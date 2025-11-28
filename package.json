@@ -1,0 +1,44 @@
+{
+  "name": "voxly-backend",
+  "version": "1.0.0",
+  "description": "Backend server for Voxly AI Interview Platform with Retell Custom LLM and Mercado Pago integration",
+  "main": "dist/server.js",
+  "scripts": {
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "test": "jest"
+  },
+  "keywords": [
+    "retell",
+    "custom-llm",
+    "interview",
+    "mercadopago"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@clerk/clerk-sdk-node": "^5.0.59",
+    "@types/express-ws": "^3.0.6",
+    "axios": "^1.7.9",
+    "body-parser": "^1.20.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "express-ws": "^5.0.2",
+    "mercadopago": "^2.0.15",
+    "openai": "^4.77.3",
+    "retell-sdk": "^4.0.0",
+    "winston": "^3.18.3",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/body-parser": "^1.19.5",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.2",
+    "@types/ws": "^8.5.13",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

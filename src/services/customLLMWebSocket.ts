@@ -1,0 +1,700 @@
+import WebSocket from 'ws';
+import OpenAI from 'openai';
+import { getFieldPrompt, formatInitialMessage } from '../prompts/fieldPrompts';
+import { 
+  analyzeResumeJobCongruency, 
+  generateGracefulEndingMessage,
+  shouldCheckCongruency,
+  CongruencyAnalysis
+} from '../utils/congruencyAnalyzer';
+import { InterviewTimer } from '../utils/interviewTimer';
+import { wsLogger } from '../utils/logger';
+
+/**
+ * Retell Custom LLM WebSocket Handler
+ * Based on: https://github.com/RetellAI/retell-custom-llm-node-demo
+ * 
+ * IMPORTANT: Must handle these interaction_types:
+ * - call_details: Initial call setup (replaces call_started in newer API)
+ * - update_only: Transcript update, no response needed
+ * - response_required: User finished speaking, response required
+ * - reminder_required: User hasn't spoken in a while
+ * - ping_pong: Keep-alive ping from Retell
+ */
+
+interface CustomLLMRequest {
+  interaction_type: 'call_details' | 'call_started' | 'update_only' | 'response_required' | 'reminder_required' | 'ping_pong';
+  call_id?: string;
+  call?: {
+    call_id: string;
+    from_number?: string;
+    to_number?: string;
+    metadata?: Record<string, any>;
+    retell_llm_dynamic_variables?: Record<string, any>;
+  };
+  response_id?: number; // Retell sends this - we must echo it back
+  transcript: Array<{
+    role: 'agent' | 'user';
+    content: string;
+    timestamp: number;
+  }>;
+  metadata?: {
+    first_name: string;
+    job_title: string;
+    company_name: string;
+    job_description: string;
+    interviewee_cv: string;
+  };
+  // Retell LLM dynamic variables passed during call
+  retell_llm_dynamic_variables?: {
+    first_name?: string;
+    job_title?: string;
+    company_name?: string;
+    job_description?: string;
+    interviewee_cv?: string;
+  };
+}
+
+interface CustomLLMResponse {
+  response_type: 'config' | 'response' | 'agent_interrupt';
+  response_id?: number;
+  content?: string;
+  content_complete?: boolean;
+  end_call?: boolean;
+  end_call_after_spoken?: boolean;
+  no_interruption_allowed?: boolean;
+  end_call_reason?: string; // 'incompatibility' | 'time_exceeded' | 'user_request' etc.
+  config?: {
+    auto_reconnect?: boolean;
+    call_details?: boolean;
+  };
+}
+
+export class CustomLLMWebSocketHandler {
+  private ws: WebSocket;
+  private openai: OpenAI;
+  private conversationHistory: OpenAI.Chat.ChatCompletionMessageParam[] = [];
+  private systemPrompt: string = '';
+  private responseId: number = 0;
+  private callId: string = '';
+  private interviewTimer: InterviewTimer;
+  private congruencyChecked: boolean = false;
+  private shouldEndInterview: boolean = false;
+  private isExtremelyIncompatible: boolean = false;
+  private metadata: any = null;
+  private hasGreeted: boolean = false; // Track if we've sent initial greeting
+
+  constructor(ws: WebSocket, openai: OpenAI, callId?: string) {
+    this.ws = ws;
+    this.openai = openai;
+    this.callId = callId || '';
+    this.interviewTimer = new InterviewTimer(
+      parseInt(process.env.MAX_INTERVIEW_DURATION_MINUTES || '15')
+    );
+    wsLogger.info('CustomLLMWebSocketHandler created', { callId: this.callId });
+    
+    // Send initial config response when WebSocket opens
+    // This tells Retell we want to receive call_details
+    this.sendConfig();
+  }
+
+  /**
+   * Send initial config response to Retell
+   * This must be sent first when WebSocket connects
+   */
+  private sendConfig() {
+    const configResponse: CustomLLMResponse = {
+      response_type: 'config',
+      config: {
+        auto_reconnect: true,
+        call_details: true // Request call details
+      }
+    };
+    
+    wsLogger.info('Sending initial config', { callId: this.callId });
+    this.ws.send(JSON.stringify(configResponse));
+  }
+
+  /**
+   * Handle incoming messages from Retell
+   */
+  async handleMessage(data: string) {
+    try {
+      const request: CustomLLMRequest = JSON.parse(data);
+      
+      // Use call_id from request or nested call object if not set
+      if (!this.callId) {
+        this.callId = request.call_id || request.call?.call_id || '';
+      }
+
+      wsLogger.info('Retell message received', {
+        callId: this.callId,
+        interactionType: request.interaction_type,
+        responseId: request.response_id,
+        transcriptLength: request.transcript?.length || 0,
+        hasMetadata: !!(request.metadata || request.retell_llm_dynamic_variables || request.call?.metadata)
+      });
+
+      switch (request.interaction_type) {
+        case 'call_details':
+          // New API - call_details replaces call_started
+          wsLogger.info('CALL_DETAILS event received', { callId: this.callId });
+          await this.handleCallDetails(request);
+          break;
+          
+        case 'call_started':
+          // Legacy API support
+          wsLogger.info('CALL_STARTED event received (legacy)', { callId: this.callId });
+          await this.handleCallStarted(request);
+          break;
+        
+        case 'response_required':
+          await this.handleResponseRequired(request);
+          break;
+        
+        case 'reminder_required':
+          await this.handleReminderRequired(request);
+          break;
+        
+        case 'update_only':
+          wsLogger.info('Update only - no response needed', { callId: this.callId });
+          break;
+          
+        case 'ping_pong':
+          // Must respond to ping to keep connection alive
+          this.handlePingPong();
+          break;
+          
+        default:
+          wsLogger.warn('Unknown interaction type', { 
+            callId: this.callId, 
+            type: (request as any).interaction_type 
+          });
+      }
+    } catch (error: any) {
+      wsLogger.error('Error handling Retell message', { 
+        callId: this.callId, 
+        error: error.message,
+        stack: error.stack 
+      });
+    }
+  }
+
+  /**
+   * Handle ping_pong to keep connection alive
+   */
+  private handlePingPong() {
+    const pongResponse = {
+      response_type: 'ping_pong',
+      timestamp: Date.now()
+    };
+    wsLogger.info('Responding to ping_pong', { callId: this.callId });
+    this.ws.send(JSON.stringify(pongResponse));
+  }
+
+  /**
+   * Handle call_details event (newer API - replaces call_started)
+   */
+  private async handleCallDetails(request: CustomLLMRequest) {
+    // Extract metadata from various possible locations
+    const metadata = request.metadata || 
+                     request.retell_llm_dynamic_variables || 
+                     request.call?.metadata ||
+                     request.call?.retell_llm_dynamic_variables ||
+                     {};
+    
+    wsLogger.info('Call details received', {
+      callId: request.call?.call_id || request.call_id,
+      candidate: metadata.first_name || 'Unknown',
+      position: metadata.job_title || 'Unknown',
+      company: metadata.company_name || 'Unknown',
+      hasCV: !!metadata.interviewee_cv
+    });
+    
+    // Store metadata
+    this.metadata = metadata;
+
+    // Proceed to start the interview (same logic as handleCallStarted)
+    await this.startInterview();
+  }
+
+  /**
+   * Handle call started event (legacy API)
+   */
+  private async handleCallStarted(request: CustomLLMRequest) {
+    wsLogger.info('Call session started (legacy)', {
+      callId: request.call_id,
+      candidate: request.metadata?.first_name || 'Unknown',
+      position: request.metadata?.job_title || 'Unknown',
+      company: request.metadata?.company_name || 'Unknown'
+    });
+    
+    // Store metadata
+    this.metadata = request.metadata;
+
+    // Start the interview
+    await this.startInterview();
+  }
+
+  /**
+   * Start the interview - shared logic for call_details and call_started
+   */
+  private async startInterview() {
+    // IMMEDIATELY perform quick congruency check before spending tokens
+    if (this.metadata?.interviewee_cv && this.metadata?.job_title) {
+      wsLogger.info('Performing quick compatibility check', { callId: this.callId });
+      
+      try {
+        const quickAnalysis = await analyzeResumeJobCongruency(
+          this.metadata.interviewee_cv,
+          this.metadata.job_title,
+          this.metadata.job_description || '',
+          this.openai,
+          true // Quick check mode
+        );
+
+        wsLogger.info('Quick compatibility result', {
+          callId: this.callId,
+          isCongruent: quickAnalysis.isCongruent,
+          isExtremelyIncompatible: quickAnalysis.isExtremelyIncompatible,
+          confidence: quickAnalysis.confidence
+        });
+
+        // If extremely incompatible, end call immediately
+        if (quickAnalysis.isExtremelyIncompatible && quickAnalysis.confidence > 0.8) {
+          wsLogger.warn('EXTREME INCOMPATIBILITY DETECTED - Ending interview', { 
+            callId: this.callId,
+            reasons: quickAnalysis.reasons 
+          });
+          this.isExtremelyIncompatible = true;
+          this.shouldEndInterview = true;
+          this.congruencyChecked = true;
+
+          const endingMessage = generateGracefulEndingMessage(quickAnalysis.reasons, true);
+          await this.sendAgentInterrupt(endingMessage, true);
+          return;
+        }
+      } catch (error: any) {
+        wsLogger.error('Quick compatibility check failed', { 
+          callId: this.callId, 
+          error: error.message 
+        });
+        // On error, proceed with interview
+      }
+    }
+
+    // Proceed with normal interview start
+    if (this.metadata) {
+      const fieldPrompt = getFieldPrompt(
+        this.metadata.job_title || '',
+        this.metadata.job_description || ''
+      );
+      
+      // Format the initial message with candidate-specific information
+      const personalizedGreeting = formatInitialMessage(
+        fieldPrompt,
+        this.metadata.first_name || 'there',
+        this.metadata.job_title || 'this position',
+        this.metadata.company_name || 'your target company'
+      );
+      
+      this.systemPrompt = `${fieldPrompt.systemPrompt}
+
+INTERVIEW CONTEXT:
+- Candidate Name: ${this.metadata.first_name}
+- Target Position: ${this.metadata.job_title} at ${this.metadata.company_name}
+- Job Description: ${this.metadata.job_description}
+
+CANDIDATE'S RESUME:
+${this.metadata.interviewee_cv || 'Not provided'}
+
+IMPORTANT INSTRUCTIONS:
+- Tailor your questions to BOTH the job description AND the candidate's resume
+- Reference specific skills, projects, or experiences from their resume
+- Keep responses concise (1-2 sentences max)
+- Ask ONE focused question at a time
+- Be conversational but professional
+- Maximum interview duration is 15 minutes`;
+
+      this.conversationHistory.push({
+        role: 'system',
+        content: this.systemPrompt
+      });
+
+      // Send personalized initial greeting
+      wsLogger.info('Sending personalized greeting', { 
+        callId: this.callId,
+        candidateName: this.metadata.first_name,
+        field: fieldPrompt.field,
+        greetingLength: personalizedGreeting.length 
+      });
+      this.hasGreeted = true;
+      await this.sendAgentInterrupt(personalizedGreeting, false);
+    } else {
+      wsLogger.warn('No metadata received - sending generic greeting', { callId: this.callId });
+      
+      // Send a generic greeting if no metadata
+      const genericGreeting = "Hello! Welcome to your mock interview with Voxly. I'm your AI interviewer, and I'll be helping you prepare for your job interview today. This session will take about 15 minutes. Let's begin - can you tell me about your professional background?";
+      
+      this.systemPrompt = `You are Voxly, a professional AI interviewer helping candidates prepare for job interviews.
+Be conversational, professional, and encouraging. 
+Keep responses concise (1-2 sentences max).
+Ask one question at a time and adapt based on candidate responses.`;
+      
+      this.conversationHistory.push({
+        role: 'system',
+        content: this.systemPrompt
+      });
+      
+      this.hasGreeted = true;
+      await this.sendAgentInterrupt(genericGreeting, false);
+    }
+  }
+
+  /**
+   * Handle response required event
+   */
+  private async handleResponseRequired(request: CustomLLMRequest) {
+    wsLogger.info('Response required', { 
+      callId: this.callId,
+      retellResponseId: request.response_id,
+      hasGreeted: this.hasGreeted
+    });
+    
+    // Use the response_id from Retell's request
+    if (request.response_id !== undefined) {
+      this.responseId = request.response_id;
+    }
+
+    // If we haven't greeted yet, send initial greeting first
+    // This handles the case where call_started event isn't received
+    if (!this.hasGreeted) {
+      wsLogger.info('First response_required - sending initial greeting', { callId: this.callId });
+      
+      // Try to get metadata from request if we don't have it
+      if (!this.metadata && request.metadata) {
+        this.metadata = request.metadata;
+      }
+
+      // Setup system prompt and send greeting
+      const fieldPrompt = getFieldPrompt(
+        this.metadata?.job_title || 'General',
+        this.metadata?.job_description || ''
+      );
+      
+      this.systemPrompt = `${fieldPrompt.systemPrompt}
+
+INTERVIEW CONTEXT:
+- Candidate: ${this.metadata?.first_name || 'Candidate'}
+- Position: ${this.metadata?.job_title || 'Position'} at ${this.metadata?.company_name || 'Company'}
+- Job Description: ${this.metadata?.job_description || 'Not provided'}
+
+INSTRUCTIONS:
+- Keep responses concise (2-3 sentences max)
+- Ask one question at a time
+- Be conversational and natural
+- Adapt follow-up questions based on candidate responses
+- Maximum interview duration is 15 minutes`;
+
+      this.conversationHistory.push({
+        role: 'system',
+        content: this.systemPrompt
+      });
+
+      this.hasGreeted = true;
+      
+      // Send greeting as a regular response (not agent_interrupt since we're responding to a request)
+      await this.sendResponse(fieldPrompt.initialMessage, false);
+      return;
+    }
+    
+    // Check timer first
+    if (this.interviewTimer.hasExceededTime()) {
+      wsLogger.info('Interview time exceeded', { callId: this.callId });
+      const timeUpMessage = this.interviewTimer.getTimeUpMessage();
+      await this.sendResponse(timeUpMessage, true);
+      return;
+    }
+
+    // Check if warning needed
+    if (this.interviewTimer.shouldWarn()) {
+      wsLogger.info('Sending time warning', { callId: this.callId });
+      const warningMessage = this.interviewTimer.getWarningMessage();
+      await this.sendResponse(warningMessage, false);
+      return;
+    }
+
+    // Get latest user message
+    const transcript = request.transcript || [];
+    const lastMessage = transcript[transcript.length - 1];
+    
+    if (!lastMessage || lastMessage.role !== 'user') {
+      wsLogger.warn('No user message to respond to', { callId: this.callId });
+      return;
+    }
+
+    wsLogger.info('User message received', { 
+      callId: this.callId, 
+      content: lastMessage.content.substring(0, 100) 
+    });
+
+    // Add user message to history
+    this.conversationHistory.push({
+      role: 'user',
+      content: lastMessage.content
+    });
+
+    // Check congruency if appropriate timing
+    if (!this.congruencyChecked && this.metadata && 
+        shouldCheckCongruency(
+          this.interviewTimer['startTime'], 
+          null, 
+          this.conversationHistory.length
+        )) {
+      await this.performCongruencyCheck();
+    }
+
+    // If interview should end, send graceful ending
+    if (this.shouldEndInterview) {
+      const endingMessage = generateGracefulEndingMessage([], this.isExtremelyIncompatible);
+      await this.sendResponseWithReason(
+        endingMessage, 
+        true, 
+        this.isExtremelyIncompatible ? 'incompatibility' : 'mismatch'
+      );
+      return;
+    }
+
+    // Generate AI response
+    await this.generateAndSendResponse();
+  }
+
+  /**
+   * Handle reminder required event
+   */
+  private async handleReminderRequired(request: CustomLLMRequest) {
+    wsLogger.info('Reminder required - user not responding', { callId: this.callId });
+    await this.sendResponse(
+      "I'm sorry, I didn't catch that. Could you please repeat?",
+      false
+    );
+  }
+
+  /**
+   * Perform congruency analysis
+   */
+  private async performCongruencyCheck() {
+    if (!this.metadata) return;
+
+    wsLogger.info('Performing full congruency check', { callId: this.callId });
+    
+    try {
+      const analysis = await analyzeResumeJobCongruency(
+        this.metadata.interviewee_cv || '',
+        this.metadata.job_title || '',
+        this.metadata.job_description || '',
+        this.openai,
+        false // Full analysis mode
+      );
+
+      wsLogger.info('Congruency analysis complete', { 
+        callId: this.callId,
+        isCongruent: analysis.isCongruent,
+        confidence: analysis.confidence 
+      });
+
+      this.congruencyChecked = true;
+
+      // If not congruent and confidence is high, end interview
+      if (!analysis.isCongruent && analysis.confidence > 0.7) {
+        this.shouldEndInterview = true;
+        this.isExtremelyIncompatible = analysis.isExtremelyIncompatible;
+      }
+    } catch (error: any) {
+      wsLogger.error('Error performing congruency check', { 
+        callId: this.callId, 
+        error: error.message 
+      });
+      // On error, continue interview
+      this.congruencyChecked = true;
+    }
+  }
+
+  /**
+   * Generate response using OpenAI
+   */
+  private async generateAndSendResponse() {
+    wsLogger.info('Generating AI response', { callId: this.callId });
+    
+    try {
+      const stream = await this.openai.chat.completions.create({
+        model: 'gpt-4o', // More reliable and faster than gpt-4-turbo-preview
+        messages: this.conversationHistory,
+        stream: true,
+        temperature: 0.3, // Lower temperature for more focused, accurate responses
+        max_tokens: 150, // Shorter responses for conversational flow
+        presence_penalty: 0.6, // Discourage repetition
+        frequency_penalty: 0.3 // Reduce word repetition
+      });
+
+      let fullResponse = '';
+      let chunkCount = 0;
+
+      for await (const chunk of stream) {
+        const content = chunk.choices[0]?.delta?.content || '';
+        if (content) {
+          fullResponse += content;
+          chunkCount++;
+          
+          // Send streaming response
+          const response: CustomLLMResponse = {
+            response_type: 'response',
+            response_id: this.responseId,
+            content: content,
+            content_complete: false
+          };
+          this.ws.send(JSON.stringify(response));
+        }
+      }
+
+      // Send completion
+      const finalResponse: CustomLLMResponse = {
+        response_type: 'response',
+        response_id: this.responseId,
+        content: '',
+        content_complete: true
+      };
+      this.ws.send(JSON.stringify(finalResponse));
+
+      wsLogger.info('AI response sent', { 
+        callId: this.callId, 
+        responseId: this.responseId,
+        chunkCount,
+        responseLength: fullResponse.length 
+      });
+
+      // Add to conversation history
+      this.conversationHistory.push({
+        role: 'assistant',
+        content: fullResponse
+      });
+
+      this.responseId++;
+    } catch (error: any) {
+      wsLogger.error('Error generating OpenAI response', { 
+        callId: this.callId, 
+        error: error.message 
+      });
+    }
+  }
+
+  /**
+   * Send an agent interrupt (for initial greeting and agent-initiated messages)
+   * This makes the agent speak first without waiting for user input
+   */
+  private async sendAgentInterrupt(content: string, endCall: boolean = false) {
+    // For agent_interrupt, we use response_id 0 for the initial greeting
+    // Retell expects the agent to speak first when using Custom LLM
+    const response: CustomLLMResponse = {
+      response_type: 'response', // Use 'response' type for initial greeting
+      response_id: 0, // First message always uses response_id 0
+      content: content,
+      content_complete: true,
+      end_call: endCall,
+      end_call_after_spoken: endCall
+    };
+
+    wsLogger.info('Sending initial agent message', {
+      callId: this.callId,
+      responseId: 0,
+      contentPreview: content.substring(0, 100),
+      endCall
+    });
+    
+    this.ws.send(JSON.stringify(response));
+
+    this.conversationHistory.push({
+      role: 'assistant',
+      content: content
+    });
+
+    // Set responseId to 1 for subsequent responses
+    this.responseId = 1;
+  }
+
+  /**
+   * Send a direct response (non-streaming)
+   */
+  private async sendResponse(content: string, endCall: boolean = false) {
+    const response: CustomLLMResponse = {
+      response_type: 'response',
+      response_id: this.responseId,
+      content: content,
+      content_complete: true,
+      end_call: endCall,
+      end_call_after_spoken: endCall
+    };
+
+    wsLogger.info('Sending response', {
+      callId: this.callId,
+      responseId: this.responseId,
+      contentPreview: content.substring(0, 100),
+      endCall
+    });
+    
+    this.ws.send(JSON.stringify(response));
+
+    this.conversationHistory.push({
+      role: 'assistant',
+      content: content
+    });
+
+    this.responseId++;
+  }
+
+  /**
+   * Send a response with end reason (for tracking incompatibility)
+   */
+  private async sendResponseWithReason(content: string, endCall: boolean, reason: string) {
+    const response: CustomLLMResponse = {
+      response_type: 'response',
+      response_id: this.responseId,
+      content: content,
+      content_complete: true,
+      end_call: endCall,
+      end_call_after_spoken: endCall,
+      end_call_reason: reason
+    };
+
+    wsLogger.info('Sending response with reason', { 
+      callId: this.callId, 
+      reason, 
+      endCall 
+    });
+    this.ws.send(JSON.stringify(response));
+
+    this.conversationHistory.push({
+      role: 'assistant',
+      content: content
+    });
+
+    this.responseId++;
+  }
+
+  /**
+   * Handle WebSocket errors
+   */
+  handleError(error: Error) {
+    wsLogger.error('WebSocket error', { callId: this.callId, error: error.message });
+  }
+
+  /**
+   * Handle WebSocket close
+   */
+  handleClose() {
+    wsLogger.info('WebSocket connection closed', { 
+      callId: this.callId,
+      duration: this.interviewTimer.getFormattedElapsedTime()
+    });
+  }
+}
