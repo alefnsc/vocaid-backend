@@ -83,6 +83,12 @@ export class MercadoPagoService {
       
       console.log('Payment URLs:', { frontendUrl, webhookUrl });
 
+      // Validate frontend URL is set - required for MercadoPago redirects
+      if (!frontendUrl) {
+        console.error('FRONTEND_URL environment variable is not set!');
+        throw new Error('Server configuration error: FRONTEND_URL is required for payment processing');
+      }
+
       // Build preference data - only include optional fields if URLs are configured
       // NOTE: MercadoPago only accepts BRL, so we use priceBRL for the payment
       const preferenceData: any = {
@@ -109,24 +115,21 @@ export class MercadoPagoService {
           user_id: userId,
           package_id: packageId,
           credits: pkg.credits
-        }
+        },
+        // Add back_urls for redirect after payment - REQUIRED for auto_return
+        back_urls: {
+          success: `${frontendUrl}/payment/success`,
+          failure: `${frontendUrl}/payment/failure`,
+          pending: `${frontendUrl}/payment/pending`
+        },
+        // Use 'all' to redirect for all payment statuses (approved, pending, rejected)
+        auto_return: 'all'
       };
 
       // Only add notification_url if webhook URL is configured
       if (webhookUrl) {
         preferenceData.notification_url = `${webhookUrl}/webhook/mercadopago`;
       }
-
-      // Add back_urls for redirect after payment
-      // Use frontend URL or fallback to localhost for development
-      const redirectUrl = frontendUrl || 'http://localhost:3000';
-      preferenceData.back_urls = {
-        success: `${redirectUrl}/payment/success`,
-        failure: `${redirectUrl}/payment/failure`,
-        pending: `${redirectUrl}/payment/pending`
-      };
-      // Use 'all' to redirect for all payment statuses (approved, pending, rejected)
-      preferenceData.auto_return = 'all';
 
       console.log('Creating preference with back_urls:', preferenceData.back_urls);
       console.log('Auto return:', preferenceData.auto_return);
