@@ -260,8 +260,9 @@ export class CustomLLMWebSocketHandler {
           confidence: quickAnalysis.confidence
         });
 
-        // If extremely incompatible, end call immediately
-        if (quickAnalysis.isExtremelyIncompatible && quickAnalysis.confidence > 0.8) {
+        // ONLY end call for EXTREME incompatibility with VERY HIGH confidence (>0.95)
+        // This should be reserved for absurd mismatches only
+        if (quickAnalysis.isExtremelyIncompatible && quickAnalysis.confidence > 0.95) {
           wsLogger.warn('EXTREME INCOMPATIBILITY DETECTED - Ending interview', { 
             callId: this.callId,
             reasons: quickAnalysis.reasons 
@@ -270,8 +271,9 @@ export class CustomLLMWebSocketHandler {
           this.shouldEndInterview = true;
           this.congruencyChecked = true;
 
+          // ALWAYS send a spoken message before ending - use end_call_after_spoken
           const endingMessage = generateGracefulEndingMessage(quickAnalysis.reasons, true);
-          await this.sendAgentInterrupt(endingMessage, true);
+          await this.sendAgentInterruptWithEndAfterSpoken(endingMessage);
           return;
         }
       } catch (error: any) {
@@ -481,7 +483,8 @@ INSTRUCTIONS:
   }
 
   /**
-   * Perform congruency analysis
+   * Perform congruency analysis (mid-interview check)
+   * This is more lenient than the initial quick check
    */
   private async performCongruencyCheck() {
     if (!this.metadata) return;
@@ -505,11 +508,19 @@ INSTRUCTIONS:
 
       this.congruencyChecked = true;
 
-      // If not congruent and confidence is high, end interview
-      if (!analysis.isCongruent && analysis.confidence > 0.7) {
+      // VERY HIGH bar for ending mid-interview - require high confidence AND extreme incompatibility
+      // Normal mismatches should NOT end the interview - let the candidate practice
+      if (!analysis.isCongruent && analysis.confidence > 0.85 && analysis.isExtremelyIncompatible) {
+        wsLogger.warn('Mid-interview incompatibility detected', {
+          callId: this.callId,
+          confidence: analysis.confidence,
+          reasons: analysis.reasons
+        });
         this.shouldEndInterview = true;
-        this.isExtremelyIncompatible = analysis.isExtremelyIncompatible;
+        this.isExtremelyIncompatible = true;
       }
+      // Note: We no longer end interviews for moderate mismatches
+      // Let candidates practice interviewing even if not a perfect fit
     } catch (error: any) {
       wsLogger.error('Error performing congruency check', { 
         callId: this.callId, 
@@ -623,6 +634,37 @@ INSTRUCTIONS:
   }
 
   /**
+   * Send an agent interrupt that MUST speak before ending call
+   * This ensures the user always hears the ending message before disconnection
+   */
+  private async sendAgentInterruptWithEndAfterSpoken(content: string) {
+    const response: CustomLLMResponse = {
+      response_type: 'response',
+      response_id: 0,
+      content: content,
+      content_complete: true,
+      end_call: false, // Don't end immediately
+      end_call_after_spoken: true, // End ONLY after speaking
+      no_interruption_allowed: true // Don't allow user to interrupt the ending message
+    };
+
+    wsLogger.info('Sending ending message (will end after spoken)', {
+      callId: this.callId,
+      responseId: 0,
+      contentPreview: content.substring(0, 100)
+    });
+    
+    this.ws.send(JSON.stringify(response));
+
+    this.conversationHistory.push({
+      role: 'assistant',
+      content: content
+    });
+
+    this.responseId = 1;
+  }
+
+  /**
    * Send a direct response (non-streaming)
    */
   private async sendResponse(content: string, endCall: boolean = false) {
@@ -654,6 +696,7 @@ INSTRUCTIONS:
 
   /**
    * Send a response with end reason (for tracking incompatibility)
+   * Ensures the agent speaks the message completely before ending
    */
   private async sendResponseWithReason(content: string, endCall: boolean, reason: string) {
     const response: CustomLLMResponse = {
@@ -662,14 +705,16 @@ INSTRUCTIONS:
       content: content,
       content_complete: true,
       end_call: endCall,
-      end_call_after_spoken: endCall,
-      end_call_reason: reason
+      end_call_after_spoken: endCall, // Wait for agent to finish speaking
+      end_call_reason: reason,
+      no_interruption_allowed: endCall // Prevent user from interrupting the ending message
     };
 
     wsLogger.info('Sending response with reason', { 
       callId: this.callId, 
       reason, 
-      endCall 
+      endCall,
+      contentLength: content.length
     });
     this.ws.send(JSON.stringify(response));
 

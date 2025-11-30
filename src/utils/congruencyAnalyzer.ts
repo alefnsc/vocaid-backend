@@ -28,34 +28,48 @@ export async function analyzeResumeJobCongruency(
   quickCheck: boolean = false
 ): Promise<CongruencyAnalysis> {
   try {
-    // For quick check at start, use lighter analysis
+    // For quick check at start, use VERY lenient analysis
     const analysisPrompt = quickCheck 
       ? `You are an expert recruiter performing a QUICK compatibility check.
 
 JOB TITLE: ${jobTitle}
 
 JOB DESCRIPTION (key requirements):
-${jobDescription.substring(0, 600)}
+${jobDescription.substring(0, 800)}
 
-CANDIDATE RESUME (summary):
-${resume.substring(0, 1000)}
+CANDIDATE RESUME:
+${resume.substring(0, 1500)}
 
-TASK: Quickly determine if this candidate is EXTREMELY INCOMPATIBLE with this role.
+TASK: Determine if this candidate is EXTREMELY INCOMPATIBLE with this role.
 
-EXTREME INCOMPATIBILITY means:
-- Completely different field (e.g., chef applying for software engineer)
-- Zero overlap in skills or experience
-- No transferable skills whatsoever
+CRITICAL - BE EXTREMELY LENIENT. Mark as incompatible ONLY if ALL of these are true:
+1. The candidate has ZERO related experience (not even tangentially related)
+2. There are NO transferable skills whatsoever
+3. The fields are completely unrelated (e.g., professional chef applying for neurosurgeon)
+4. No education or background could possibly apply
 
-BE LENIENT: If there's ANY reasonable connection (similar industry, transferable skills, related education), mark as NOT extremely incompatible.
+EXAMPLES OF COMPATIBLE (should NOT be marked incompatible):
+- Software developer applying for different tech stack (transferable skills)
+- Marketing person applying for sales (related fields)
+- Junior applying for senior role (growth potential)
+- Different industry but same function (transferable)
+- Any tech role to any other tech role
+- Any business role to any other business role
+
+ONLY mark isExtremelyIncompatible=true for ABSURD mismatches like:
+- Chef applying for Software Engineer with NO tech background
+- Farmer applying for Investment Banker with NO finance background
+- Lifeguard applying for Brain Surgeon with NO medical background
+
+When in doubt, mark as COMPATIBLE and let the interview proceed.
 
 Respond with this exact JSON format:
 {
-  "isCongruent": true/false,
-  "confidence": 0.0-1.0,
+  "isCongruent": true,
+  "confidence": 0.3,
   "reasons": ["brief reason"],
-  "recommendation": "continue" or "end_gracefully",
-  "isExtremelyIncompatible": true/false,
+  "recommendation": "continue",
+  "isExtremelyIncompatible": false,
   "skillsMatch": {
     "matched": ["skill1"],
     "missing": ["skill1"],
@@ -63,7 +77,7 @@ Respond with this exact JSON format:
   }
 }
 
-Mark isExtremelyIncompatible=true ONLY if there is virtually NO overlap (less than 10% match).`
+DEFAULT TO isCongruent=true and isExtremelyIncompatible=false unless ABSURDLY incompatible.`
       : `You are an expert technical recruiter analyzing candidate-job fit.
 
 JOB TITLE: ${jobTitle}
@@ -75,21 +89,22 @@ CANDIDATE RESUME:
 ${resume}
 
 ANALYSIS TASK:
-Perform a thorough evaluation of how well this candidate matches the job requirements.
+Perform a fair evaluation of how well this candidate matches the job requirements.
+Be encouraging and focus on potential, not just exact matches.
 
 EVALUATE:
-1. **Required Skills Match**: Which required skills does the candidate have?
-2. **Experience Alignment**: Does their experience level match the role?
-3. **Domain Knowledge**: Do they have relevant industry/domain experience?
+1. **Required Skills Match**: Which required skills does the candidate have or could quickly learn?
+2. **Experience Alignment**: Does their experience level match or show growth trajectory?
+3. **Domain Knowledge**: Do they have relevant industry/domain experience or related experience?
 4. **Transferable Skills**: What skills could transfer even if not exact match?
-5. **Education/Certifications**: Do qualifications align?
-6. **Red Flags**: Any concerning gaps or mismatches?
+5. **Education/Certifications**: Do qualifications align or show capability?
+6. **Growth Potential**: Could this candidate succeed with some ramp-up time?
 
-SCORING GUIDE:
-- 70%+ match = Congruent (continue interview)
-- 40-70% match = Borderline (continue with focus on gaps)
-- Below 40% match = Not congruent (end gracefully)
-- Below 15% match = Extremely incompatible (immediate end)
+SCORING GUIDE (BE LENIENT):
+- 50%+ match = Congruent (continue interview)
+- 30-50% match = Borderline (continue with focus on gaps)
+- Below 30% match = Not congruent (end gracefully)
+- Below 10% match = Extremely incompatible (immediate end - VERY RARE)
 
 Respond with this exact JSON format:
 {
@@ -110,26 +125,30 @@ Respond with this exact JSON format:
       messages: [
         {
           role: 'system',
-          content: 'You are a precise technical recruiter analyzing job-candidate fit. Always respond with valid JSON only. Be fair but thorough in your assessment.'
+          content: 'You are a fair and encouraging recruiter. Your job is to give candidates a chance. Only reject candidates for EXTREME mismatches. When in doubt, let them interview. Always respond with valid JSON only.'
         },
         {
           role: 'user',
           content: analysisPrompt
         }
       ],
-      temperature: 0.2,
-      max_tokens: quickCheck ? 300 : 600,
+      temperature: 0.1, // Very low temperature for consistent, conservative results
+      max_tokens: quickCheck ? 400 : 700,
       response_format: { type: 'json_object' }
     });
 
     const analysis = JSON.parse(response.choices[0].message.content || '{}');
+    
+    // Additional safety: Override extremely incompatible if confidence is not very high
+    const isExtremelyIncompatible = analysis.isExtremelyIncompatible === true && 
+                                     (analysis.confidence || 0) > 0.9;
     
     return {
       isCongruent: analysis.isCongruent ?? true,
       confidence: analysis.confidence ?? 0.5,
       reasons: analysis.reasons ?? [],
       recommendation: analysis.recommendation ?? 'continue',
-      isExtremelyIncompatible: analysis.isExtremelyIncompatible ?? false,
+      isExtremelyIncompatible: isExtremelyIncompatible,
       skillsMatch: {
         matched: analysis.skillsMatch?.matched ?? [],
         missing: analysis.skillsMatch?.missing ?? [],
