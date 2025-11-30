@@ -27,6 +27,9 @@ const requiredEnvVars = [
   'CLERK_SECRET_KEY'
 ];
 
+// Optional env vars (warn but don't fail)
+const optionalEnvVars = ['GEMINI_API_KEY'];
+
 const missingEnvVars = requiredEnvVars.filter(varName => {
   const value = process.env[varName];
   return !value || value === `your_${varName.toLowerCase()}_here` || value.includes('your_');
@@ -40,6 +43,13 @@ if (missingEnvVars.length > 0) {
   logger.error('Mercado Pago: https://www.mercadopago.com.br/developers/panel/credentials');
   logger.error('Clerk: https://dashboard.clerk.com/');
 }
+
+// Log optional env vars status
+optionalEnvVars.forEach(varName => {
+  if (!process.env[varName]) {
+    logger.warn(`Optional env var ${varName} not set - fallback functionality may be limited`);
+  }
+});
 
 // Initialize Express app
 const app = express();
@@ -88,7 +98,10 @@ const openai = new OpenAI({
 
 const retellService = new RetellService(process.env.RETELL_API_KEY || '');
 const mercadoPagoService = new MercadoPagoService(process.env.MERCADOPAGO_ACCESS_TOKEN || '');
-const feedbackService = new FeedbackService(process.env.OPENAI_API_KEY || '');
+const feedbackService = new FeedbackService(
+  process.env.OPENAI_API_KEY || '',
+  process.env.GEMINI_API_KEY // Optional Gemini fallback
+);
 
 // Health check endpoint
 app.get('/health', (req: Request, res: Response) => {
@@ -375,9 +388,86 @@ app.get('/payment/history/:userId', async (req: Request, res: Response) => {
   }
 });
 
-// ===== CREDITS MANAGEMENT =====
+// ===== CLERK WEBHOOKS =====
 
 import { clerkClient } from '@clerk/clerk-sdk-node';
+
+/**
+ * Clerk webhook handler for user events
+ * POST /webhook/clerk
+ * 
+ * Handles:
+ * - user.created: Grants 1 free credit to new users
+ */
+app.post('/webhook/clerk', async (req: Request, res: Response) => {
+  try {
+    const { type, data } = req.body;
+
+    authLogger.info('Received Clerk webhook', { type, userId: data?.id });
+
+    if (type === 'user.created') {
+      const userId = data.id;
+      const userEmail = data.email_addresses?.[0]?.email_address;
+      
+      authLogger.info('New user registration', { userId, userEmail });
+
+      // Grant 1 free credit to new user
+      try {
+        await clerkClient.users.updateUser(userId, {
+          publicMetadata: {
+            credits: 1,
+            freeTrialUsed: false,
+            registrationDate: new Date().toISOString()
+          }
+        });
+
+        authLogger.info('Free trial credit granted', { userId, credits: 1 });
+        
+        res.status(200).json({
+          status: 'success',
+          message: 'Free trial credit granted',
+          userId,
+          credits: 1
+        });
+      } catch (updateError: any) {
+        authLogger.error('Failed to grant free credit', { userId, error: updateError.message });
+        res.status(200).json({
+          status: 'error',
+          message: 'Failed to grant free credit',
+          error: updateError.message
+        });
+      }
+    } else {
+      // Acknowledge other webhook types
+      res.status(200).json({
+        status: 'ok',
+        message: `Webhook type ${type} acknowledged`
+      });
+    }
+  } catch (error: any) {
+    authLogger.error('Error processing Clerk webhook', { error: error.message });
+    // Still return 200 to acknowledge receipt
+    res.status(200).json({
+      status: 'error',
+      message: error.message
+    });
+  }
+});
+
+/**
+ * Get Clerk webhook info
+ * GET /webhook/clerk
+ */
+app.get('/webhook/clerk', (req: Request, res: Response) => {
+  res.json({
+    status: 'ok',
+    message: 'Clerk webhook endpoint',
+    url: `${process.env.WEBHOOK_BASE_URL}/webhook/clerk`,
+    events: ['user.created']
+  });
+});
+
+// ===== CREDITS MANAGEMENT =====
 
 /**
  * Consume credit when interview starts

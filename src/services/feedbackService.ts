@@ -1,8 +1,9 @@
 import OpenAI from 'openai';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { feedbackLogger } from '../utils/logger';
 
 /**
- * Feedback generation service using OpenAI
+ * Feedback generation service using OpenAI with Gemini fallback
  */
 
 export interface InterviewTranscript {
@@ -32,11 +33,20 @@ export interface CallStatus {
 
 export class FeedbackService {
   private openai: OpenAI;
+  private gemini: GoogleGenerativeAI | null = null;
+  private geminiApiKey: string | null = null;
 
-  constructor(apiKey: string) {
+  constructor(openaiApiKey: string, geminiApiKey?: string) {
     this.openai = new OpenAI({
-      apiKey: apiKey
+      apiKey: openaiApiKey
     });
+    
+    // Initialize Gemini as fallback if API key is provided
+    if (geminiApiKey) {
+      this.gemini = new GoogleGenerativeAI(geminiApiKey);
+      this.geminiApiKey = geminiApiKey;
+      feedbackLogger.info('Gemini fallback initialized');
+    }
   }
 
   /**
@@ -249,6 +259,18 @@ Provide detailed feedback in the following JSON format:
   "recommendations": ["recommendation1", "recommendation2", ...]
 }
 
+CRITICAL REQUIREMENTS FOR areas_for_improvement:
+- Each area MUST be UNIQUE and address a DIFFERENT aspect of the candidate's performance
+- DO NOT repeat the same concept with different wording (e.g., "needs more examples" and "should provide concrete examples" are redundant)
+- Focus on DISTINCT categories: technical knowledge gaps, communication style, specific missing skills, presentation issues, etc.
+- Maximum 3-4 unique, actionable improvement areas
+- If you cannot identify distinct areas, provide fewer items rather than redundant ones
+
+CRITICAL REQUIREMENTS FOR strengths:
+- Each strength MUST be UNIQUE and address a DIFFERENT positive aspect
+- DO NOT repeat similar achievements or qualities with different phrasing
+- Maximum 3-4 distinct strengths
+
 Rate on scale of 1-5:
 1 - Poor (very short interview, minimal responses, or interview was interrupted)
 2 - Below Average (incomplete answers, interview cut short, limited demonstration of skills)
@@ -256,26 +278,64 @@ Rate on scale of 1-5:
 4 - Good (solid performance with minor areas to improve)
 5 - Excellent (comprehensive, detailed responses demonstrating clear expertise)
 
-Be constructive, specific, and actionable in your feedback.`;
+Be constructive, specific, and actionable in your feedback. Avoid redundancy at all costs.`;
 
-      const response = await this.openai.chat.completions.create({
-        model: 'gpt-4-turbo-preview',
-        messages: [
-          {
-            role: 'system',
-            content: 'You are an expert interview evaluator providing detailed, constructive feedback. Always respond with valid JSON only.'
-          },
-          {
-            role: 'user',
-            content: analysisPrompt
+      let feedback: any;
+      
+      try {
+        // Try OpenAI first
+        const response = await this.openai.chat.completions.create({
+          model: 'gpt-4-turbo-preview',
+          messages: [
+            {
+              role: 'system',
+              content: 'You are an expert interview evaluator providing detailed, constructive feedback. Always respond with valid JSON only. CRITICAL: Never be redundant - each strength and each area for improvement must address a completely different aspect. If two items convey the same idea with different words, keep only one.'
+            },
+            {
+              role: 'user',
+              content: analysisPrompt
+            }
+          ],
+          temperature: 0.5,
+          max_tokens: 1500,
+          response_format: { type: 'json_object' }
+        });
+
+        feedback = JSON.parse(response.choices[0].message.content || '{}');
+        feedbackLogger.info('Feedback generated using OpenAI');
+      } catch (openaiError: any) {
+        feedbackLogger.warn('OpenAI failed, attempting Gemini fallback', { error: openaiError.message });
+        
+        // Try Gemini fallback
+        if (this.gemini) {
+          try {
+            const model = this.gemini.getGenerativeModel({ model: 'gemini-1.5-flash' });
+            
+            const geminiPrompt = `You are an expert interview evaluator providing detailed, constructive feedback. Always respond with valid JSON only. CRITICAL: Never be redundant - each strength and each area for improvement must address a completely different aspect. If two items convey the same idea with different words, keep only one.
+
+${analysisPrompt}
+
+IMPORTANT: Respond ONLY with a valid JSON object, no markdown formatting, no code blocks, just pure JSON.`;
+
+            const result = await model.generateContent(geminiPrompt);
+            const responseText = result.response.text();
+            
+            // Clean up potential markdown formatting from Gemini
+            const cleanedResponse = responseText
+              .replace(/```json\n?/g, '')
+              .replace(/```\n?/g, '')
+              .trim();
+            
+            feedback = JSON.parse(cleanedResponse);
+            feedbackLogger.info('Feedback generated using Gemini fallback');
+          } catch (geminiError: any) {
+            feedbackLogger.error('Gemini fallback also failed', { error: geminiError.message });
+            throw new Error(`Both OpenAI and Gemini failed: OpenAI: ${openaiError.message}, Gemini: ${geminiError.message}`);
           }
-        ],
-        temperature: 0.5,
-        max_tokens: 1500,
-        response_format: { type: 'json_object' }
-      });
-
-      const feedback = JSON.parse(response.choices[0].message.content || '{}');
+        } else {
+          throw openaiError; // Re-throw if no Gemini fallback available
+        }
+      }
 
       // Apply penalty factor for interrupted/short interviews
       const applyPenalty = (rating: number): number => {
