@@ -1,7 +1,7 @@
 {
   "name": "voxly-backend",
   "version": "1.0.0",
-  "description": "Backend server for Voxly AI Interview Platform with Retell Custom LLM and Mercado Pago integration",
+  "description": "Backend server for Voxly Interview Platform with Retell Custom LLM and Mercado Pago integration",
   "main": "dist/server.js",
   "scripts": {
     "start": "node dist/server.js",

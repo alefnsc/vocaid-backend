@@ -1,7 +1,7 @@
-# Voxly AI - Backend
+# Voxly - Backend
 
 <p align="center">
-  <strong>Backend Server for Voxly AI Interview Platform</strong><br>
+  <strong>Backend Server for Voxly Interview Platform</strong><br>
   Retell Custom LLM, OpenAI Integration, and MercadoPago Payment Processing
 </p>
 

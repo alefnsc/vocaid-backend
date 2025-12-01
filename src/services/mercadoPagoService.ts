@@ -113,7 +113,7 @@ export class MercadoPagoService {
           packageId: packageId,
           credits: pkg.credits
         }),
-        statement_descriptor: 'VOXLY AI',
+        statement_descriptor: 'Voxly',
         metadata: {
           user_id: userId,
           package_id: packageId,
