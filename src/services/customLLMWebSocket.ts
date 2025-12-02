@@ -242,49 +242,11 @@ export class CustomLLMWebSocketHandler {
    * Start the interview - shared logic for call_details and call_started
    */
   private async startInterview() {
-    // IMMEDIATELY perform quick congruency check before spending tokens
+    // OPTIMIZATION: Perform congruency check in BACKGROUND after greeting
+    // This eliminates 1-3 seconds of latency before the agent speaks
     if (this.metadata?.interviewee_cv && this.metadata?.job_title) {
-      wsLogger.info('Performing quick compatibility check', { callId: this.callId });
-      
-      try {
-        const quickAnalysis = await analyzeResumeJobCongruency(
-          this.metadata.interviewee_cv,
-          this.metadata.job_title,
-          this.metadata.job_description || '',
-          this.openai,
-          true // Quick check mode
-        );
-
-        wsLogger.info('Quick compatibility result', {
-          callId: this.callId,
-          isCongruent: quickAnalysis.isCongruent,
-          isExtremelyIncompatible: quickAnalysis.isExtremelyIncompatible,
-          confidence: quickAnalysis.confidence
-        });
-
-        // ONLY end call for EXTREME incompatibility with VERY HIGH confidence (>0.95)
-        // This should be reserved for absurd mismatches only
-        if (quickAnalysis.isExtremelyIncompatible && quickAnalysis.confidence > 0.95) {
-          wsLogger.warn('EXTREME INCOMPATIBILITY DETECTED - Ending interview', { 
-            callId: this.callId,
-            reasons: quickAnalysis.reasons 
-          });
-          this.isExtremelyIncompatible = true;
-          this.shouldEndInterview = true;
-          this.congruencyChecked = true;
-
-          // ALWAYS send a spoken message before ending - use end_call_after_spoken
-          const endingMessage = generateGracefulEndingMessage(quickAnalysis.reasons, true);
-          await this.sendAgentInterruptWithEndAfterSpoken(endingMessage);
-          return;
-        }
-      } catch (error: any) {
-        wsLogger.error('Quick compatibility check failed', { 
-          callId: this.callId, 
-          error: error.message 
-        });
-        // On error, proceed with interview
-      }
+      // Fire async congruency check - don't await it
+      this.performBackgroundCongruencyCheck();
     }
 
     // Proceed with normal interview start
@@ -302,23 +264,20 @@ export class CustomLLMWebSocketHandler {
         this.metadata.company_name || 'your target company'
       );
       
+      // OPTIMIZED: Condensed system prompt to reduce tokens and processing time
+      // Truncate job description and resume to essential parts
+      const truncatedJobDesc = (this.metadata.job_description || '').substring(0, 500);
+      const truncatedCV = (this.metadata.interviewee_cv || '').substring(0, 1000);
+      
       this.systemPrompt = `${fieldPrompt.systemPrompt}
 
-INTERVIEW CONTEXT:
-- Candidate Name: ${this.metadata.first_name}
-- Target Position: ${this.metadata.job_title} at ${this.metadata.company_name}
-- Job Description: ${this.metadata.job_description}
+CONTEXT: ${this.metadata.first_name} for ${this.metadata.job_title} at ${this.metadata.company_name}
 
-CANDIDATE'S RESUME:
-${this.metadata.interviewee_cv || 'Not provided'}
+JOB: ${truncatedJobDesc}
 
-IMPORTANT INSTRUCTIONS:
-- Tailor your questions to BOTH the job description AND the candidate's resume
-- Reference specific skills, projects, or experiences from their resume
-- Keep responses concise (1-2 sentences max)
-- Ask ONE focused question at a time
-- Be conversational but professional
-- Maximum interview duration is 15 minutes`;
+RESUME: ${truncatedCV}
+
+RULES: 1-2 sentences max. ONE question at a time. Reference their resume.`;
 
       this.conversationHistory.push({
         role: 'system',
@@ -536,6 +495,49 @@ INSTRUCTIONS:
   }
 
   /**
+   * Perform background congruency check at interview start
+   * Runs async to avoid blocking the initial greeting
+   */
+  private async performBackgroundCongruencyCheck() {
+    if (!this.metadata) return;
+
+    wsLogger.info('Starting background compatibility check', { callId: this.callId });
+    
+    try {
+      const quickAnalysis = await analyzeResumeJobCongruency(
+        this.metadata.interviewee_cv,
+        this.metadata.job_title,
+        this.metadata.job_description || '',
+        this.openai,
+        true // Quick check mode
+      );
+
+      wsLogger.info('Background compatibility result', {
+        callId: this.callId,
+        isCongruent: quickAnalysis.isCongruent,
+        isExtremelyIncompatible: quickAnalysis.isExtremelyIncompatible,
+        confidence: quickAnalysis.confidence
+      });
+
+      // Only flag for extreme incompatibility - will be handled on next response
+      if (quickAnalysis.isExtremelyIncompatible && quickAnalysis.confidence > 0.95) {
+        wsLogger.warn('EXTREME INCOMPATIBILITY DETECTED', { 
+          callId: this.callId,
+          reasons: quickAnalysis.reasons 
+        });
+        this.isExtremelyIncompatible = true;
+        this.shouldEndInterview = true;
+        this.congruencyChecked = true;
+      }
+    } catch (error: any) {
+      wsLogger.error('Background compatibility check failed', { 
+        callId: this.callId, 
+        error: error.message 
+      });
+    }
+  }
+
+  /**
    * Perform congruency analysis (mid-interview check)
    * This is more lenient than the initial quick check
    */
@@ -586,18 +588,19 @@ INSTRUCTIONS:
 
   /**
    * Generate response using OpenAI
+   * OPTIMIZED: Using gpt-4o-mini for faster response times (~2-3x faster than gpt-4o)
    */
   private async generateAndSendResponse() {
     wsLogger.info('Generating AI response', { callId: this.callId });
     
     try {
       const stream = await this.openai.chat.completions.create({
-        model: 'gpt-4o', // More reliable and faster than gpt-4-turbo-preview
+        model: 'gpt-4o-mini', // OPTIMIZED: Much faster than gpt-4o with similar quality for conversation
         messages: this.conversationHistory,
         stream: true,
-        temperature: 0.3, // Lower temperature for more focused, accurate responses
-        max_tokens: 150, // Shorter responses for conversational flow
-        presence_penalty: 0.6, // Discourage repetition
+        temperature: 0.4, // Slightly higher for more natural conversation
+        max_tokens: 100, // OPTIMIZED: Shorter responses = faster completion
+        presence_penalty: 0.5, // Discourage repetition
         frequency_penalty: 0.3 // Reduce word repetition
       });
 

@@ -590,7 +590,7 @@ router.get(
         position: i.jobTitle,
         company: i.companyName,
         createdAt: i.createdAt,
-        duration: Math.round((i.callDuration || 0) / 60), // Convert seconds to minutes
+        duration: Math.round((i.callDuration || 0) / 1000 / 60), // Convert milliseconds to minutes
         overallScore: i.score,
         status: i.status.toLowerCase()
       }));
