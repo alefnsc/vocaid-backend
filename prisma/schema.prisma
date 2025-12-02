@@ -1,0 +1,171 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ========================================
+// USER MODEL
+// Synced with Clerk - stores additional user data
+// ========================================
+model User {
+  id            String    @id @default(uuid()) @db.Uuid
+  clerkId       String    @unique @map("clerk_id")
+  email         String    @unique
+  firstName     String?   @map("first_name")
+  lastName      String?   @map("last_name")
+  imageUrl      String?   @map("image_url")
+  credits       Int       @default(0)
+  isActive      Boolean   @default(true) @map("is_active")
+  deletedAt     DateTime? @map("deleted_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  interviews    Interview[]
+  payments      Payment[]
+
+  @@index([clerkId])
+  @@index([email])
+  @@index([isActive])
+  @@map("users")
+}
+
+// ========================================
+// INTERVIEW MODEL
+// Stores interview sessions and their results
+// ========================================
+model Interview {
+  id              String           @id @default(uuid()) @db.Uuid
+  userId          String           @map("user_id") @db.Uuid
+  retellCallId    String?          @unique @map("retell_call_id")
+  
+  // Interview Details
+  jobTitle        String           @map("job_title")
+  companyName     String           @map("company_name")
+  jobDescription  String           @map("job_description") @db.Text
+  
+  // Resume stored as base64 or file reference
+  resumeData      String?          @map("resume_data") @db.Text
+  resumeFileName  String?          @map("resume_file_name")
+  resumeMimeType  String?          @map("resume_mime_type")
+  
+  // Interview Results
+  status          InterviewStatus  @default(PENDING)
+  score           Float?           @db.DoublePrecision
+  
+  // Feedback stored as base64 encoded PDF
+  feedbackPdf     String?          @map("feedback_pdf") @db.Text
+  feedbackText    String?          @map("feedback_text") @db.Text
+  
+  // Call metrics (from Retell)
+  callDuration    Int?             @map("call_duration") // in seconds
+  startedAt       DateTime?        @map("started_at")
+  endedAt         DateTime?        @map("ended_at")
+  
+  // Timestamps
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+
+  // Relations
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  metrics         InterviewMetric[]
+
+  @@index([userId])
+  @@index([retellCallId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("interviews")
+}
+
+// ========================================
+// INTERVIEW METRICS MODEL
+// Stores detailed interview performance metrics
+// ========================================
+model InterviewMetric {
+  id            String    @id @default(uuid()) @db.Uuid
+  interviewId   String    @map("interview_id") @db.Uuid
+  
+  // Metric categories
+  category      String    // e.g., "communication", "technical", "behavioral"
+  metricName    String    @map("metric_name")
+  score         Float     @db.DoublePrecision
+  maxScore      Float     @default(10) @map("max_score") @db.DoublePrecision
+  feedback      String?   @db.Text
+  
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  // Relations
+  interview     Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+
+  @@index([interviewId])
+  @@index([category])
+  @@map("interview_metrics")
+}
+
+// ========================================
+// PAYMENT MODEL
+// Stores payment transaction records
+// ========================================
+model Payment {
+  id                  String        @id @default(uuid()) @db.Uuid
+  userId              String        @map("user_id") @db.Uuid
+  
+  // MercadoPago identifiers
+  mercadoPagoId       String?       @unique @map("mercadopago_id")
+  preferenceId        String?       @map("preference_id")
+  
+  // Package details
+  packageId           String        @map("package_id")
+  packageName         String        @map("package_name")
+  creditsAmount       Int           @map("credits_amount")
+  
+  // Payment amounts
+  amountUSD           Float         @map("amount_usd") @db.DoublePrecision
+  amountBRL           Float         @map("amount_brl") @db.DoublePrecision
+  
+  // Payment status
+  status              PaymentStatus @default(PENDING)
+  statusDetail        String?       @map("status_detail")
+  
+  // Timestamps
+  paidAt              DateTime?     @map("paid_at")
+  createdAt           DateTime      @default(now()) @map("created_at")
+  updatedAt           DateTime      @updatedAt @map("updated_at")
+
+  // Relations
+  user                User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([mercadoPagoId])
+  @@index([status])
+  @@index([createdAt])
+  @@map("payments")
+}
+
+// ========================================
+// ENUMS
+// ========================================
+
+enum InterviewStatus {
+  PENDING     // Interview created but not started
+  IN_PROGRESS // Interview currently in progress
+  COMPLETED   // Interview completed successfully
+  FAILED      // Interview failed (technical error)
+  CANCELLED   // Interview cancelled by user
+}
+
+enum PaymentStatus {
+  PENDING     // Payment initiated
+  APPROVED    // Payment successful
+  REJECTED    // Payment rejected
+  CANCELLED   // Payment cancelled
+  REFUNDED    // Payment refunded
+  IN_PROCESS  // Payment being processed
+}

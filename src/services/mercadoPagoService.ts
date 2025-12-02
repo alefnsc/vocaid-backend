@@ -1,10 +1,53 @@
 import { MercadoPagoConfig, Preference, Payment } from 'mercadopago';
 import { clerkClient } from '@clerk/clerk-sdk-node';
+import { paymentLogger } from '../utils/logger';
+import { updateUserCredits } from './clerkService';
+
+// Import payment service for database operations (lazy to avoid circular deps)
+let paymentDbService: typeof import('./paymentService') | null = null;
+const getPaymentDbService = async () => {
+  if (!paymentDbService) {
+    paymentDbService = await import('./paymentService');
+  }
+  return paymentDbService;
+};
 
 /**
  * Mercado Pago Service for payment processing
  * Documentation: https://www.mercadopago.com.br/developers/pt/docs
+ * 
+ * Credential Selection Logic:
+ * - Development (NODE_ENV=development): Uses TEST credentials (sandbox)
+ * - Production (NODE_ENV=production): Uses PROD credentials (live)
  */
+
+// Environment-based credential selection
+const isProduction = process.env.NODE_ENV === 'production';
+
+export const getMercadoPagoCredentials = () => {
+  const accessToken = isProduction
+    ? process.env.MERCADOPAGO_ACCESS_TOKEN
+    : process.env.MERCADOPAGO_TEST_ACCESS_TOKEN || process.env.MERCADOPAGO_ACCESS_TOKEN;
+  
+  const publicKey = isProduction
+    ? process.env.MERCADOPAGO_PUBLIC_KEY
+    : process.env.MERCADOPAGO_TEST_PUBLIC_KEY || process.env.MERCADOPAGO_PUBLIC_KEY;
+
+  if (!accessToken) {
+    throw new Error(
+      `MercadoPago access token not configured. ` +
+      `Set ${isProduction ? 'MERCADOPAGO_ACCESS_TOKEN' : 'MERCADOPAGO_TEST_ACCESS_TOKEN'} in your .env file.`
+    );
+  }
+
+  paymentLogger.info('MercadoPago credentials loaded', {
+    environment: isProduction ? 'production' : 'development',
+    mode: isProduction ? 'LIVE' : 'SANDBOX',
+    publicKeyPrefix: publicKey?.substring(0, 15) + '...',
+  });
+
+  return { accessToken, publicKey };
+};
 
 export interface CreditPackage {
   id: string;
@@ -70,22 +113,20 @@ export class MercadoPagoService {
         throw new Error('Invalid package ID');
       }
 
-      console.log('Creating payment preference for:', { 
+      paymentLogger.info('Creating payment preference', { 
         packageId, 
         userId, 
         userEmail,
-        priceUSD: `$${pkg.priceUSD}`,
-        priceBRL: `R$ ${pkg.priceBRL}`
+        priceUSD: pkg.priceUSD,
+        priceBRL: pkg.priceBRL
       });
 
       const frontendUrl = process.env.FRONTEND_URL;
       const webhookUrl = process.env.WEBHOOK_BASE_URL;
-      
-      console.log('Payment URLs:', { frontendUrl, webhookUrl });
 
       // Validate frontend URL is set - required for MercadoPago redirects
       if (!frontendUrl) {
-        console.error('FRONTEND_URL environment variable is not set!');
+        paymentLogger.error('FRONTEND_URL environment variable is not set!');
         throw new Error('Server configuration error: FRONTEND_URL is required for payment processing');
       }
 
@@ -132,7 +173,7 @@ export class MercadoPagoService {
         // Use 'all' to redirect for all payment statuses (approved, pending, rejected)
         preferenceData.auto_return = 'all';
       } else {
-        console.log('⚠️ Localhost detected - skipping back_urls and auto_return (MercadoPago requires public URLs)');
+        paymentLogger.warn('Localhost detected - skipping back_urls (MercadoPago requires public URLs)');
       }
 
       // Only add notification_url if webhook URL is configured and not localhost
@@ -140,15 +181,33 @@ export class MercadoPagoService {
         preferenceData.notification_url = `${webhookUrl}/webhook/mercadopago`;
       }
 
-      console.log('Creating preference with back_urls:', preferenceData.back_urls || 'SKIPPED (localhost)');
-      console.log('Auto return:', preferenceData.auto_return || 'SKIPPED (localhost)');
-      console.log('Notification URL:', preferenceData.notification_url || 'SKIPPED');
-
       const response = await this.preference.create({ body: preferenceData });
 
-      console.log('Preference created successfully:', response.id);
-      console.log('Init point:', response.init_point);
-      console.log('Sandbox init point:', response.sandbox_init_point);
+      paymentLogger.info('Preference created successfully', { 
+        preferenceId: response.id,
+        initPoint: response.init_point 
+      });
+
+      // Store payment record in database
+      try {
+        const paymentDb = await getPaymentDbService();
+        await paymentDb.createPayment({
+          userId,
+          packageId,
+          packageName: pkg.name,
+          creditsAmount: pkg.credits,
+          amountUSD: pkg.priceUSD,
+          amountBRL: pkg.priceBRL,
+          preferenceId: response.id || undefined
+        });
+        paymentLogger.info('Payment record created in database', { preferenceId: response.id });
+      } catch (dbError: any) {
+        // Don't fail if DB write fails - payment can still proceed
+        paymentLogger.warn('Failed to create payment record in database', { 
+          error: dbError.message,
+          preferenceId: response.id 
+        });
+      }
 
       return {
         preferenceId: response.id,
@@ -156,8 +215,7 @@ export class MercadoPagoService {
         sandboxInitPoint: response.sandbox_init_point
       };
     } catch (error: any) {
-      console.error('Error creating preference:', error);
-      console.error('Error details:', error.cause || error.response?.data || error.message);
+      paymentLogger.error('Error creating preference', { error: error.message });
       throw new Error(`Failed to create preference: ${error.message}`);
     }
   }
@@ -177,7 +235,7 @@ export class MercadoPagoService {
         metadata: payment.metadata
       };
     } catch (error: any) {
-      console.error('Error verifying payment:', error);
+      paymentLogger.error('Error verifying payment', { paymentId, error: error.message });
       throw new Error(`Failed to verify payment: ${error.message}`);
     }
   }
@@ -197,7 +255,7 @@ export class MercadoPagoService {
       
       return result.results || [];
     } catch (error: any) {
-      console.error('Error getting recent payments:', error);
+      paymentLogger.error('Error getting recent payments', { error: error.message });
       return [];
     }
   }
@@ -207,14 +265,20 @@ export class MercadoPagoService {
    */
   async processWebhook(notification: any) {
     try {
-      console.log('Processing webhook notification:', notification);
+      paymentLogger.info('Processing webhook notification', { 
+        type: notification.type, 
+        dataId: notification.data?.id 
+      });
 
       // Mercado Pago sends type and data.id
       if (notification.type === 'payment') {
         const paymentId = notification.data.id;
         const paymentInfo = await this.verifyPayment(paymentId);
 
-        console.log('Payment info:', paymentInfo);
+        paymentLogger.info('Payment verification result', { 
+          paymentId, 
+          status: paymentInfo.status 
+        });
 
         // Only process approved payments
         if (paymentInfo.status === 'approved') {
@@ -224,6 +288,20 @@ export class MercadoPagoService {
           const credits = externalReference.credits;
 
           if (userId && credits) {
+            // Update payment in database
+            try {
+              const paymentDb = await getPaymentDbService();
+              await paymentDb.processSuccessfulPayment(
+                String(paymentId),
+                paymentInfo.status_detail
+              );
+              paymentLogger.info('Payment processed in database', { paymentId, userId, credits });
+            } catch (dbError: any) {
+              paymentLogger.warn('Failed to update payment in database', { 
+                error: dbError.message 
+              });
+            }
+
             // Add credits to user via Clerk
             await this.addCreditsToUser(userId, credits);
 
@@ -234,6 +312,20 @@ export class MercadoPagoService {
               credits
             };
           }
+        } else if (paymentInfo.status === 'rejected' || paymentInfo.status === 'cancelled') {
+          // Update payment status in database
+          try {
+            const paymentDb = await getPaymentDbService();
+            await paymentDb.processFailedPayment(
+              String(paymentId),
+              paymentInfo.status === 'rejected' ? 'REJECTED' : 'CANCELLED',
+              paymentInfo.status_detail
+            );
+          } catch (dbError: any) {
+            paymentLogger.warn('Failed to update failed payment in database', { 
+              error: dbError.message 
+            });
+          }
         }
       }
 
@@ -242,34 +334,25 @@ export class MercadoPagoService {
         message: 'Payment not approved or missing data'
       };
     } catch (error: any) {
-      console.error('Error processing webhook:', error);
+      paymentLogger.error('Error processing webhook', { error: error.message });
       throw new Error(`Failed to process webhook: ${error.message}`);
     }
   }
 
   /**
-   * Add credits to user via Clerk metadata
+   * Add credits to user via PostgreSQL database
+   * Uses clerkService which updates both PostgreSQL (source of truth) and Clerk metadata
    */
   private async addCreditsToUser(userId: string, creditsToAdd: number) {
     try {
       console.log(`Adding ${creditsToAdd} credits to user ${userId}`);
 
-      // Get current user
-      const user = await clerkClient.users.getUser(userId);
-      const currentCredits = (user.publicMetadata.credits as number) || 0;
-      const newCredits = currentCredits + creditsToAdd;
+      // Use updateUserCredits to update credits in PostgreSQL (source of truth)
+      const updatedUser = await updateUserCredits(userId, creditsToAdd, 'add');
 
-      // Update user metadata
-      await clerkClient.users.updateUser(userId, {
-        publicMetadata: {
-          ...user.publicMetadata,
-          credits: newCredits
-        }
-      });
+      console.log(`Credits updated for user ${userId}: new balance = ${updatedUser.credits}`);
 
-      console.log(`Credits updated: ${currentCredits} -> ${newCredits}`);
-
-      return newCredits;
+      return updatedUser.credits;
     } catch (error: any) {
       console.error('Error adding credits to user:', error);
       throw new Error(`Failed to add credits: ${error.message}`);

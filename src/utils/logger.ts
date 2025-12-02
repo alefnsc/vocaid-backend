@@ -3,18 +3,23 @@ import path from 'path';
 
 /**
  * Winston Logger Configuration
- * Three levels: INFO, WARNING, ERROR
+ * Levels: ERROR, WARN, INFO, DEBUG
+ * Components: websocket, retell, feedback, payment, auth, database, api
  */
 
 const logFormat = winston.format.combine(
   winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss.SSS' }),
   winston.format.errors({ stack: true }),
-  winston.format.printf(({ level, message, timestamp, stack, ...metadata }) => {
-    let log = `${timestamp} [${level.toUpperCase().padEnd(7)}] ${message}`;
+  winston.format.printf(({ level, message, timestamp, stack, component, ...metadata }) => {
+    const comp = component ? `[${component}]` : '';
+    let log = `${timestamp} [${level.toUpperCase().padEnd(7)}]${comp} ${message}`;
     
-    // Add metadata if present
-    if (Object.keys(metadata).length > 0) {
-      log += ` ${JSON.stringify(metadata)}`;
+    // Add metadata if present (excluding internal fields)
+    const metaKeys = Object.keys(metadata).filter(k => !['service', 'level', 'timestamp'].includes(k));
+    if (metaKeys.length > 0) {
+      const metaObj: Record<string, unknown> = {};
+      metaKeys.forEach(k => metaObj[k] = metadata[k]);
+      log += ` ${JSON.stringify(metaObj)}`;
     }
     
     // Add stack trace for errors
@@ -29,11 +34,15 @@ const logFormat = winston.format.combine(
 const coloredFormat = winston.format.combine(
   winston.format.colorize({ all: true }),
   winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss.SSS' }),
-  winston.format.printf(({ level, message, timestamp, ...metadata }) => {
-    let log = `${timestamp} [${level}] ${message}`;
+  winston.format.printf(({ level, message, timestamp, component, ...metadata }) => {
+    const comp = component ? `[${component}]` : '';
+    let log = `${timestamp} [${level}]${comp} ${message}`;
     
-    if (Object.keys(metadata).length > 0 && !metadata.stack) {
-      log += ` ${JSON.stringify(metadata)}`;
+    const metaKeys = Object.keys(metadata).filter(k => !['service', 'level', 'timestamp', 'stack'].includes(k));
+    if (metaKeys.length > 0) {
+      const metaObj: Record<string, unknown> = {};
+      metaKeys.forEach(k => metaObj[k] = metadata[k]);
+      log += ` ${JSON.stringify(metaObj)}`;
     }
     
     return log;
@@ -66,6 +75,20 @@ const logger = winston.createLogger({
       filename: path.join(logsDir, 'combined.log'),
       maxsize: 5242880, // 5MB
       maxFiles: 5
+    }),
+
+    // Database operations log
+    new winston.transports.File({
+      filename: path.join(logsDir, 'database.log'),
+      maxsize: 5242880, // 5MB
+      maxFiles: 3
+    }),
+
+    // API requests log
+    new winston.transports.File({
+      filename: path.join(logsDir, 'api.log'),
+      maxsize: 5242880, // 5MB
+      maxFiles: 3
     })
   ]
 });
@@ -76,5 +99,7 @@ export const retellLogger = logger.child({ component: 'retell' });
 export const feedbackLogger = logger.child({ component: 'feedback' });
 export const paymentLogger = logger.child({ component: 'payment' });
 export const authLogger = logger.child({ component: 'auth' });
+export const dbLogger = logger.child({ component: 'database' });
+export const apiLogger = logger.child({ component: 'api' });
 
 export default logger;

@@ -12,9 +12,12 @@ import crypto from 'crypto';
 
 // Services
 import { RetellService } from './services/retellService';
-import { MercadoPagoService } from './services/mercadoPagoService';
+import { MercadoPagoService, getMercadoPagoCredentials } from './services/mercadoPagoService';
 import { FeedbackService } from './services/feedbackService';
 import { CustomLLMWebSocketHandler } from './services/customLLMWebSocket';
+
+// Routes
+import apiRoutes from './routes/apiRoutes';
 
 // Logger
 import logger, { wsLogger, retellLogger, feedbackLogger, paymentLogger, authLogger } from './utils/logger';
@@ -27,9 +30,15 @@ const requiredEnvVars = [
   'OPENAI_API_KEY',
   'RETELL_API_KEY',
   'RETELL_AGENT_ID',
-  'MERCADOPAGO_ACCESS_TOKEN',
   'CLERK_SECRET_KEY'
 ];
+
+// MercadoPago credentials are validated based on NODE_ENV
+// Development: MERCADOPAGO_TEST_ACCESS_TOKEN (or fallback to MERCADOPAGO_ACCESS_TOKEN)
+// Production: MERCADOPAGO_ACCESS_TOKEN
+const mpEnvVar = process.env.NODE_ENV === 'production' 
+  ? 'MERCADOPAGO_ACCESS_TOKEN' 
+  : (process.env.MERCADOPAGO_TEST_ACCESS_TOKEN ? 'MERCADOPAGO_TEST_ACCESS_TOKEN' : 'MERCADOPAGO_ACCESS_TOKEN');
 
 // Optional env vars (warn but don't fail)
 const optionalEnvVars = ['GEMINI_API_KEY'];
@@ -58,6 +67,11 @@ optionalEnvVars.forEach(varName => {
 // Initialize Express app
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// ===== TRUST PROXY =====
+// Enable trust proxy for proper client IP detection behind reverse proxies (nginx, load balancers, etc.)
+// This is required for express-rate-limit to work correctly with X-Forwarded-For headers
+app.set('trust proxy', 1);
 
 // ===== SECURITY MIDDLEWARE =====
 
@@ -181,6 +195,9 @@ app.use(cors({
 app.use(bodyParser.json({ limit: '1mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '1mb' }));
 
+// Mount API routes for database operations (dashboard, interviews, payments, etc.)
+app.use('/api', apiRoutes);
+
 // ===== AUTHENTICATION MIDDLEWARE =====
 
 // Verify user ID from header matches Clerk format and is present
@@ -215,7 +232,13 @@ const openai = new OpenAI({
 });
 
 const retellService = new RetellService(process.env.RETELL_API_KEY || '');
-const mercadoPagoService = new MercadoPagoService(process.env.MERCADOPAGO_ACCESS_TOKEN || '');
+
+// MercadoPago: Uses getMercadoPagoCredentials() for environment-based credential selection
+// Development (NODE_ENV=development): Uses TEST credentials (sandbox)
+// Production (NODE_ENV=production): Uses PROD credentials (live)
+const { accessToken: mpAccessToken } = getMercadoPagoCredentials();
+const mercadoPagoService = new MercadoPagoService(mpAccessToken);
+
 const feedbackService = new FeedbackService(
   process.env.OPENAI_API_KEY || '',
   process.env.GEMINI_API_KEY // Optional Gemini fallback
@@ -574,23 +597,27 @@ app.get('/payment/history/:userId',
   }
 });
 
-// ===== CLERK WEBHOOKS =====
+// ===== CLERK WEBHOOKS & USER SYNC =====
 
 import { clerkClient } from '@clerk/clerk-sdk-node';
 import { Webhook } from 'svix';
-
-// Track processed webhook IDs to prevent replay attacks (in production, use Redis)
-const processedWebhookIds = new Set<string>();
-const WEBHOOK_ID_TTL = 5 * 60 * 1000; // 5 minutes
+import * as clerkService from './services/clerkService';
 
 /**
  * Clerk webhook handler for user events
  * POST /webhook/clerk
  * 
  * Handles:
- * - user.created: Grants 1 free credit to new users
+ * - user.created: Creates user in database, grants 1 free credit
+ * - user.updated: Syncs updated user data to database
+ * - user.deleted: Removes user and related data from database
  * 
  * Security: Verifies Svix signature when CLERK_WEBHOOK_SECRET is set
+ * 
+ * Required Clerk Webhook Events (configure in Clerk Dashboard):
+ * - user.created
+ * - user.updated
+ * - user.deleted
  */
 app.post('/webhook/clerk',
   webhookLimiter,
@@ -610,95 +637,79 @@ app.post('/webhook/clerk',
       }
       
       // Prevent replay attacks - check if we've seen this webhook ID
-      if (processedWebhookIds.has(svixId)) {
+      if (clerkService.isWebhookProcessed(svixId)) {
         authLogger.warn('Duplicate webhook ID detected (potential replay attack)', { svixId });
         return res.status(200).json({ status: 'ignored', message: 'Duplicate webhook' });
       }
       
-      try {
-        const wh = new Webhook(webhookSecret);
-        wh.verify(JSON.stringify(req.body), {
+      // Verify signature
+      const isValid = clerkService.verifyWebhookSignature(
+        JSON.stringify(req.body),
+        {
           'svix-id': svixId,
           'svix-timestamp': svixTimestamp,
           'svix-signature': svixSignature,
-        });
-        
-        // Mark webhook as processed
-        processedWebhookIds.add(svixId);
-        setTimeout(() => processedWebhookIds.delete(svixId), WEBHOOK_ID_TTL);
-        
-        authLogger.info('Clerk webhook signature verified');
-      } catch (verifyError) {
-        authLogger.error('Clerk webhook signature verification failed', { error: verifyError });
+        },
+        webhookSecret
+      );
+      
+      if (!isValid) {
+        authLogger.error('Clerk webhook signature verification failed');
         return res.status(401).json({ status: 'error', message: 'Invalid webhook signature' });
       }
+      
+      // Mark webhook as processed
+      clerkService.markWebhookProcessed(svixId);
+      authLogger.info('Clerk webhook signature verified');
     } else {
       authLogger.warn('CLERK_WEBHOOK_SECRET not set - webhook signature not verified');
     }
     
     const { type, data } = req.body;
+    const userId = data?.id || data?.user_id; // user_id for session events, id for user events
 
-    authLogger.info('Received Clerk webhook', { type, userId: data?.id });
+    authLogger.info('Received Clerk webhook', { type, userId });
 
-    if (type === 'user.created') {
-      const userId = data.id;
-      const userEmail = data.email_addresses?.[0]?.email_address;
+    // Validate user ID format for user/session events
+    const eventUserId = type.startsWith('session.') ? data?.user_id : data?.id;
+    if ((type.startsWith('user.') || type.startsWith('session.')) && eventUserId && !isValidUserId(eventUserId)) {
+      authLogger.warn('Invalid user ID in webhook', { userId: eventUserId, type });
+      return res.status(200).json({ status: 'ignored', message: 'Invalid user ID' });
+    }
+
+    // Process the webhook event using clerkService
+    try {
+      const result = await clerkService.processWebhookEvent({ type, data, object: 'event' });
       
-      // Validate user ID format
-      if (!userId || !isValidUserId(userId)) {
-        authLogger.warn('Invalid user ID in webhook', { userId });
-        return res.status(200).json({ status: 'ignored', message: 'Invalid user ID' });
-      }
-      
-      authLogger.info('New user registration', { userId, userEmail });
-
-      // Grant 1 free credit to new user (only if not already granted)
-      try {
-        // First, check if user already has freeTrialUsed set to true (prevent double grants)
-        const existingUser = await clerkClient.users.getUser(userId);
-        const existingMetadata = existingUser.publicMetadata || {};
-        
-        if (existingMetadata.freeTrialUsed === true) {
-          authLogger.warn('Free trial already used - skipping', { userId });
-          return res.status(200).json({
-            status: 'skipped',
-            message: 'Free trial already granted',
-            userId
-          });
+      // Extract ID from result based on event type
+      let resultId = null;
+      if (result) {
+        if ('id' in result) {
+          resultId = result.id;
+        } else if ('user' in result && result.user) {
+          resultId = result.user.id;
+        } else if ('session' in result && result.session) {
+          resultId = result.session.id;
         }
-        
-        // Grant free credit and mark as used
-        const currentCredits = (existingMetadata.credits as number) || 0;
-        await clerkClient.users.updateUser(userId, {
-          publicMetadata: {
-            ...existingMetadata,
-            credits: currentCredits + 1,
-            freeTrialUsed: true, // Mark as used to prevent duplicate grants
-            registrationDate: existingMetadata.registrationDate || new Date().toISOString()
-          }
-        });
-
-        authLogger.info('Free trial credit granted', { userId, credits: currentCredits + 1 });
-        
-        res.status(200).json({
-          status: 'success',
-          message: 'Free trial credit granted',
-          userId,
-          credits: currentCredits + 1
-        });
-      } catch (updateError: any) {
-        authLogger.error('Failed to grant free credit', { userId, error: updateError.message });
-        res.status(200).json({
-          status: 'error',
-          message: 'Failed to grant free credit',
-          error: updateError.message
-        });
       }
-    } else {
-      // Acknowledge other webhook types
+      
       res.status(200).json({
-        status: 'ok',
-        message: `Webhook type ${type} acknowledged`
+        status: 'success',
+        message: `Webhook ${type} processed successfully`,
+        userId: eventUserId,
+        result: resultId ? { id: resultId } : null
+      });
+    } catch (processError: any) {
+      authLogger.error('Failed to process webhook event', { 
+        type, 
+        userId, 
+        error: processError.message 
+      });
+      // Still return 200 to acknowledge receipt
+      res.status(200).json({
+        status: 'error',
+        message: `Failed to process ${type}`,
+        error: processError.message
       });
     }
   } catch (error: any) {
@@ -720,8 +731,174 @@ app.get('/webhook/clerk', (req: Request, res: Response) => {
     status: 'ok',
     message: 'Clerk webhook endpoint',
     url: `${process.env.WEBHOOK_BASE_URL}/webhook/clerk`,
-    events: ['user.created']
+    supportedEvents: clerkService.SUPPORTED_WEBHOOK_EVENTS,
+    description: 'Subscribe to these events in Clerk Dashboard > Webhooks'
   });
+});
+
+// ===== USER SYNC ENDPOINTS =====
+
+/**
+ * Sync user data on login
+ * POST /api/users/sync
+ * 
+ * Called by frontend when user logs in.
+ * Ensures user exists in local database, creates from Clerk if not found.
+ * 
+ * Protected: Requires valid user authentication
+ */
+app.post('/api/users/sync',
+  verifyUserAuth,
+  async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).authenticatedUserId;
+    
+    authLogger.info('User sync requested', { userId });
+
+    // Find or create user in database
+    const { user, source } = await clerkService.findOrCreateUserByClerkId(userId);
+
+    authLogger.info('User sync completed', { 
+      userId, 
+      dbUserId: user.id, 
+      source,
+      credits: user.credits 
+    });
+
+    res.json({
+      status: 'success',
+      message: source === 'clerk' ? 'User created from Clerk' : 'User found in database',
+      user: {
+        id: user.id,
+        clerkId: user.clerkId,
+        email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        imageUrl: user.imageUrl,
+        credits: user.credits,
+        createdAt: user.createdAt
+      }
+    });
+  } catch (error: any) {
+    authLogger.error('User sync failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to sync user',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * Get current user data
+ * GET /api/users/me
+ * 
+ * Returns the authenticated user's data from local database.
+ * If user doesn't exist, attempts to create from Clerk.
+ * 
+ * Protected: Requires valid user authentication
+ */
+app.get('/api/users/me',
+  verifyUserAuth,
+  async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).authenticatedUserId;
+    
+    // First try to get from database
+    let user = await clerkService.getUserFromDatabase(userId);
+    
+    // If not found, create from Clerk
+    if (!user) {
+      authLogger.info('User not in database, creating from Clerk', { userId });
+      const result = await clerkService.findOrCreateUserByClerkId(userId);
+      user = result.user as any;
+    }
+
+    // At this point user is guaranteed to exist
+    if (!user) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'User not found and could not be created'
+      });
+    }
+
+    res.json({
+      status: 'success',
+      user: {
+        id: user.id,
+        clerkId: user.clerkId,
+        email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        imageUrl: user.imageUrl,
+        credits: user.credits,
+        createdAt: user.createdAt,
+        updatedAt: user.updatedAt,
+        _count: (user as any)._count
+      }
+    });
+  } catch (error: any) {
+    authLogger.error('Failed to get user', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get user data',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * Validate user session and ensure user exists
+ * POST /api/users/validate
+ * 
+ * Called by frontend on interview page load and critical actions.
+ * Validates Clerk session and ensures user exists in database.
+ * Creates user from Clerk if not found.
+ * 
+ * Protected: Requires valid user authentication
+ */
+app.post('/api/users/validate',
+  verifyUserAuth,
+  async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).authenticatedUserId;
+    
+    authLogger.info('User validation requested', { userId });
+
+    // Validate and sync user
+    const { user, source, freeTrialGranted } = await clerkService.validateAndSyncUser(userId);
+
+    authLogger.info('User validation completed', { 
+      userId, 
+      dbUserId: user.id, 
+      source,
+      credits: user.credits,
+      freeTrialGranted
+    });
+
+    res.json({
+      status: 'success',
+      message: source === 'clerk' ? 'User created from Clerk' : 'User validated',
+      user: {
+        id: user.id,
+        clerkId: user.clerkId,
+        email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        imageUrl: user.imageUrl,
+        credits: user.credits,
+        createdAt: user.createdAt
+      },
+      freeTrialGranted
+    });
+  } catch (error: any) {
+    authLogger.error('User validation failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to validate user',
+      error: error.message
+    });
+  }
 });
 
 // ===== CREDITS MANAGEMENT =====
@@ -731,6 +908,7 @@ app.get('/webhook/clerk', (req: Request, res: Response) => {
  * POST /consume-credit
  * CRITICAL: This endpoint handles financial transactions
  * Protected: Requires valid user authentication + rate limited
+ * Uses PostgreSQL as source of truth for credits
  */
 app.post('/consume-credit',
   sensitiveLimiter,
@@ -761,9 +939,18 @@ app.post('/consume-credit',
 
     authLogger.info('Credit consumption requested', { userId, callId });
 
-    // Get current user credits
-    const user = await clerkClient.users.getUser(userId);
-    const currentCredits = (user.publicMetadata.credits as number) || 0;
+    // Get current user credits from PostgreSQL (source of truth)
+    const dbUser = await clerkService.getUserFromDatabase(userId);
+    
+    if (!dbUser) {
+      authLogger.warn('User not found in database', { userId });
+      return res.status(404).json({
+        status: 'error',
+        message: 'User not found'
+      });
+    }
+
+    const currentCredits = dbUser.credits;
 
     if (currentCredits <= 0) {
       authLogger.warn('Insufficient credits', { userId, currentCredits });
@@ -773,23 +960,16 @@ app.post('/consume-credit',
       });
     }
 
-    const newCredits = currentCredits - 1;
+    // Update credits in PostgreSQL (source of truth)
+    const updatedUser = await clerkService.updateUserCredits(userId, 1, 'subtract');
 
-    // Update user metadata with consumed credit
-    await clerkClient.users.updateUser(userId, {
-      publicMetadata: {
-        ...user.publicMetadata,
-        credits: newCredits
-      }
-    });
-
-    authLogger.info('Credit consumed', { userId, previousCredits: currentCredits, newCredits });
+    authLogger.info('Credit consumed', { userId, previousCredits: currentCredits, newCredits: updatedUser.credits });
 
     res.json({
       status: 'success',
       message: 'Credit consumed successfully',
       previousCredits: currentCredits,
-      newCredits: newCredits
+      newCredits: updatedUser.credits
     });
   } catch (error: any) {
     authLogger.error('Error consuming credit', { error: error.message });
@@ -804,6 +984,7 @@ app.post('/consume-credit',
  * Restore credits when interview is cancelled due to incompatibility
  * POST /restore-credit
  * Protected: Requires valid user authentication + rate limited
+ * Uses PostgreSQL as source of truth for credits
  */
 app.post('/restore-credit',
   sensitiveLimiter,
@@ -834,9 +1015,18 @@ app.post('/restore-credit',
 
     authLogger.info('Credit restoration requested', { userId, reason, callId });
 
-    // Get current user credits
-    const user = await clerkClient.users.getUser(userId);
-    const currentCredits = (user.publicMetadata.credits as number) || 0;
+    // Get current user credits from PostgreSQL (source of truth)
+    const dbUser = await clerkService.getUserFromDatabase(userId);
+    
+    if (!dbUser) {
+      authLogger.warn('User not found in database', { userId });
+      return res.status(404).json({
+        status: 'error',
+        message: 'User not found'
+      });
+    }
+
+    const currentCredits = dbUser.credits;
     
     // SECURITY: Cap maximum credits to prevent abuse
     const MAX_CREDITS = 100;
@@ -847,24 +1037,17 @@ app.post('/restore-credit',
         message: 'Maximum credit limit reached'
       });
     }
-    
-    const newCredits = currentCredits + 1;
 
-    // Update user metadata with restored credit
-    await clerkClient.users.updateUser(userId, {
-      publicMetadata: {
-        ...user.publicMetadata,
-        credits: newCredits
-      }
-    });
+    // Update credits in PostgreSQL (source of truth)
+    const updatedUser = await clerkService.updateUserCredits(userId, 1, 'add');
 
-    authLogger.info('Credit restored', { userId, previousCredits: currentCredits, newCredits });
+    authLogger.info('Credit restored', { userId, previousCredits: currentCredits, newCredits: updatedUser.credits });
 
     res.json({
       status: 'success',
       message: 'Credit restored successfully',
       previousCredits: currentCredits,
-      newCredits: newCredits
+      newCredits: updatedUser.credits
     });
   } catch (error: any) {
     authLogger.error('Error restoring credit', { error: error.message });

@@ -1,0 +1,18 @@
+
+> voxly-backend@1.1.0 start
+> node dist/server.js
+
+Starting October 8, 2024, the Node SDK is entering a three-month notice period. We encourage everyone to migrate to @clerk/express. For full details, please see our changelog: https://clerk.com/changelog/2024-10-08-express-sdk
+2025-12-01 21:02:00.049 [[32minfo[39m][payment] [32mMercadoPago credentials loaded[39m {"environment":"development","mode":"SANDBOX","publicKeyPrefix":"APP_USR-d16dff7..."}
+2025-12-01 21:02:00.049 [[32minfo[39m][feedback] [32mGemini fallback initialized[39m
+2025-12-01 21:02:00.051 [[32minfo[39m] [32mWebSocket endpoints initialized[39m {"pattern1":"/llm-websocket/:call_id","pattern2":"/llm-websocket/:placeholder/:actual_call_id"}
+2025-12-01 21:02:00.051 [[32minfo[39m] [32m════════════════════════════════════════════════════════════[39m
+2025-12-01 21:02:00.052 [[32minfo[39m] [32m🎙️  Voxly Backend Server Running[39m
+2025-12-01 21:02:00.052 [[32minfo[39m] [32m════════════════════════════════════════════════════════════[39m
+2025-12-01 21:02:00.052 [[32minfo[39m] [32mPort: 3001[39m
+2025-12-01 21:02:00.052 [[32minfo[39m] [32mEnvironment: development[39m
+2025-12-01 21:02:00.052 [[32minfo[39m] [32mEndpoints:[39m {"http":"http://localhost:3001","websocket":"ws://localhost:3001/llm-websocket","health":"http://localhost:3001/health"}
+2025-12-01 21:02:00.052 [[32minfo[39m] [32mServices: Retell Custom LLM, Mercado Pago, OpenAI, Clerk[39m
+2025-12-01 21:02:00.052 [[32minfo[39m] [32mCustom LLM WebSocket URL: wss://f72957e5fb0c.ngrok-free.app/llm-websocket/{call_id}[39m
+2025-12-01 21:02:00.052 [[32minfo[39m] [32mWebhook URL: https://f72957e5fb0c.ngrok-free.app/webhook/mercadopago[39m
+2025-12-01 21:02:00.052 [[32minfo[39m] [32m════════════════════════════════════════════════════════════[39m

@@ -1,25 +1,46 @@
 {
   "name": "voxly-backend",
-  "version": "1.0.0",
-  "description": "Backend server for Voxly Interview Platform with Retell Custom LLM and Mercado Pago integration",
+  "version": "1.1.0",
+  "description": "Backend server for Voxly Interview Platform with Retell Custom LLM, Mercado Pago, and PostgreSQL database",
   "main": "dist/server.js",
   "scripts": {
     "start": "node dist/server.js",
-    "dev": "tsx watch src/server.ts",
-    "build": "tsc",
-    "test": "jest"
+    "dev": "nodemon --exec tsx src/server.ts",
+    "dev:watch": "tsx watch src/server.ts",
+    "build": "prisma generate && tsc",
+    "build:clean": "rm -rf dist && npm run build",
+    "test": "jest",
+    "db:generate": "prisma generate",
+    "db:push": "prisma db push",
+    "db:migrate": "prisma migrate dev",
+    "db:migrate:deploy": "prisma migrate deploy",
+    "db:migrate:reset": "prisma migrate reset",
+    "db:studio": "prisma studio",
+    "db:seed": "tsx prisma/seed.ts",
+    "docker:up": "docker-compose up -d",
+    "docker:down": "docker-compose down",
+    "docker:logs": "docker-compose logs -f",
+    "docker:reset": "docker-compose down -v && docker-compose up -d",
+    "docker:ps": "docker-compose ps",
+    "setup": "docker-compose up -d && npm install && prisma generate && prisma migrate dev",
+    "setup:fresh": "docker-compose down -v && docker-compose up -d && npm install && prisma generate && prisma migrate dev",
+    "lint": "eslint src/**/*.ts",
+    "typecheck": "tsc --noEmit"
   },
   "keywords": [
     "retell",
     "custom-llm",
     "interview",
-    "mercadopago"
+    "mercadopago",
+    "prisma",
+    "postgresql"
   ],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "@clerk/clerk-sdk-node": "^5.0.59",
     "@google/generative-ai": "^0.24.1",
+    "@prisma/client": "^6.8.0",
     "@types/express-ws": "^3.0.6",
     "axios": "^1.7.9",
     "body-parser": "^1.20.3",
@@ -29,14 +50,14 @@
     "express-rate-limit": "^8.2.1",
     "express-validator": "^7.3.1",
     "express-ws": "^5.0.2",
-    "gh-pages": "^6.3.0",
     "helmet": "^8.1.0",
     "mercadopago": "^2.0.15",
     "openai": "^4.77.3",
     "retell-sdk": "^4.0.0",
     "svix": "^1.81.0",
     "winston": "^3.18.3",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "zod": "^3.24.0"
   },
   "devDependencies": {
     "@types/body-parser": "^1.19.5",
@@ -44,7 +65,19 @@
     "@types/express": "^5.0.0",
     "@types/node": "^22.10.2",
     "@types/ws": "^8.5.13",
+    "nodemon": "^3.1.0",
+    "prisma": "^6.8.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
+  },
+  "prisma": {
+    "schema": "prisma/schema.prisma",
+    "seed": "tsx prisma/seed.ts"
+  },
+  "nodemonConfig": {
+    "watch": ["src"],
+    "ext": "ts,json",
+    "ignore": ["src/**/*.spec.ts"],
+    "delay": "500"
   }
 }
