@@ -438,21 +438,54 @@ app.post('/create-payment-preference',
 /**
  * Mercado Pago webhook handler
  * POST /webhook/mercadopago
+ * Handles both IPN (query params) and Webhook (body) formats
  * Rate limited to prevent replay attacks
  */
 app.post('/webhook/mercadopago',
   webhookLimiter,
   async (req: Request, res: Response) => {
   try {
-    paymentLogger.info('Received Mercado Pago webhook', { type: req.body?.type });
+    // MercadoPago can send data in body (webhook) or query params (IPN)
+    const webhookData = req.body && Object.keys(req.body).length > 0 
+      ? req.body 
+      : req.query;
 
-    // Basic validation of webhook payload
-    if (!req.body || !req.body.type) {
-      paymentLogger.warn('Invalid webhook payload received');
+    paymentLogger.info('Received Mercado Pago webhook', { 
+      type: webhookData?.type,
+      action: webhookData?.action,
+      dataId: webhookData?.data?.id || webhookData?.id,
+      topic: webhookData?.topic,
+      source: req.body && Object.keys(req.body).length > 0 ? 'body' : 'query'
+    });
+
+    // Handle IPN format (topic + id in query params)
+    if (webhookData?.topic && webhookData?.id) {
+      paymentLogger.info('Processing IPN notification', { 
+        topic: webhookData.topic, 
+        id: webhookData.id 
+      });
+      
+      // Convert IPN format to webhook format for processing
+      const ipnData = {
+        type: webhookData.topic === 'payment' ? 'payment' : webhookData.topic,
+        action: 'payment.updated',
+        data: { id: webhookData.id }
+      };
+      
+      const result = await mercadoPagoService.processWebhook(ipnData);
+      return res.status(200).json({ status: 'success', result });
+    }
+
+    // Handle webhook format (type + data.id in body)
+    if (!webhookData || !webhookData.type) {
+      paymentLogger.warn('Invalid webhook payload received', { 
+        body: JSON.stringify(req.body),
+        query: JSON.stringify(req.query)
+      });
       return res.status(200).json({ status: 'ignored', message: 'Invalid payload' });
     }
 
-    const result = await mercadoPagoService.processWebhook(req.body);
+    const result = await mercadoPagoService.processWebhook(webhookData);
 
     // Acknowledge receipt
     res.status(200).json({

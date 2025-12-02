@@ -629,22 +629,11 @@ router.get(
         });
       }
       
-      const result = await paymentService.getUserPayments(clerkId, {});
-      
-      // Format for frontend
-      const formattedPayments = result.payments.map(p => ({
-        id: p.id,
-        amount: p.amountUSD,
-        currency: 'USD',
-        credits: p.creditsAmount,
-        status: p.status.toLowerCase(),
-        createdAt: p.createdAt,
-        paymentMethod: 'MercadoPago'
-      }));
+      const result = await paymentService.getUserPayments(clerkId, { limit: 50 });
       
       res.json({
         status: 'success',
-        data: formattedPayments
+        data: result.payments
       });
     } catch (error: any) {
       dbLogger.error('Error fetching user payments', { error: error.message });

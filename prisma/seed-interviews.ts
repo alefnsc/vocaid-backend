@@ -1,4 +1,4 @@
-import { PrismaClient, InterviewStatus } from '@prisma/client';
+import { PrismaClient, InterviewStatus, PaymentStatus } from '@prisma/client';
 
 const prisma = new PrismaClient();
 
@@ -15,6 +15,55 @@ async function main() {
   }
   
   console.log('Found user:', user.email);
+  
+  // Create mock payments first
+  const payments = [
+    {
+      userId: user.id,
+      packageId: 'starter',
+      packageName: 'Starter',
+      creditsAmount: 5,
+      amountUSD: 3.99,
+      amountBRL: 23.94,
+      status: PaymentStatus.APPROVED,
+      mercadoPagoId: 'mock_payment_1',
+      preferenceId: 'mock_pref_1',
+      createdAt: new Date('2025-11-20T10:00:00Z'),
+    },
+    {
+      userId: user.id,
+      packageId: 'intermediate',
+      packageName: 'Intermediate',
+      creditsAmount: 10,
+      amountUSD: 5.99,
+      amountBRL: 35.94,
+      status: PaymentStatus.APPROVED,
+      mercadoPagoId: 'mock_payment_2',
+      preferenceId: 'mock_pref_2',
+      createdAt: new Date('2025-11-25T14:30:00Z'),
+    },
+    {
+      userId: user.id,
+      packageId: 'professional',
+      packageName: 'Professional',
+      creditsAmount: 15,
+      amountUSD: 7.99,
+      amountBRL: 47.94,
+      status: PaymentStatus.APPROVED,
+      mercadoPagoId: 'mock_payment_3',
+      preferenceId: 'mock_pref_3',
+      createdAt: new Date('2025-12-01T09:00:00Z'),
+    },
+  ];
+  
+  console.log('\nCreating mock payments...');
+  
+  for (const paymentData of payments) {
+    const payment = await prisma.payment.create({
+      data: paymentData
+    });
+    console.log('Created payment:', payment.packageName, '- $' + payment.amountUSD);
+  }
   
   const interviews = [
     {

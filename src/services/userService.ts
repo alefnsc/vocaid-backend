@@ -227,13 +227,49 @@ export async function getUserDashboardStats(clerkId: string) {
     score: i.score
   }));
 
+  // Calculate interviews this month
+  const now = new Date();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  const interviewsThisMonth = user.interviews.filter(i => 
+    new Date(i.createdAt) >= startOfMonth
+  ).length;
+
+  // Calculate score change (compare last month vs current month)
+  const startOfLastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+  const endOfLastMonth = new Date(now.getFullYear(), now.getMonth(), 0);
+  
+  const lastMonthInterviews = user.interviews.filter(i => {
+    const date = new Date(i.createdAt);
+    return date >= startOfLastMonth && date <= endOfLastMonth;
+  });
+  
+  const thisMonthInterviews = user.interviews.filter(i => 
+    new Date(i.createdAt) >= startOfMonth
+  );
+  
+  const lastMonthAvg = lastMonthInterviews.length > 0
+    ? lastMonthInterviews.reduce((sum, i) => sum + (i.score || 0), 0) / lastMonthInterviews.length
+    : 0;
+  
+  const thisMonthAvg = thisMonthInterviews.length > 0
+    ? thisMonthInterviews.reduce((sum, i) => sum + (i.score || 0), 0) / thisMonthInterviews.length
+    : 0;
+  
+  const scoreChange = lastMonthAvg > 0 
+    ? Math.round(((thisMonthAvg - lastMonthAvg) / lastMonthAvg) * 100)
+    : 0;
+
   return {
     userId: user.id,
     credits: user.credits,
+    creditsRemaining: user.credits,
     totalInterviews: completedInterviews,
+    completedInterviews,
     averageScore: Math.round(averageScore * 10) / 10,
     totalSpent: Math.round(totalSpent * 100) / 100,
     totalCreditsPurchased,
-    scoreEvolution
+    scoreEvolution,
+    interviewsThisMonth,
+    scoreChange
   };
 }
