@@ -1,10 +1,13 @@
 import OpenAI from 'openai';
+import { AIService, getAIService, ChatMessage } from '../services/aiService';
 
 /**
  * Resume-Job Congruency Analyzer
  * 
  * Analyzes the match between a candidate's resume and a job description
  * to determine if the interview should proceed or end gracefully.
+ * 
+ * Uses AIService for OpenAI with automatic Gemini fallback on errors.
  */
 
 export interface CongruencyAnalysis {
@@ -27,6 +30,9 @@ export async function analyzeResumeJobCongruency(
   openai: OpenAI,
   quickCheck: boolean = false
 ): Promise<CongruencyAnalysis> {
+  // Get AIService for fallback support
+  const aiService = getAIService();
+  
   try {
     // For quick check at start, use VERY lenient analysis
     const analysisPrompt = quickCheck 
@@ -120,24 +126,22 @@ Respond with this exact JSON format:
   }
 }`;
 
-    const response = await openai.chat.completions.create({
+    const systemPrompt = 'You are a fair and encouraging recruiter. Your job is to give candidates a chance. Only reject candidates for EXTREME mismatches. When in doubt, let them interview. Always respond with valid JSON only.';
+
+    const messages: ChatMessage[] = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: analysisPrompt }
+    ];
+
+    // Use AIService with automatic fallback
+    const responseContent = await aiService.chatCompletion(messages, {
       model: quickCheck ? 'gpt-4o-mini' : 'gpt-4o',
-      messages: [
-        {
-          role: 'system',
-          content: 'You are a fair and encouraging recruiter. Your job is to give candidates a chance. Only reject candidates for EXTREME mismatches. When in doubt, let them interview. Always respond with valid JSON only.'
-        },
-        {
-          role: 'user',
-          content: analysisPrompt
-        }
-      ],
-      temperature: 0.1, // Very low temperature for consistent, conservative results
-      max_tokens: quickCheck ? 400 : 700,
-      response_format: { type: 'json_object' }
+      temperature: 0.1,
+      maxTokens: quickCheck ? 400 : 700,
+      responseFormat: 'json'
     });
 
-    const analysis = JSON.parse(response.choices[0].message.content || '{}');
+    const analysis = JSON.parse(responseContent || '{}');
     
     // Additional safety: Override extremely incompatible if confidence is not very high
     const isExtremelyIncompatible = analysis.isExtremelyIncompatible === true && 

@@ -8,10 +8,14 @@ import { clerkClient } from '@clerk/clerk-sdk-node';
 interface RegisterCallBody {
   metadata: {
     first_name: string;
+    last_name?: string;
     job_title: string;
     company_name: string;
     job_description: string;
-    interviewee_cv: string;
+    interviewee_cv: string; // Base64 encoded resume content
+    resume_file_name?: string;
+    resume_mime_type?: string;
+    interview_id?: string;
   };
 }
 

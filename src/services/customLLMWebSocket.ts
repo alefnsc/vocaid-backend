@@ -9,6 +9,7 @@ import {
 } from '../utils/congruencyAnalyzer';
 import { InterviewTimer } from '../utils/interviewTimer';
 import { wsLogger } from '../utils/logger';
+import { AIService, getAIService, ChatMessage } from './aiService';
 
 /**
  * Retell Custom LLM WebSocket Handler
@@ -40,10 +41,14 @@ interface CustomLLMRequest {
   }>;
   metadata?: {
     first_name: string;
+    last_name?: string;
     job_title: string;
     company_name: string;
     job_description: string;
-    interviewee_cv: string;
+    interviewee_cv: string; // Base64 encoded resume content
+    resume_file_name?: string;
+    resume_mime_type?: string;
+    interview_id?: string;
   };
   // Retell LLM dynamic variables passed during call
   retell_llm_dynamic_variables?: {
@@ -73,7 +78,8 @@ interface CustomLLMResponse {
 export class CustomLLMWebSocketHandler {
   private ws: WebSocket;
   private openai: OpenAI;
-  private conversationHistory: OpenAI.Chat.ChatCompletionMessageParam[] = [];
+  private aiService: AIService;
+  private conversationHistory: ChatMessage[] = [];
   private systemPrompt: string = '';
   private responseId: number = 0;
   private callId: string = '';
@@ -89,11 +95,15 @@ export class CustomLLMWebSocketHandler {
   constructor(ws: WebSocket, openai: OpenAI, callId?: string) {
     this.ws = ws;
     this.openai = openai;
+    this.aiService = getAIService();
     this.callId = callId || '';
     this.interviewTimer = new InterviewTimer(
       parseInt(process.env.MAX_INTERVIEW_DURATION_MINUTES || '15')
     );
-    wsLogger.info('CustomLLMWebSocketHandler created', { callId: this.callId });
+    wsLogger.info('CustomLLMWebSocketHandler created', { 
+      callId: this.callId,
+      aiProvider: this.aiService.getCurrentProvider()
+    });
     
     // Send initial config response when WebSocket opens
     // This tells Retell we want to receive call_details
@@ -587,57 +597,65 @@ INSTRUCTIONS:
   }
 
   /**
-   * Generate response using OpenAI
+   * Generate response using AIService (OpenAI with Gemini fallback)
    * OPTIMIZED: Using gpt-4o-mini for faster response times (~2-3x faster than gpt-4o)
+   * FALLBACK: Automatically falls back to Gemini on OpenAI errors
    */
   private async generateAndSendResponse() {
-    wsLogger.info('Generating AI response', { callId: this.callId });
+    wsLogger.info('Generating AI response', { 
+      callId: this.callId,
+      provider: this.aiService.getCurrentProvider()
+    });
     
     try {
-      const stream = await this.openai.chat.completions.create({
-        model: 'gpt-4o-mini', // OPTIMIZED: Much faster than gpt-4o with similar quality for conversation
-        messages: this.conversationHistory,
-        stream: true,
-        temperature: 0.4, // Slightly higher for more natural conversation
-        max_tokens: 100, // OPTIMIZED: Shorter responses = faster completion
-        presence_penalty: 0.5, // Discourage repetition
-        frequency_penalty: 0.3 // Reduce word repetition
-      });
-
       let fullResponse = '';
       let chunkCount = 0;
 
+      // Use AIService streaming with automatic fallback
+      const stream = this.aiService.streamChatCompletion(
+        this.conversationHistory,
+        {
+          model: 'gpt-4o-mini', // Will fallback to gemini-1.5-flash if needed
+          temperature: 0.4,
+          maxTokens: 100,
+          presencePenalty: 0.5,
+          frequencyPenalty: 0.3
+        }
+      );
+
       for await (const chunk of stream) {
-        const content = chunk.choices[0]?.delta?.content || '';
-        if (content) {
-          fullResponse += content;
+        if (chunk.content) {
+          fullResponse += chunk.content;
           chunkCount++;
           
           // Send streaming response
           const response: CustomLLMResponse = {
             response_type: 'response',
             response_id: this.responseId,
-            content: content,
+            content: chunk.content,
             content_complete: false
           };
           this.ws.send(JSON.stringify(response));
         }
-      }
 
-      // Send completion
-      const finalResponse: CustomLLMResponse = {
-        response_type: 'response',
-        response_id: this.responseId,
-        content: '',
-        content_complete: true
-      };
-      this.ws.send(JSON.stringify(finalResponse));
+        if (chunk.isComplete) {
+          // Send completion
+          const finalResponse: CustomLLMResponse = {
+            response_type: 'response',
+            response_id: this.responseId,
+            content: '',
+            content_complete: true
+          };
+          this.ws.send(JSON.stringify(finalResponse));
+        }
+      }
 
       wsLogger.info('AI response sent', { 
         callId: this.callId, 
         responseId: this.responseId,
         chunkCount,
-        responseLength: fullResponse.length 
+        responseLength: fullResponse.length,
+        provider: this.aiService.getCurrentProvider()
       });
 
       // Add to conversation history
@@ -648,10 +666,15 @@ INSTRUCTIONS:
 
       this.responseId++;
     } catch (error: any) {
-      wsLogger.error('Error generating OpenAI response', { 
+      wsLogger.error('Error generating AI response', { 
         callId: this.callId, 
-        error: error.message 
+        error: error.message,
+        provider: this.aiService.getCurrentProvider()
       });
+
+      // Send a fallback response to avoid silence
+      const fallbackMessage = "I apologize, I'm having a brief technical issue. Could you please repeat what you just said?";
+      await this.sendResponse(fallbackMessage, false);
     }
   }
 
