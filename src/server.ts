@@ -20,7 +20,7 @@ import { CustomLLMWebSocketHandler } from './services/customLLMWebSocket';
 import apiRoutes from './routes/apiRoutes';
 
 // Logger
-import logger, { wsLogger, retellLogger, feedbackLogger, paymentLogger, authLogger } from './utils/logger';
+import logger, { wsLogger, retellLogger, feedbackLogger, paymentLogger, authLogger, httpLogger } from './utils/logger';
 
 // Load environment variables
 dotenv.config();
@@ -194,6 +194,64 @@ app.use(cors({
 // Body parsers with size limits to prevent large payload attacks
 app.use(bodyParser.json({ limit: '1mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '1mb' }));
+
+// ===== HTTP REQUEST LOGGING MIDDLEWARE =====
+// Log all incoming requests with detailed metadata for debugging data flow issues
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const startTime = Date.now();
+  const requestId = crypto.randomUUID().slice(0, 8);
+  
+  // Attach request ID for tracking through the request lifecycle
+  (req as any).requestId = requestId;
+  
+  // Extract user ID from headers for correlation
+  const userId = req.headers['x-user-id'] as string || 'anonymous';
+  const userIdShort = userId.startsWith('user_') ? userId.slice(0, 15) + '...' : userId;
+  
+  // Log incoming request
+  httpLogger.info(`→ ${req.method} ${req.path}`, {
+    requestId,
+    userId: userIdShort,
+    query: Object.keys(req.query).length > 0 ? req.query : undefined,
+    contentLength: req.headers['content-length'],
+    origin: req.headers.origin || req.headers.referer || 'direct'
+  });
+  
+  // Capture response details
+  const originalSend = res.send;
+  res.send = function(body: any) {
+    const duration = Date.now() - startTime;
+    const statusCode = res.statusCode;
+    
+    // Determine log level based on status code
+    const logLevel = statusCode >= 500 ? 'error' : statusCode >= 400 ? 'warn' : 'info';
+    
+    // Parse response body size
+    const bodySize = typeof body === 'string' ? body.length : JSON.stringify(body || {}).length;
+    
+    // Log response with appropriate level
+    httpLogger[logLevel](`← ${req.method} ${req.path} ${statusCode}`, {
+      requestId,
+      userId: userIdShort,
+      status: statusCode,
+      duration: `${duration}ms`,
+      size: `${Math.round(bodySize / 1024)}KB`
+    });
+    
+    // Log warnings for slow requests
+    if (duration > 2000) {
+      httpLogger.warn(`⚠ Slow request detected`, {
+        requestId,
+        path: req.path,
+        duration: `${duration}ms`
+      });
+    }
+    
+    return originalSend.call(this, body);
+  };
+  
+  next();
+});
 
 // Mount API routes for database operations (dashboard, interviews, payments, etc.)
 app.use('/api', apiRoutes);

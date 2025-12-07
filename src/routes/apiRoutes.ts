@@ -12,6 +12,7 @@ import * as interviewService from '../services/interviewService';
 import * as paymentService from '../services/paymentService';
 import { sendFeedbackEmail } from '../services/emailService';
 import { dbLogger } from '../services/databaseService';
+import { apiLogger } from '../utils/logger';
 
 // Schemas
 import {
@@ -174,8 +175,23 @@ router.get(
     try {
       const clerkId = (req as any).clerkUserId;
       const query = (req as any).validatedQuery;
+      const requestId = (req as any).requestId || 'N/A';
+      
+      apiLogger.info('Fetching interviews list', { 
+        requestId, 
+        userId: clerkId.slice(0, 15), 
+        page: query.page, 
+        limit: query.limit 
+      });
       
       const result = await interviewService.getUserInterviews(clerkId, query);
+      
+      apiLogger.info('Interviews fetched successfully', {
+        requestId,
+        count: result.interviews.length,
+        total: result.pagination.total,
+        page: result.pagination.page
+      });
       
       res.json({
         status: 'success',
@@ -183,7 +199,10 @@ router.get(
         pagination: result.pagination
       });
     } catch (error: any) {
-      dbLogger.error('Error fetching interviews', { error: error.message });
+      apiLogger.error('Error fetching interviews', { 
+        error: error.message,
+        requestId: (req as any).requestId 
+      });
       res.status(500).json({
         status: 'error',
         message: 'Failed to fetch interviews'
@@ -202,11 +221,19 @@ router.get(
     try {
       const { interviewId } = req.params;
       const clerkId = (req as any).clerkUserId;
+      const requestId = (req as any).requestId || 'N/A';
+      
+      apiLogger.info('Fetching interview details', { 
+        requestId, 
+        interviewId: interviewId.slice(0, 8) + '...',
+        userId: clerkId.slice(0, 15)
+      });
       
       // Validate UUID
       try {
         uuidSchema.parse(interviewId);
       } catch {
+        apiLogger.warn('Invalid interview ID format', { requestId, interviewId });
         return res.status(400).json({
           status: 'error',
           message: 'Invalid interview ID format'
@@ -216,6 +243,7 @@ router.get(
       const interview = await interviewService.getInterviewById(interviewId);
       
       if (!interview) {
+        apiLogger.warn('Interview not found', { requestId, interviewId });
         return res.status(404).json({
           status: 'error',
           message: 'Interview not found'
@@ -250,12 +278,23 @@ router.get(
         } : null
       };
       
+      apiLogger.info('Interview details fetched', {
+        requestId,
+        interviewId: interviewId.slice(0, 8) + '...',
+        hasScore: interview.score !== null,
+        hasFeedback: interview.feedbackText !== null,
+        status: interview.status
+      });
+      
       res.json({
         status: 'success',
         data: transformedInterview
       });
     } catch (error: any) {
-      dbLogger.error('Error fetching interview', { error: error.message });
+      apiLogger.error('Error fetching interview', { 
+        error: error.message,
+        requestId: (req as any).requestId
+      });
       res.status(500).json({
         status: 'error',
         message: 'Failed to fetch interview'
@@ -560,9 +599,20 @@ router.get(
     try {
       const { userId } = req.params;
       const clerkId = (req as any).clerkUserId;
+      const requestId = (req as any).requestId || 'N/A';
+      
+      apiLogger.info('Fetching dashboard stats', { 
+        requestId, 
+        userId: userId.slice(0, 15) 
+      });
       
       // Verify user is accessing their own data
       if (userId !== clerkId) {
+        apiLogger.warn('Access denied - user mismatch', { 
+          requestId, 
+          requestedUser: userId.slice(0, 15),
+          actualUser: clerkId.slice(0, 15)
+        });
         return res.status(403).json({
           status: 'error',
           message: 'Access denied'
@@ -572,27 +622,40 @@ router.get(
       const stats = await userService.getUserDashboardStats(clerkId);
       
       if (!stats) {
+        apiLogger.warn('User not found for stats', { requestId, userId: userId.slice(0, 15) });
         return res.status(404).json({
           status: 'error',
           message: 'User not found'
         });
       }
       
+      const responseData = {
+        totalInterviews: stats.totalInterviews,
+        completedInterviews: stats.totalInterviews,
+        averageScore: stats.averageScore,
+        totalSpent: stats.totalSpent,
+        creditsRemaining: stats.credits,
+        scoreChange: 0, // TODO: Calculate actual change
+        interviewsThisMonth: 0 // TODO: Calculate
+      };
+      
+      apiLogger.info('Dashboard stats fetched', {
+        requestId,
+        totalInterviews: stats.totalInterviews,
+        avgScore: stats.averageScore,
+        credits: stats.credits
+      });
+      
       // Format response for frontend
       res.json({
         status: 'success',
-        data: {
-          totalInterviews: stats.totalInterviews,
-          completedInterviews: stats.totalInterviews,
-          averageScore: stats.averageScore,
-          totalSpent: stats.totalSpent,
-          creditsRemaining: stats.credits,
-          scoreChange: 0, // TODO: Calculate actual change
-          interviewsThisMonth: 0 // TODO: Calculate
-        }
+        data: responseData
       });
     } catch (error: any) {
-      dbLogger.error('Error fetching user stats', { error: error.message });
+      apiLogger.error('Error fetching user stats', { 
+        error: error.message,
+        requestId: (req as any).requestId 
+      });
       res.status(500).json({
         status: 'error',
         message: 'Failed to fetch user statistics'
@@ -612,9 +675,18 @@ router.get(
       const { userId } = req.params;
       const clerkId = (req as any).clerkUserId;
       const { page = '1', limit = '10' } = req.query;
+      const requestId = (req as any).requestId || 'N/A';
+      
+      apiLogger.info('Fetching user interviews list', { 
+        requestId, 
+        userId: userId.slice(0, 15),
+        page,
+        limit
+      });
       
       // Verify user is accessing their own data
       if (userId !== clerkId) {
+        apiLogger.warn('Access denied - user mismatch', { requestId });
         return res.status(403).json({
           status: 'error',
           message: 'Access denied'
@@ -637,13 +709,22 @@ router.get(
         status: i.status.toLowerCase()
       }));
       
+      apiLogger.info('User interviews fetched', {
+        requestId,
+        count: formattedInterviews.length,
+        total: result.pagination.total
+      });
+      
       res.json({
         status: 'success',
         data: formattedInterviews,
         pagination: result.pagination
       });
     } catch (error: any) {
-      dbLogger.error('Error fetching user interviews', { error: error.message });
+      apiLogger.error('Error fetching user interviews', { 
+        error: error.message,
+        requestId: (req as any).requestId 
+      });
       res.status(500).json({
         status: 'error',
         message: 'Failed to fetch interviews'
@@ -698,6 +779,13 @@ router.get(
       const { userId } = req.params;
       const clerkId = (req as any).clerkUserId;
       const { months = '6' } = req.query;
+      const requestId = (req as any).requestId || 'N/A';
+      
+      apiLogger.info('Fetching score evolution', { 
+        requestId, 
+        userId: userId.slice(0, 15),
+        months 
+      });
       
       // Verify user is accessing their own data
       if (userId !== clerkId) {
@@ -728,12 +816,20 @@ router.get(
           interviewId: '' // TODO: Include interview ID
         }));
       
+      apiLogger.info('Score evolution fetched', {
+        requestId,
+        dataPoints: scoreEvolution.length
+      });
+      
       res.json({
         status: 'success',
         data: scoreEvolution
       });
     } catch (error: any) {
-      dbLogger.error('Error fetching score evolution', { error: error.message });
+      apiLogger.error('Error fetching score evolution', { 
+        error: error.message,
+        requestId: (req as any).requestId 
+      });
       res.status(500).json({
         status: 'error',
         message: 'Failed to fetch score evolution'

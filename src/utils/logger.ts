@@ -4,7 +4,16 @@ import path from 'path';
 /**
  * Winston Logger Configuration
  * Levels: ERROR, WARN, INFO, DEBUG
- * Components: websocket, retell, feedback, payment, auth, database, api
+ * Components: websocket, retell, feedback, payment, auth, database, api, http
+ * 
+ * Log Strategy:
+ * - HTTP: All incoming requests with method, path, status, duration
+ * - API: Endpoint-specific business logic
+ * - AUTH: User validation and session management
+ * - DATABASE: Query operations and data access
+ * - PAYMENT: Transaction processing
+ * - FEEDBACK: Interview feedback generation
+ * - WEBSOCKET: Real-time communication
  */
 
 const logFormat = winston.format.combine(
@@ -53,19 +62,19 @@ const coloredFormat = winston.format.combine(
 const logsDir = path.join(process.cwd(), 'logs');
 
 // Determine log level based on environment
+// Use 'info' for better visibility of request flow
 const isProduction = process.env.NODE_ENV === 'production';
-const logLevel = process.env.LOG_LEVEL || (isProduction ? 'warn' : 'info');
+const logLevel = process.env.LOG_LEVEL || 'info';
 
 const logger = winston.createLogger({
   level: logLevel,
   format: logFormat,
   defaultMeta: { service: 'voxly-backend' },
   transports: [
-    // Console output with colors
+    // Console output with colors - show info level for request visibility
     new winston.transports.Console({
       format: coloredFormat,
-      // In production, only log warn and above to console
-      level: isProduction ? 'warn' : logLevel
+      level: logLevel
     }),
     
     // Error log file
@@ -76,12 +85,20 @@ const logger = winston.createLogger({
       maxFiles: 5
     }),
     
-    // Combined log file - only errors and warnings in production
+    // Combined log file - all levels for debugging
     new winston.transports.File({
       filename: path.join(logsDir, 'combined.log'),
-      level: isProduction ? 'warn' : 'info',
+      level: 'info',
       maxsize: 5242880, // 5MB
       maxFiles: 3
+    }),
+    
+    // Request-specific log file for tracing data flow issues
+    new winston.transports.File({
+      filename: path.join(logsDir, 'requests.log'),
+      level: 'info',
+      maxsize: 10485760, // 10MB
+      maxFiles: 5
     })
   ]
 });
@@ -94,5 +111,6 @@ export const paymentLogger = logger.child({ component: 'payment' });
 export const authLogger = logger.child({ component: 'auth' });
 export const dbLogger = logger.child({ component: 'database' });
 export const apiLogger = logger.child({ component: 'api' });
+export const httpLogger = logger.child({ component: 'http' });
 
 export default logger;
