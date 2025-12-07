@@ -5,7 +5,7 @@
 
 import { prisma, dbLogger } from './databaseService';
 import { Prisma } from '@prisma/client';
-import { clerkClient } from '@clerk/clerk-sdk-node';
+import { clerkClient } from '@clerk/express';
 
 // ========================================
 // USER CRUD OPERATIONS

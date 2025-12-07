@@ -631,7 +631,7 @@ app.get('/payment/history/:userId',
 
 // ===== CLERK WEBHOOKS & USER SYNC =====
 
-import { clerkClient } from '@clerk/clerk-sdk-node';
+import { clerkClient } from '@clerk/express';
 import { Webhook } from 'svix';
 import * as clerkService from './services/clerkService';
 

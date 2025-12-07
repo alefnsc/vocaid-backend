@@ -1,5 +1,5 @@
 import Retell from 'retell-sdk';
-import { clerkClient } from '@clerk/clerk-sdk-node';
+import { clerkClient } from '@clerk/express';
 
 /**
  * Retell Service for managing interview calls

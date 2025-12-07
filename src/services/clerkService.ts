@@ -3,7 +3,7 @@
  * Handles Clerk webhook events and user synchronization
  */
 
-import { clerkClient } from '@clerk/clerk-sdk-node';
+import { clerkClient } from '@clerk/express';
 import { Webhook } from 'svix';
 import { prisma, dbLogger } from './databaseService';
 import { authLogger } from '../utils/logger';

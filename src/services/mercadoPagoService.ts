@@ -1,5 +1,5 @@
 import { MercadoPagoConfig, Preference, Payment } from 'mercadopago';
-import { clerkClient } from '@clerk/clerk-sdk-node';
+import { clerkClient } from '@clerk/express';
 import { paymentLogger } from '../utils/logger';
 import { updateUserCredits } from './clerkService';
 
