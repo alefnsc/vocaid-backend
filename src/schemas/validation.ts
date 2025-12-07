@@ -61,7 +61,7 @@ export const createInterviewSchema = z.object({
   userId: uuidSchema.or(clerkUserIdSchema),
   jobTitle: z.string().min(1).max(200).transform(val => val.trim()),
   companyName: z.string().min(1).max(200).transform(val => val.trim()),
-  jobDescription: z.string().min(200).max(50000).transform(val => val.trim()),
+  jobDescription: z.string().min(10).max(50000).transform(val => val.trim()),
   resumeData: z.string().optional(), // Base64 encoded
   resumeFileName: z.string().max(255).optional(),
   resumeMimeType: z.string().max(100).optional()
