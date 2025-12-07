@@ -10,6 +10,7 @@ import { z, ZodError } from 'zod';
 import * as userService from '../services/userService';
 import * as interviewService from '../services/interviewService';
 import * as paymentService from '../services/paymentService';
+import { sendFeedbackEmail } from '../services/emailService';
 import { dbLogger } from '../services/databaseService';
 
 // Schemas
@@ -796,6 +797,103 @@ router.get(
       res.status(500).json({
         status: 'error',
         message: 'Failed to fetch spending history'
+      });
+    }
+  }
+);
+
+// ========================================
+// EMAIL ROUTES
+// ========================================
+
+/**
+ * POST /api/interviews/:interviewId/send-feedback-email
+ * Send interview feedback email to user
+ */
+router.post(
+  '/interviews/:interviewId/send-feedback-email',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const { interviewId } = req.params;
+      const clerkId = (req as any).clerkUserId;
+      
+      // Validate UUID
+      try {
+        uuidSchema.parse(interviewId);
+      } catch {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Invalid interview ID format'
+        });
+      }
+      
+      // Get interview with user data
+      const interview = await interviewService.getInterviewById(interviewId);
+      
+      if (!interview) {
+        return res.status(404).json({
+          status: 'error',
+          message: 'Interview not found'
+        });
+      }
+      
+      // Verify ownership
+      if (interview.user.clerkId !== clerkId) {
+        return res.status(403).json({
+          status: 'error',
+          message: 'Access denied'
+        });
+      }
+      
+      // Check if interview has feedback
+      if (!interview.score && !interview.feedbackText) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'No feedback available for this interview'
+        });
+      }
+      
+      // Send feedback email
+      const result = await sendFeedbackEmail({
+        toEmail: interview.user.email || '',
+        candidateName: `${interview.user.firstName || ''} ${interview.user.lastName || ''}`.trim() || 'Candidate',
+        jobTitle: interview.jobTitle,
+        companyName: interview.companyName,
+        score: interview.score || 0,
+        interviewId: interview.id,
+        feedbackPdfBase64: interview.feedbackPdf,
+        resumeBase64: interview.resumeData,
+        resumeFileName: interview.resumeFileName,
+        feedbackSummary: interview.feedbackText?.split('\n')[0] || undefined
+      });
+      
+      if (!result.success) {
+        dbLogger.error('Failed to send feedback email', { 
+          interviewId, 
+          error: result.error 
+        });
+        return res.status(500).json({
+          status: 'error',
+          message: result.error || 'Failed to send email'
+        });
+      }
+      
+      dbLogger.info('Feedback email sent', { 
+        interviewId, 
+        messageId: result.messageId 
+      });
+      
+      res.json({
+        status: 'success',
+        message: 'Feedback email sent successfully',
+        messageId: result.messageId
+      });
+    } catch (error: any) {
+      dbLogger.error('Error sending feedback email', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to send feedback email'
       });
     }
   }

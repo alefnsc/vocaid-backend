@@ -52,6 +52,7 @@
     "helmet": "^8.1.0",
     "mercadopago": "^2.0.15",
     "openai": "^4.77.3",
+    "resend": "^6.5.2",
     "retell-sdk": "^4.0.0",
     "svix": "^1.81.0",
     "winston": "^3.18.3",
