@@ -229,9 +229,29 @@ router.get(
         });
       }
       
+      // Transform interview data to frontend expected format
+      const transformedInterview = {
+        ...interview,
+        // Build structured feedback object from metrics and feedbackText
+        feedback: interview.score !== null ? {
+          overallScore: interview.score || 0,
+          // Extract category scores from metrics or use overall score as fallback
+          contentScore: interview.metrics?.find(m => m.category === 'content')?.score ?? interview.score ?? 0,
+          communicationScore: interview.metrics?.find(m => m.category === 'communication')?.score ?? interview.score ?? 0,
+          confidenceScore: interview.metrics?.find(m => m.category === 'confidence')?.score ?? interview.score ?? 0,
+          technicalScore: interview.metrics?.find(m => m.category === 'technical')?.score ?? interview.score ?? 0,
+          summary: interview.feedbackText?.split('\n')[0] || 'Interview completed.',
+          // Parse strengths, improvements, recommendations from feedbackText if available
+          strengths: parseFeedbackSection(interview.feedbackText, 'Strengths'),
+          improvements: parseFeedbackSection(interview.feedbackText, 'Areas for Improvement') || 
+                       parseFeedbackSection(interview.feedbackText, 'Improvements'),
+          recommendations: parseFeedbackSection(interview.feedbackText, 'Recommendations')
+        } : null
+      };
+      
       res.json({
         status: 'success',
-        data: interview
+        data: transformedInterview
       });
     } catch (error: any) {
       dbLogger.error('Error fetching interview', { error: error.message });
@@ -242,6 +262,27 @@ router.get(
     }
   }
 );
+
+/**
+ * Helper function to parse feedback sections from markdown text
+ */
+function parseFeedbackSection(feedbackText: string | null, sectionName: string): string[] {
+  if (!feedbackText) return [];
+  
+  const regex = new RegExp(`##\\s*${sectionName}[\\s\\S]*?(?=##|$)`, 'i');
+  const match = feedbackText.match(regex);
+  
+  if (!match) return [];
+  
+  // Extract bullet points
+  const items = match[0]
+    .split('\n')
+    .filter(line => line.trim().startsWith('-'))
+    .map(line => line.replace(/^-\s*/, '').trim())
+    .filter(item => item.length > 0);
+  
+  return items;
+}
 
 /**
  * POST /api/interviews - Create new interview
