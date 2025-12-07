@@ -41,7 +41,7 @@ const mpEnvVar = process.env.NODE_ENV === 'production'
   : (process.env.MERCADOPAGO_TEST_ACCESS_TOKEN ? 'MERCADOPAGO_TEST_ACCESS_TOKEN' : 'MERCADOPAGO_ACCESS_TOKEN');
 
 // Optional env vars (warn but don't fail)
-const optionalEnvVars = ['GEMINI_API_KEY'];
+const optionalEnvVars: string[] = [];
 
 const missingEnvVars = requiredEnvVars.filter(varName => {
   const value = process.env[varName];
@@ -240,8 +240,7 @@ const { accessToken: mpAccessToken } = getMercadoPagoCredentials();
 const mercadoPagoService = new MercadoPagoService(mpAccessToken);
 
 const feedbackService = new FeedbackService(
-  process.env.OPENAI_API_KEY || '',
-  process.env.GEMINI_API_KEY // Optional Gemini fallback
+  process.env.OPENAI_API_KEY || ''
 );
 
 // Health check endpoint

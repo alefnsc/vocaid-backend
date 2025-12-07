@@ -39,7 +39,6 @@
   "license": "ISC",
   "dependencies": {
     "@clerk/clerk-sdk-node": "^5.0.59",
-    "@google/generative-ai": "^0.24.1",
     "@prisma/client": "^6.8.0",
     "@types/express-ws": "^3.0.6",
     "axios": "^1.7.9",
@@ -75,9 +74,13 @@
     "seed": "tsx prisma/seed.ts"
   },
   "nodemonConfig": {
-    "watch": ["src"],
+    "watch": [
+      "src"
+    ],
     "ext": "ts,json",
-    "ignore": ["src/**/*.spec.ts"],
+    "ignore": [
+      "src/**/*.spec.ts"
+    ],
     "delay": "500"
   }
 }

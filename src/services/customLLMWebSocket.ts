@@ -9,7 +9,6 @@ import {
 } from '../utils/congruencyAnalyzer';
 import { InterviewTimer } from '../utils/interviewTimer';
 import { wsLogger } from '../utils/logger';
-import { AIService, getAIService, ChatMessage } from './aiService';
 
 /**
  * Retell Custom LLM WebSocket Handler
@@ -75,10 +74,14 @@ interface CustomLLMResponse {
   };
 }
 
+interface ChatMessage {
+  role: 'system' | 'user' | 'assistant';
+  content: string;
+}
+
 export class CustomLLMWebSocketHandler {
   private ws: WebSocket;
   private openai: OpenAI;
-  private aiService: AIService;
   private conversationHistory: ChatMessage[] = [];
   private systemPrompt: string = '';
   private responseId: number = 0;
@@ -95,14 +98,12 @@ export class CustomLLMWebSocketHandler {
   constructor(ws: WebSocket, openai: OpenAI, callId?: string) {
     this.ws = ws;
     this.openai = openai;
-    this.aiService = getAIService();
     this.callId = callId || '';
     this.interviewTimer = new InterviewTimer(
       parseInt(process.env.MAX_INTERVIEW_DURATION_MINUTES || '15')
     );
     wsLogger.info('CustomLLMWebSocketHandler created', { 
-      callId: this.callId,
-      aiProvider: this.aiService.getCurrentProvider()
+      callId: this.callId
     });
     
     // Send initial config response when WebSocket opens
@@ -597,48 +598,48 @@ INSTRUCTIONS:
   }
 
   /**
-   * Generate response using AIService (OpenAI with Gemini fallback)
+   * Generate response using OpenAI streaming
    * OPTIMIZED: Using gpt-4o-mini for faster response times (~2-3x faster than gpt-4o)
-   * FALLBACK: Automatically falls back to Gemini on OpenAI errors
    */
   private async generateAndSendResponse() {
     wsLogger.info('Generating AI response', { 
-      callId: this.callId,
-      provider: this.aiService.getCurrentProvider()
+      callId: this.callId
     });
     
     try {
       let fullResponse = '';
       let chunkCount = 0;
 
-      // Use AIService streaming with automatic fallback
-      const stream = this.aiService.streamChatCompletion(
-        this.conversationHistory,
-        {
-          model: 'gpt-4o-mini', // Will fallback to gemini-1.5-flash if needed
-          temperature: 0.4,
-          maxTokens: 100,
-          presencePenalty: 0.5,
-          frequencyPenalty: 0.3
-        }
-      );
+      // Use OpenAI streaming directly
+      const stream = await this.openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: this.conversationHistory.map(m => ({ role: m.role, content: m.content })),
+        temperature: 0.4,
+        max_tokens: 100,
+        presence_penalty: 0.5,
+        frequency_penalty: 0.3,
+        stream: true
+      });
 
       for await (const chunk of stream) {
-        if (chunk.content) {
-          fullResponse += chunk.content;
+        const content = chunk.choices[0]?.delta?.content || '';
+        const isComplete = chunk.choices[0]?.finish_reason !== null;
+        
+        if (content) {
+          fullResponse += content;
           chunkCount++;
           
           // Send streaming response
           const response: CustomLLMResponse = {
             response_type: 'response',
             response_id: this.responseId,
-            content: chunk.content,
+            content: content,
             content_complete: false
           };
           this.ws.send(JSON.stringify(response));
         }
 
-        if (chunk.isComplete) {
+        if (isComplete) {
           // Send completion
           const finalResponse: CustomLLMResponse = {
             response_type: 'response',
@@ -654,8 +655,7 @@ INSTRUCTIONS:
         callId: this.callId, 
         responseId: this.responseId,
         chunkCount,
-        responseLength: fullResponse.length,
-        provider: this.aiService.getCurrentProvider()
+        responseLength: fullResponse.length
       });
 
       // Add to conversation history
@@ -668,8 +668,7 @@ INSTRUCTIONS:
     } catch (error: any) {
       wsLogger.error('Error generating AI response', { 
         callId: this.callId, 
-        error: error.message,
-        provider: this.aiService.getCurrentProvider()
+        error: error.message
       });
 
       // Send a fallback response to avoid silence

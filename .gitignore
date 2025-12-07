@@ -29,3 +29,6 @@ Thumbs.db
 
 # Test coverage
 coverage/
+
+# SSH Keys
+keys/
