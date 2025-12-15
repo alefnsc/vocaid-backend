@@ -291,16 +291,26 @@ export class MercadoPagoService {
 
           if (userId && credits) {
             // Try to update payment in database (non-blocking)
-            // This links the MercadoPago payment ID to our payment record
+            // First try to update by mercadoPagoId (processSuccessfulPayment)
+            let paymentLinked = false;
             try {
               const paymentDb = await getPaymentDbService();
-              await paymentDb.linkMercadoPagoPayment(
-                userId,
-                packageId,
-                String(paymentId),
-                paymentInfo.status_detail
-              );
-              paymentLogger.info('Payment linked in database', { paymentId, userId, packageId });
+              try {
+                await paymentDb.processSuccessfulPayment(String(paymentId), paymentInfo.status_detail);
+                paymentLogger.info('Payment updated by mercadoPagoId', { paymentId });
+                paymentLinked = true;
+              } catch (err) {
+                paymentLogger.warn('Could not update payment by mercadoPagoId, falling back to link by user/package', { paymentId, userId, packageId });
+                // Fallback: link by user/package if not found by mercadoPagoId
+                await paymentDb.linkMercadoPagoPayment(
+                  userId,
+                  packageId,
+                  String(paymentId),
+                  paymentInfo.status_detail
+                );
+                paymentLogger.info('Payment linked in database (fallback)', { paymentId, userId, packageId });
+                paymentLinked = true;
+              }
             } catch (dbError: any) {
               // This is non-critical - credits will still be added
               paymentLogger.warn('Could not link payment in database (non-critical)', { 
