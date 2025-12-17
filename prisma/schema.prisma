@@ -31,6 +31,9 @@ model User {
   interviews    Interview[]
   payments      Payment[]
   signupRecord  SignupRecord?
+  scoreHistory  InterviewScoreHistory[]
+  usageLogs     UsageLog[]
+  chatSessions  ChatSession[]
 
   @@index([clerkId])
   @@index([email])
@@ -55,8 +58,22 @@ model SignupRecord {
   // Additional device info
   userAgent       String?   @map("user_agent") @db.Text
   
+  // Email domain for disposable email detection
+  emailDomain     String?   @map("email_domain")
+  
   // Whether free credit was granted
   freeCreditGranted Boolean @default(false) @map("free_credit_granted")
+  
+  // Credit throttling tier: 'full', 'throttled', 'blocked'
+  creditTier      String    @default("full") @map("credit_tier")
+  
+  // Verification status
+  phoneVerified   Boolean   @default(false) @map("phone_verified")
+  captchaCompleted Boolean  @default(false) @map("captcha_completed")
+  linkedInId      String?   @map("linkedin_id")
+  
+  // Behavioral analysis score (0-100)
+  behaviorScore   Int       @default(50) @map("behavior_score")
   
   // Fraud flags
   isSuspicious    Boolean   @default(false) @map("is_suspicious")
@@ -69,7 +86,10 @@ model SignupRecord {
 
   @@index([ipAddress])
   @@index([deviceFingerprint])
+  @@index([emailDomain])
   @@index([freeCreditGranted])
+  @@index([creditTier])
+  @@index([phoneVerified])
   @@map("signup_records")
 }
 
@@ -105,6 +125,9 @@ model Interview {
   startedAt       DateTime?        @map("started_at")
   endedAt         DateTime?        @map("ended_at")
   
+  // Transcript storage for performance chat
+  transcript      String?          @db.Text
+  
   // Timestamps
   createdAt       DateTime         @default(now()) @map("created_at")
   updatedAt       DateTime         @updatedAt @map("updated_at")
@@ -112,11 +135,14 @@ model Interview {
   // Relations
   user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
   metrics         InterviewMetric[]
+  scoreHistory    InterviewScoreHistory[]
 
   @@index([userId])
   @@index([retellCallId])
   @@index([status])
   @@index([createdAt])
+  @@index([jobTitle])
+  @@index([companyName])
   @@map("interviews")
 }
 
@@ -183,6 +209,157 @@ model Payment {
   @@index([status])
   @@index([createdAt])
   @@map("payments")
+}
+
+// ========================================
+// INTERVIEW SCORE HISTORY MODEL
+// Historical score tracking by role and company for analytics
+// ========================================
+model InterviewScoreHistory {
+  id            String    @id @default(uuid()) @db.Uuid
+  userId        String    @map("user_id") @db.Uuid
+  interviewId   String    @map("interview_id") @db.Uuid
+  
+  // Role and company for filtering/aggregation
+  role          String    // Normalized job title/role
+  company       String    // Company name
+  
+  // Scores
+  overallScore  Float     @map("overall_score") @db.DoublePrecision
+  technicalScore Float?   @map("technical_score") @db.DoublePrecision
+  communicationScore Float? @map("communication_score") @db.DoublePrecision
+  confidenceScore Float?  @map("confidence_score") @db.DoublePrecision
+  
+  // Metadata
+  callDuration  Int?      @map("call_duration") // in seconds
+  
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  // Relations
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  interview     Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+
+  @@index([userId, role])
+  @@index([userId, company])
+  @@index([userId, createdAt])
+  @@index([createdAt])
+  @@index([role])
+  @@map("interview_score_history")
+}
+
+// ========================================
+// USAGE LOG MODEL
+// Tracks user activity for analytics and monitoring
+// ========================================
+model UsageLog {
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @map("user_id") @db.Uuid
+  
+  // Event type: 'interview_started', 'interview_completed', 'credits_purchased', etc.
+  eventType   String    @map("event_type")
+  
+  // Flexible event data
+  eventData   Json?     @map("event_data") @db.JsonB
+  
+  // For quick time-series queries
+  timestamp   DateTime  @default(now())
+  
+  // Relations
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, timestamp])
+  @@index([eventType, timestamp])
+  @@index([timestamp])
+  @@map("usage_logs")
+}
+
+// ========================================
+// DISPOSABLE EMAIL DOMAIN MODEL
+// Blocklist for temporary/disposable email providers
+// ========================================
+model DisposableEmailDomain {
+  id        String    @id @default(uuid()) @db.Uuid
+  domain    String    @unique
+  source    String?   // Where this domain was sourced from
+  isActive  Boolean   @default(true) @map("is_active")
+  addedAt   DateTime  @default(now()) @map("added_at")
+
+  @@index([domain])
+  @@index([isActive])
+  @@map("disposable_email_domains")
+}
+
+// ========================================
+// SUBNET TRACKER MODEL
+// Tracks signup velocity from IP subnets for abuse detection
+// ========================================
+model SubnetTracker {
+  id            String    @id @default(uuid()) @db.Uuid
+  subnet        String    // /24 subnet (e.g., "192.168.1.0/24")
+  signupCount   Int       @default(1) @map("signup_count")
+  lastSignupAt  DateTime  @default(now()) @map("last_signup_at")
+  windowStart   DateTime  @default(now()) @map("window_start")
+  
+  // Automatic cleanup after 24 hours
+  expiresAt     DateTime  @map("expires_at")
+
+  @@unique([subnet, windowStart])
+  @@index([subnet])
+  @@index([windowStart])
+  @@index([expiresAt])
+  @@map("subnet_trackers")
+}
+
+// ========================================
+// PERFORMANCE CHAT SESSION MODEL
+// Stores chat history for performance analyst conversations
+// ========================================
+model ChatSession {
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @map("user_id") @db.Uuid
+  
+  // Chat context filters
+  roleFilter  String?   @map("role_filter")
+  companyFilter String? @map("company_filter")
+  
+  // Session state
+  isActive    Boolean   @default(true) @map("is_active")
+  
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages    ChatMessage[]
+
+  @@index([userId])
+  @@index([isActive])
+  @@map("chat_sessions")
+}
+
+// ========================================
+// CHAT MESSAGE MODEL
+// Individual messages in a chat session
+// ========================================
+model ChatMessage {
+  id          String    @id @default(uuid()) @db.Uuid
+  sessionId   String    @map("session_id") @db.Uuid
+  
+  // Message content
+  role        String    // 'user' or 'assistant'
+  content     String    @db.Text
+  
+  // Optional metadata
+  metadata    Json?     @db.JsonB
+  
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  // Relations
+  session     ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@index([createdAt])
+  @@map("chat_messages")
 }
 
 // ========================================

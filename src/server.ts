@@ -18,6 +18,7 @@ import { CustomLLMWebSocketHandler } from './services/customLLMWebSocket';
 
 // Routes
 import apiRoutes from './routes/apiRoutes';
+import analyticsRoutes from './routes/analyticsRoutes';
 
 // Logger
 import logger, { wsLogger, retellLogger, feedbackLogger, paymentLogger, authLogger, httpLogger } from './utils/logger';
@@ -255,6 +256,9 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
 // Mount API routes for database operations (dashboard, interviews, payments, etc.)
 app.use('/api', apiRoutes);
+
+// Mount analytics, performance chat, and abuse detection routes
+app.use('/api', analyticsRoutes);
 
 // ===== AUTHENTICATION MIDDLEWARE =====
 
