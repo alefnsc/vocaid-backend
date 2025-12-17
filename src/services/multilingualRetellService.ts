@@ -2,13 +2,19 @@
  * Multilingual Retell Service
  * 
  * Extends the base Retell service to support multiple languages.
- * Selects appropriate agent/voice based on user's language preferences.
+ * Uses a SINGLE multilingual Retell agent for most languages,
+ * with language-specific configuration injected via Custom LLM.
+ * 
+ * Architecture:
+ * - Single multilingual agent (RETELL_AGENT_ID) for: PT, EN, ES, FR, RU, HI
+ * - Separate Chinese agent (RETELL_AGENT_ID_ZH) for: ZH-CN, ZH-TW
+ * - Language context is passed to Custom LLM WebSocket for prompt injection
  * 
  * Key features:
- * - Language-specific agent selection
+ * - Language-aware agent selection
  * - Voice ID mapping for accurate TTS accents
  * - Dynamic variable injection with language context
- * - Performance optimizations for real-time voice interaction
+ * - Custom LLM prompt localization
  * 
  * @module services/multilingualRetellService
  */
@@ -26,32 +32,77 @@ import {
 import { getUserPreferences } from './userPreferencesService';
 
 // ========================================
-// RETELL LANGUAGE CONFIGURATION
+// LANGUAGE CONFIGURATION
 // ========================================
 
 /**
- * Environment-based agent ID mapping
- * Set these in your .env file for each language
+ * Languages supported by the main multilingual agent
+ * These all share the same RETELL_AGENT_ID and differentiate via Custom LLM prompts
+ */
+const MULTILINGUAL_AGENT_LANGUAGES: SupportedLanguageCode[] = [
+  'pt-BR',
+  'en-US',
+  'en-GB',
+  'es-ES',
+  'es-MX',
+  'es-AR',
+  'fr-FR',
+  'ru-RU',
+  'hi-IN',
+];
+
+/**
+ * Languages that require a separate agent (e.g., Chinese)
+ * These use RETELL_AGENT_ID_ZH or similar language-specific agents
+ */
+const SEPARATE_AGENT_LANGUAGES: SupportedLanguageCode[] = [
+  'zh-CN',
+  'zh-TW',
+];
+
+/**
+ * Check if language uses the main multilingual agent
+ */
+export function usesMultilingualAgent(language: SupportedLanguageCode): boolean {
+  return MULTILINGUAL_AGENT_LANGUAGES.includes(language);
+}
+
+/**
+ * Check if language requires a separate dedicated agent
+ */
+export function requiresSeparateAgent(language: SupportedLanguageCode): boolean {
+  return SEPARATE_AGENT_LANGUAGES.includes(language);
+}
+
+/**
+ * Get the appropriate agent ID for a language
  * 
- * Example .env:
- * RETELL_AGENT_ID_PT_BR=agent_xxx
- * RETELL_AGENT_ID_EN_US=agent_yyy
- * RETELL_AGENT_ID_ES_ES=agent_zzz
+ * Logic:
+ * 1. Chinese languages (zh-CN, zh-TW) → RETELL_AGENT_ID_ZH
+ * 2. All other supported languages → RETELL_AGENT_ID (main multilingual agent)
  */
 function getAgentIdForLanguage(language: SupportedLanguageCode): string {
-  const envKey = `RETELL_AGENT_ID_${language.replace('-', '_').toUpperCase()}`;
-  const agentId = process.env[envKey];
+  // Chinese requires separate agent
+  if (requiresSeparateAgent(language)) {
+    // Try language-specific agent first (zh-CN or zh-TW)
+    const specificEnvKey = `RETELL_AGENT_ID_${language.replace('-', '_').toUpperCase()}`;
+    const specificAgentId = process.env[specificEnvKey];
+    if (specificAgentId) return specificAgentId;
+    
+    // Fallback to general Chinese agent
+    const chineseAgentId = process.env.RETELL_AGENT_ID_ZH;
+    if (chineseAgentId) return chineseAgentId;
+    
+    wsLogger.warn('No Chinese agent configured, falling back to main agent', { language });
+  }
   
-  // Fallback chain: specific language -> base language -> default
-  if (agentId) return agentId;
+  // All other languages use the main multilingual agent
+  const mainAgentId = process.env.RETELL_AGENT_ID;
+  if (!mainAgentId) {
+    throw new Error('RETELL_AGENT_ID environment variable is required');
+  }
   
-  // Try base language (e.g., es-MX -> ES -> default)
-  const baseKey = `RETELL_AGENT_ID_${language.split('-')[0].toUpperCase()}`;
-  const baseAgentId = process.env[baseKey];
-  if (baseAgentId) return baseAgentId;
-  
-  // Final fallback to default agent
-  return process.env.RETELL_AGENT_ID || '';
+  return mainAgentId;
 }
 
 /**
@@ -96,53 +147,75 @@ export class MultilingualRetellService {
 
   /**
    * Register a multilingual call with Retell
-   * Fetches user's language preference from Clerk and configures accordingly
+   * 
+   * For multilingual agent languages: passes language context to Custom LLM
+   * For Chinese: uses dedicated Chinese agent
    */
   async registerMultilingualCall(params: MultilingualRetellCallParams) {
     const { userId, language, metadata } = params;
 
+    const isMultilingual = usesMultilingualAgent(language);
+    const languageConfig = getLanguageConfig(language);
+
     wsLogger.info('Registering multilingual call', {
       userId,
       language,
+      isMultilingualAgent: isMultilingual,
       jobTitle: metadata.job_title,
     });
 
     try {
-      // Get language-specific configuration
+      // Get agent ID based on language type
       const agentId = getAgentIdForLanguage(language);
       const voiceId = getVoiceIdForLanguage(language);
-      const languageConfig = getLanguageConfig(language);
 
       if (!agentId) {
         throw new Error(`No Retell agent configured for language: ${language}`);
       }
 
-      // Build dynamic variables with language context
+      // Build dynamic variables with comprehensive language context
+      // These are passed to the Custom LLM WebSocket for prompt injection
       const dynamicVariables: Record<string, string> = {
+        // User info
         first_name: metadata.first_name,
         job_title: metadata.job_title,
         company_name: metadata.company_name,
+        
+        // Language context (critical for Custom LLM prompt building)
         preferred_language: language,
+        language_code: language,
         language_name: languageConfig.englishName,
         language_native_name: languageConfig.name,
+        language_base_code: languageConfig.baseCode,
+        is_rtl: String(languageConfig.rtl),
+        
+        // Agent type indicator
+        uses_multilingual_agent: String(isMultilingual),
       };
 
-      // Create web call with language-specific agent
+      // Create web call with language context in metadata
+      // The Custom LLM WebSocket will use this for prompt localization
       const callParams: any = {
         agent_id: agentId,
         metadata: {
           ...metadata,
+          // Language configuration for Custom LLM
           preferred_language: language,
           language_config: {
             code: language,
             name: languageConfig.name,
+            englishName: languageConfig.englishName,
+            baseCode: languageConfig.baseCode,
             rtl: languageConfig.rtl,
+            flag: languageConfig.flag,
           },
+          // Indicate if this is the multilingual agent (for prompt building)
+          uses_multilingual_agent: isMultilingual,
         },
         retell_llm_dynamic_variables: dynamicVariables,
       };
 
-      // Add voice override if specified
+      // Add voice override if specified (for native accent TTS)
       if (voiceId) {
         callParams.voice_id = voiceId;
       }
@@ -153,6 +226,7 @@ export class MultilingualRetellService {
         callId: callResponse.call_id,
         language,
         agentId,
+        isMultilingualAgent: isMultilingual,
       });
 
       return {
@@ -220,23 +294,71 @@ export class MultilingualRetellService {
   }
 
   /**
-   * Get all configured languages with their agents
+   * Get all supported languages
+   * Returns all languages that have agent support:
+   * - Multilingual agent languages (PT, EN, ES, FR, RU, HI) if main agent configured
+   * - Chinese languages if Chinese agent configured
    */
   getConfiguredLanguages(): SupportedLanguageCode[] {
-    return (Object.keys(LANGUAGE_CONFIGS) as SupportedLanguageCode[]).filter(
-      (lang) => {
-        const agentId = getAgentIdForLanguage(lang);
-        return !!agentId && agentId !== process.env.RETELL_AGENT_ID;
-      }
-    );
+    const configuredLanguages: SupportedLanguageCode[] = [];
+    
+    // Check if main multilingual agent is configured
+    const mainAgentId = process.env.RETELL_AGENT_ID;
+    if (mainAgentId) {
+      configuredLanguages.push(...MULTILINGUAL_AGENT_LANGUAGES);
+    }
+    
+    // Check if Chinese agent is configured
+    const chineseAgentId = process.env.RETELL_AGENT_ID_ZH || 
+                           process.env.RETELL_AGENT_ID_ZH_CN || 
+                           process.env.RETELL_AGENT_ID_ZH_TW;
+    if (chineseAgentId) {
+      configuredLanguages.push(...SEPARATE_AGENT_LANGUAGES);
+    }
+    
+    return configuredLanguages;
   }
 
   /**
-   * Check if a language has dedicated agent configuration
+   * Check if a language is supported
+   * A language is supported if its agent is configured
    */
   hasLanguageSupport(language: SupportedLanguageCode): boolean {
-    const agentId = getAgentIdForLanguage(language);
-    return !!agentId;
+    if (usesMultilingualAgent(language)) {
+      return !!process.env.RETELL_AGENT_ID;
+    }
+    if (requiresSeparateAgent(language)) {
+      return !!(process.env.RETELL_AGENT_ID_ZH || 
+                process.env[`RETELL_AGENT_ID_${language.replace('-', '_').toUpperCase()}`]);
+    }
+    return false;
+  }
+
+  /**
+   * Get language support status summary
+   */
+  getLanguageSupportStatus(): { 
+    multilingualAgentConfigured: boolean;
+    chineseAgentConfigured: boolean;
+    supportedLanguages: SupportedLanguageCode[];
+    unsupportedLanguages: SupportedLanguageCode[];
+  } {
+    const multilingualAgentConfigured = !!process.env.RETELL_AGENT_ID;
+    const chineseAgentConfigured = !!(process.env.RETELL_AGENT_ID_ZH || 
+                                       process.env.RETELL_AGENT_ID_ZH_CN);
+    
+    const allLanguages = Object.keys(LANGUAGE_CONFIGS) as SupportedLanguageCode[];
+    const supportedLanguages = this.getConfiguredLanguages();
+    const unsupportedLanguages = allLanguages.filter(
+      lang => !supportedLanguages.includes(lang)
+    );
+    
+    return {
+      multilingualAgentConfigured,
+      chineseAgentConfigured,
+      supportedLanguages,
+      unsupportedLanguages,
+    };
   }
 
   /**

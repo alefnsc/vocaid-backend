@@ -2,6 +2,11 @@ import WebSocket from 'ws';
 import OpenAI from 'openai';
 import { getFieldPrompt, formatInitialMessage } from '../prompts/fieldPrompts';
 import { 
+  generateMultilingualSystemPrompt, 
+  generateInitialGreeting,
+  getLanguageSpecificPhrases 
+} from '../prompts/multilingualPrompts';
+import { 
   analyzeResumeJobCongruency, 
   generateGracefulEndingMessage,
   shouldCheckCongruency,
@@ -9,6 +14,7 @@ import {
 } from '../utils/congruencyAnalyzer';
 import { InterviewTimer } from '../utils/interviewTimer';
 import { wsLogger } from '../utils/logger';
+import { SupportedLanguageCode, isValidLanguageCode, getLanguageConfig } from '../types/multilingual';
 
 /**
  * Retell Custom LLM WebSocket Handler
@@ -257,6 +263,11 @@ export class CustomLLMWebSocketHandler {
 
   /**
    * Start the interview - shared logic for call_details and call_started
+   * 
+   * Supports multilingual interviews by:
+   * 1. Detecting preferred_language from metadata
+   * 2. Generating language-specific system prompts
+   * 3. Using localized greetings and transitions
    */
   private async startInterview() {
     // OPTIMIZATION: Perform congruency check in BACKGROUND after greeting
@@ -266,6 +277,17 @@ export class CustomLLMWebSocketHandler {
       this.performBackgroundCongruencyCheck();
     }
 
+    // Extract language preference from metadata (set by multilingualRetellService)
+    const preferredLanguage = this.getPreferredLanguage();
+    const isMultilingual = preferredLanguage !== 'en-US';
+
+    wsLogger.info('Starting interview with language context', {
+      callId: this.callId,
+      preferredLanguage,
+      isMultilingual,
+      candidateName: this.metadata?.first_name,
+    });
+
     // Proceed with normal interview start
     if (this.metadata) {
       const fieldPrompt = getFieldPrompt(
@@ -273,20 +295,64 @@ export class CustomLLMWebSocketHandler {
         this.metadata.job_description || ''
       );
       
-      // Format the initial message with candidate-specific information
-      const personalizedGreeting = formatInitialMessage(
-        fieldPrompt,
-        this.metadata.first_name || 'there',
-        this.metadata.job_title || 'this position',
-        this.metadata.company_name || 'your target company'
-      );
+      // Generate greeting based on language
+      let personalizedGreeting: string;
+      if (isMultilingual) {
+        // Use multilingual greeting
+        personalizedGreeting = generateInitialGreeting(
+          preferredLanguage,
+          this.metadata.first_name || 'there',
+          this.metadata.job_title || 'this position',
+          this.metadata.company_name || 'your target company'
+        );
+      } else {
+        // Use default English greeting
+        personalizedGreeting = formatInitialMessage(
+          fieldPrompt,
+          this.metadata.first_name || 'there',
+          this.metadata.job_title || 'this position',
+          this.metadata.company_name || 'your target company'
+        );
+      }
       
       // OPTIMIZED: Condensed system prompt to reduce tokens and processing time
       // Truncate job description and resume to essential parts
       const truncatedJobDesc = (this.metadata.job_description || '').substring(0, 500);
       const truncatedCV = (this.metadata.interviewee_cv || '').substring(0, 1000);
       
-      this.systemPrompt = `${fieldPrompt.systemPrompt}
+      // Build system prompt with language context
+      if (isMultilingual) {
+        // Use multilingual system prompt with language-specific instructions
+        const multilingualPrompt = generateMultilingualSystemPrompt(
+          preferredLanguage,
+          this.detectFieldFromJobTitle(this.metadata.job_title || '')
+        );
+        
+        this.systemPrompt = `${multilingualPrompt}
+
+<interview_context>
+  <candidate>${this.metadata.first_name}</candidate>
+  <position>${this.metadata.job_title}</position>
+  <company>${this.metadata.company_name}</company>
+</interview_context>
+
+<job_description>
+${truncatedJobDesc}
+</job_description>
+
+<candidate_resume>
+${truncatedCV}
+</candidate_resume>
+
+<response_rules>
+  <rule>Keep responses to 1-2 sentences maximum</rule>
+  <rule>Ask ONE question at a time</rule>
+  <rule>Reference specific items from the candidate's resume</rule>
+  <rule>Conduct the ENTIRE interview in ${getLanguageConfig(preferredLanguage).name}</rule>
+</response_rules>`;
+      } else {
+        // Use standard English prompt
+        this.systemPrompt = `${fieldPrompt.systemPrompt}
 
 CONTEXT: ${this.metadata.first_name} for ${this.metadata.job_title} at ${this.metadata.company_name}
 
@@ -295,6 +361,7 @@ JOB: ${truncatedJobDesc}
 RESUME: ${truncatedCV}
 
 RULES: 1-2 sentences max. ONE question at a time. Reference their resume.`;
+      }
 
       this.conversationHistory.push({
         role: 'system',
@@ -306,6 +373,7 @@ RULES: 1-2 sentences max. ONE question at a time. Reference their resume.`;
         callId: this.callId,
         candidateName: this.metadata.first_name,
         field: fieldPrompt.field,
+        language: preferredLanguage,
         greetingLength: personalizedGreeting.length 
       });
       this.hasGreeted = true;
@@ -313,10 +381,26 @@ RULES: 1-2 sentences max. ONE question at a time. Reference their resume.`;
     } else {
       wsLogger.warn('No metadata received - sending generic greeting', { callId: this.callId });
       
-      // Send a generic greeting if no metadata
-      const genericGreeting = "Hello! Welcome to your mock interview with Voxly. I'm your AI interviewer, and I'll be helping you prepare for your job interview today. This session will take about 15 minutes. Let's begin - can you tell me about your professional background?";
+      // Get language-specific generic greeting
+      const phrases = getLanguageSpecificPhrases(preferredLanguage);
+      const languageConfig = getLanguageConfig(preferredLanguage);
       
-      this.systemPrompt = `You are Voxly, a professional AI interviewer helping candidates prepare for job interviews.
+      // Send a generic greeting in the appropriate language
+      const genericGreeting = isMultilingual 
+        ? phrases.greeting
+            .replace('{candidateName}', 'there')
+            .replace('{jobTitle}', 'this position')
+            .replace('{companyName}', 'your target company')
+        : "Hello! Welcome to your mock interview with Voxly. I'm your AI interviewer, and I'll be helping you prepare for your job interview today. This session will take about 15 minutes. Let's begin - can you tell me about your professional background?";
+      
+      this.systemPrompt = isMultilingual
+        ? `You are Voxly, a professional AI interviewer helping candidates prepare for job interviews.
+You MUST conduct this ENTIRE interview in ${languageConfig.name} (${languageConfig.englishName}).
+Be conversational, professional, and encouraging. 
+Keep responses concise (1-2 sentences max).
+Ask one question at a time and adapt based on candidate responses.
+Do NOT switch to English unless the candidate explicitly requests it.`
+        : `You are Voxly, a professional AI interviewer helping candidates prepare for job interviews.
 Be conversational, professional, and encouraging. 
 Keep responses concise (1-2 sentences max).
 Ask one question at a time and adapt based on candidate responses.`;
@@ -329,6 +413,62 @@ Ask one question at a time and adapt based on candidate responses.`;
       this.hasGreeted = true;
       await this.sendAgentInterrupt(genericGreeting, false);
     }
+  }
+
+  /**
+   * Get preferred language from metadata
+   * Falls back to 'en-US' if not specified
+   */
+  private getPreferredLanguage(): SupportedLanguageCode {
+    // Check various locations where language might be specified
+    const languageConfig = this.metadata?.language_config;
+    const preferredLanguage = this.metadata?.preferred_language || 
+                              languageConfig?.code ||
+                              this.metadata?.language_code;
+    
+    if (preferredLanguage && isValidLanguageCode(preferredLanguage)) {
+      return preferredLanguage;
+    }
+    
+    return 'en-US'; // Default fallback
+  }
+
+  /**
+   * Detect field/domain from job title for specialized prompts
+   */
+  private detectFieldFromJobTitle(jobTitle: string): string | undefined {
+    const lowerTitle = jobTitle.toLowerCase();
+    
+    if (lowerTitle.includes('engineer') || lowerTitle.includes('developer') || 
+        lowerTitle.includes('software') || lowerTitle.includes('devops') ||
+        lowerTitle.includes('architect') || lowerTitle.includes('programmer')) {
+      return 'engineering';
+    }
+    
+    if (lowerTitle.includes('marketing') || lowerTitle.includes('brand') ||
+        lowerTitle.includes('growth') || lowerTitle.includes('seo')) {
+      return 'marketing';
+    }
+    
+    if (lowerTitle.includes('product') || lowerTitle.includes('pm')) {
+      return 'product';
+    }
+    
+    if (lowerTitle.includes('design') || lowerTitle.includes('ux') ||
+        lowerTitle.includes('ui')) {
+      return 'design';
+    }
+    
+    if (lowerTitle.includes('sales') || lowerTitle.includes('account')) {
+      return 'sales';
+    }
+    
+    if (lowerTitle.includes('data') || lowerTitle.includes('analyst') ||
+        lowerTitle.includes('scientist')) {
+      return 'data';
+    }
+    
+    return undefined; // Use general prompt
   }
 
   /**
@@ -356,12 +496,60 @@ Ask one question at a time and adapt based on candidate responses.`;
         this.metadata = request.metadata;
       }
 
-      // Setup system prompt and send greeting
+      // Get language preference
+      const preferredLanguage = this.getPreferredLanguage();
+      const isMultilingual = preferredLanguage !== 'en-US';
+      const languageConfig = getLanguageConfig(preferredLanguage);
+
+      // Setup system prompt with language context
       const fieldPrompt = getFieldPrompt(
         this.metadata?.job_title || 'General',
         this.metadata?.job_description || ''
       );
       
+      if (isMultilingual) {
+        // Use multilingual prompt
+        const multilingualPrompt = generateMultilingualSystemPrompt(
+          preferredLanguage,
+          this.detectFieldFromJobTitle(this.metadata?.job_title || '')
+        );
+        
+        this.systemPrompt = `${multilingualPrompt}
+
+<interview_context>
+  <candidate>${this.metadata?.first_name || 'Candidate'}</candidate>
+  <position>${this.metadata?.job_title || 'Position'}</position>
+  <company>${this.metadata?.company_name || 'Company'}</company>
+</interview_context>
+
+<job_description>${this.metadata?.job_description || 'Not provided'}</job_description>
+
+<response_rules>
+  <rule>Keep responses concise (2-3 sentences max)</rule>
+  <rule>Ask one question at a time</rule>
+  <rule>Conduct the ENTIRE interview in ${languageConfig.name}</rule>
+  <rule>Maximum interview duration is 15 minutes</rule>
+</response_rules>`;
+
+        // Generate localized greeting
+        const greeting = generateInitialGreeting(
+          preferredLanguage,
+          this.metadata?.first_name || 'there',
+          this.metadata?.job_title || 'this position',
+          this.metadata?.company_name || 'your target company'
+        );
+        
+        this.conversationHistory.push({
+          role: 'system',
+          content: this.systemPrompt
+        });
+
+        this.hasGreeted = true;
+        await this.sendResponse(greeting, false);
+        return;
+      }
+      
+      // Default English prompt
       this.systemPrompt = `${fieldPrompt.systemPrompt}
 
 INTERVIEW CONTEXT:
