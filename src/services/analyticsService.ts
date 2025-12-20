@@ -1151,7 +1151,7 @@ export async function recalculateRoleBenchmarks(): Promise<void> {
     by: ['role'],
     _count: { role: true },
     _avg: { overallScore: true, communicationScore: true, confidenceScore: true },
-    where: { overallScore: { not: null } }
+    where: { overallScore: { not: undefined } }
   });
   
   for (const stat of roleStats) {
@@ -1165,14 +1165,19 @@ export async function recalculateRoleBenchmarks(): Promise<void> {
     
     const distribution = calculateScoreDistribution(scores.map(s => s.overallScore));
     
+    // Safely access aggregated values
+    const avgScore = stat._avg?.overallScore ?? 70;
+    const countRole = typeof stat._count === 'object' ? (stat._count?.role ?? 0) : 0;
+    const avgComm = stat._avg?.communicationScore ?? null;
+    
     await prisma.rolePerformanceBenchmark.upsert({
       where: { roleTitle: normalizedRole },
       create: {
         roleTitle: normalizedRole,
-        globalAverageScore: stat._avg.overallScore || 70,
-        totalInterviews: stat._count.role,
+        globalAverageScore: avgScore,
+        totalInterviews: countRole,
         scoreDistribution: distribution,
-        avgCommunication: stat._avg.communicationScore,
+        avgCommunication: avgComm,
         avgAdaptability: 70,
         avgProblemSolving: 70,
         avgTechnicalDepth: 70,
@@ -1180,10 +1185,10 @@ export async function recalculateRoleBenchmarks(): Promise<void> {
         lastCalculatedAt: new Date()
       },
       update: {
-        globalAverageScore: stat._avg.overallScore || 70,
-        totalInterviews: stat._count.role,
+        globalAverageScore: avgScore,
+        totalInterviews: countRole,
         scoreDistribution: distribution,
-        avgCommunication: stat._avg.communicationScore,
+        avgCommunication: avgComm,
         lastCalculatedAt: new Date()
       }
     });
@@ -1287,8 +1292,8 @@ export async function getStudyRecommendations(
   if (!recommendation) return null;
   
   return {
-    topics: recommendation.topics as StudyTopic[],
-    weakAreas: recommendation.weakAreas as WeakArea[]
+    topics: (recommendation.topics as unknown) as StudyTopic[],
+    weakAreas: (recommendation.weakAreas as unknown) as WeakArea[]
   };
 }
 
@@ -1539,9 +1544,9 @@ export async function getFilteredAnalytics(
   
   // Get chart data
   const [scoreTimeSeries, scoresByRole, scoresByCompany] = await Promise.all([
-    getScoreTimeSeries(clerkId, 'daily', { startDate, endDate }),
-    getScoresByRole(clerkId, { startDate, endDate }),
-    getScoresByCompany(clerkId, { startDate, endDate })
+    getScoreTimeSeries(clerkId, 'daily', { months: 1 }),
+    getScoresByRole(clerkId),
+    getScoresByCompany(clerkId)
   ]);
   
   return {

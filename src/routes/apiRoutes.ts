@@ -1094,8 +1094,8 @@ router.post(
         });
       }
       
-      // Check user preferences for automated emails
-      const userPreferences = interview.user.publicMetadata || {};
+      // Check user preferences for automated emails (safe access since publicMetadata may not be in schema)
+      const userPreferences = (interview.user as any)?.publicMetadata || {};
       if (!shouldSendAutomatedEmail(userPreferences as Record<string, any>)) {
         dbLogger.info('User has disabled automated feedback emails', { 
           interviewId, 
@@ -1177,11 +1177,11 @@ router.post(
 
 // ==================== Analytics Routes ====================
 
-// Get interview analytics (confidence timeline, sentiment, WPM)
+// Get interview transcript segments
 router.get(
-  '/interviews/:interviewId/analytics',
+  '/interviews/:interviewId/transcript',
   requireAuth,
-  async (req: AuthenticatedRequest, res: Response) => {
+  async (req: Request, res: Response) => {
     try {
       const { interviewId } = req.params;
       
@@ -1192,14 +1192,50 @@ router.get(
         });
       }
       
-      const analytics = await analyticsService.getInterviewAnalytics(interviewId);
+      const segments = await analyticsService.getTranscriptSegments(interviewId);
       
-      if (!analytics) {
+      if (!segments || segments.length === 0) {
         return res.status(404).json({
           status: 'error',
-          message: 'Analytics not found for this interview'
+          message: 'Transcript not found for this interview'
         });
       }
+      
+      res.json({
+        status: 'success',
+        data: { segments }
+      });
+    } catch (error: any) {
+      dbLogger.error('Error fetching transcript', { 
+        error: error.message,
+        interviewId: req.params.interviewId 
+      });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to fetch transcript'
+      });
+    }
+  }
+);
+
+// Get interview analytics dashboard data
+router.get(
+  '/interviews/:interviewId/analytics',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const { interviewId } = req.params;
+      const clerkId = (req as any).clerkUserId;
+      
+      if (!interviewId) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Interview ID is required'
+        });
+      }
+      
+      // Get dashboard analytics which includes score data
+      const analytics = await analyticsService.getDashboardAnalytics(clerkId, 'monthly');
       
       res.json({
         status: 'success',
@@ -1218,22 +1254,28 @@ router.get(
   }
 );
 
-// Get role benchmark data
+// Get benchmark data for role comparison
 router.get(
-  '/benchmarks/:roleTitle',
+  '/interviews/:interviewId/benchmark',
   requireAuth,
-  async (req: AuthenticatedRequest, res: Response) => {
+  async (req: Request, res: Response) => {
     try {
-      const { roleTitle } = req.params;
+      const { interviewId } = req.params;
+      const { roleTitle, userScore } = req.query;
       
-      if (!roleTitle) {
+      if (!interviewId || !roleTitle) {
         return res.status(400).json({
           status: 'error',
-          message: 'Role title is required'
+          message: 'Interview ID and role title are required'
         });
       }
       
-      const benchmark = await analyticsService.getRoleBenchmark(decodeURIComponent(roleTitle));
+      const score = userScore ? parseFloat(userScore as string) : 0;
+      const benchmark = await analyticsService.getBenchmarkData(
+        interviewId, 
+        decodeURIComponent(roleTitle as string),
+        score
+      );
       
       if (!benchmark) {
         return res.status(404).json({
@@ -1247,64 +1289,23 @@ router.get(
         data: benchmark
       });
     } catch (error: any) {
-      dbLogger.error('Error fetching role benchmark', { 
-        error: error.message,
-        roleTitle: req.params.roleTitle 
-      });
-      res.status(500).json({
-        status: 'error',
-        message: 'Failed to fetch role benchmark'
-      });
-    }
-  }
-);
-
-// Get transcript with timestamps
-router.get(
-  '/interviews/:interviewId/transcript',
-  requireAuth,
-  async (req: AuthenticatedRequest, res: Response) => {
-    try {
-      const { interviewId } = req.params;
-      
-      if (!interviewId) {
-        return res.status(400).json({
-          status: 'error',
-          message: 'Interview ID is required'
-        });
-      }
-      
-      const transcript = await analyticsService.getTranscriptWithTimestamps(interviewId);
-      
-      if (!transcript || transcript.length === 0) {
-        return res.status(404).json({
-          status: 'error',
-          message: 'Transcript not found for this interview'
-        });
-      }
-      
-      res.json({
-        status: 'success',
-        data: { segments: transcript }
-      });
-    } catch (error: any) {
-      dbLogger.error('Error fetching transcript', { 
+      dbLogger.error('Error fetching benchmark', { 
         error: error.message,
         interviewId: req.params.interviewId 
       });
       res.status(500).json({
         status: 'error',
-        message: 'Failed to fetch transcript'
+        message: 'Failed to fetch benchmark data'
       });
     }
   }
 );
 
-// Generate AI study recommendations
-router.post(
+// Get stored study recommendations
+router.get(
   '/interviews/:interviewId/recommendations',
   requireAuth,
-  async (req: AuthenticatedRequest, res: Response) => {
+  async (req: Request, res: Response) => {
     try {
       const { interviewId } = req.params;
       
@@ -1315,27 +1316,20 @@ router.post(
         });
       }
       
-      const recommendations = await analyticsService.generateStudyRecommendations(interviewId);
-      
-      if (!recommendations || recommendations.length === 0) {
-        return res.status(404).json({
-          status: 'error',
-          message: 'Could not generate recommendations for this interview'
-        });
-      }
+      const recommendations = await analyticsService.getStudyRecommendations(interviewId);
       
       res.json({
         status: 'success',
-        data: { recommendations }
+        data: recommendations
       });
     } catch (error: any) {
-      dbLogger.error('Error generating recommendations', { 
+      dbLogger.error('Error fetching recommendations', { 
         error: error.message,
         interviewId: req.params.interviewId 
       });
       res.status(500).json({
         status: 'error',
-        message: 'Failed to generate recommendations'
+        message: 'Failed to fetch recommendations'
       });
     }
   }

@@ -3,6 +3,10 @@ import { clerkClient } from '@clerk/express';
 
 /**
  * Retell Service for managing interview calls
+ * 
+ * Supports multilingual agent switching:
+ * - Chinese (zh-CN) → uses RETELL_AGENT_ID_ZH
+ * - All other languages → uses RETELL_AGENT_ID (main multilingual agent)
  */
 
 interface RegisterCallBody {
@@ -16,7 +20,29 @@ interface RegisterCallBody {
     resume_file_name?: string;
     resume_mime_type?: string;
     interview_id?: string;
+    preferred_language?: string; // Language code for agent switching
   };
+}
+
+/**
+ * Get the appropriate agent ID based on language
+ * Chinese Mandarin (zh-CN) uses a separate agent
+ */
+function getAgentIdForLanguage(language?: string): string {
+  // Chinese Mandarin requires separate agent
+  if (language === 'zh-CN') {
+    const chineseAgentId = process.env.RETELL_AGENT_ID_ZH;
+    if (chineseAgentId) {
+      console.log('🇨🇳 Using Chinese Mandarin agent:', chineseAgentId);
+      return chineseAgentId;
+    }
+    console.warn('⚠️ No Chinese agent configured, falling back to main agent');
+  }
+  
+  // All other languages use the main multilingual agent
+  const mainAgentId = process.env.RETELL_AGENT_ID || '';
+  console.log('🌐 Using main multilingual agent:', mainAgentId);
+  return mainAgentId;
 }
 
 export class RetellService {
@@ -35,32 +61,51 @@ export class RetellService {
 
   /**
    * Register a new call with Retell
+   * Automatically selects the appropriate agent based on preferred_language
    */
   async registerCall(body: RegisterCallBody, userId: string) {
     try {
-      console.log('Registering call with Retell for user:', userId);
+      const language = body.metadata.preferred_language;
+      console.log('📞 Registering call with Retell:', {
+        userId,
+        language: language || 'auto (en-US)',
+        candidate: body.metadata.first_name
+      });
+
+      // Select agent based on language
+      const agentId = getAgentIdForLanguage(language);
 
       // Create web call with custom LLM
       const callResponse = await this.retell.call.createWebCall({
-        agent_id: process.env.RETELL_AGENT_ID || '',
-        metadata: body.metadata,
+        agent_id: agentId,
+        metadata: {
+          ...body.metadata,
+          // Ensure language is in metadata for Custom LLM prompt building
+          preferred_language: language || 'en-US'
+        },
         retell_llm_dynamic_variables: {
           first_name: body.metadata.first_name,
           job_title: body.metadata.job_title,
-          company_name: body.metadata.company_name
+          company_name: body.metadata.company_name,
+          preferred_language: language || 'en-US'
         }
       });
 
-      console.log('Call registered successfully:', callResponse.call_id);
+      console.log('✅ Call registered:', {
+        callId: callResponse.call_id,
+        agentId,
+        language: language || 'en-US'
+      });
 
       return {
         call_id: callResponse.call_id,
         access_token: callResponse.access_token,
         status: 'created',
-        message: 'Call registered successfully'
+        message: 'Call registered successfully',
+        language: language || 'en-US'
       };
     } catch (error: any) {
-      console.error('Error registering call:', error);
+      console.error('❌ Error registering call:', error);
       throw new Error(`Failed to register call: ${error.message}`);
     }
   }

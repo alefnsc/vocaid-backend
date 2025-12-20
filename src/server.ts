@@ -16,6 +16,7 @@ import { MercadoPagoService, getMercadoPagoCredentials } from './services/mercad
 import { FeedbackService } from './services/feedbackService';
 import { CustomLLMWebSocketHandler } from './services/customLLMWebSocket';
 import { spendCredits, restoreCredits } from './services/creditsWalletService';
+import { verifyMercadoPagoSignature, generateWebhookIdempotencyKey } from './services/webhookVerificationService';
 
 // Routes
 import apiRoutes from './routes/apiRoutes';
@@ -520,14 +521,32 @@ app.post('/webhook/mercadopago',
       ? req.body 
       : req.query;
 
+    const dataId = webhookData?.data?.id || webhookData?.id || '';
+
     paymentLogger.info('Received Mercado Pago webhook', { 
       type: webhookData?.type,
       action: webhookData?.action,
-      dataId: webhookData?.data?.id || webhookData?.id,
+      dataId,
       topic: webhookData?.topic,
       resource: webhookData?.resource,
       source: req.body && Object.keys(req.body).length > 0 ? 'body' : 'query'
     });
+
+    // Verify webhook signature (if secret is configured)
+    if (dataId && process.env.MERCADOPAGO_WEBHOOK_SECRET) {
+      const verification = verifyMercadoPagoSignature(req.headers as Record<string, string>, dataId);
+      if (!verification.valid) {
+        paymentLogger.warn('Webhook signature verification failed', { 
+          error: verification.error,
+          dataId 
+        });
+        // Return 200 to prevent retries, but don't process
+        return res.status(200).json({ 
+          status: 'rejected', 
+          message: 'Signature verification failed' 
+        });
+      }
+    }
 
     // Handle merchant_order topic - these are informational, just acknowledge
     // The actual payment processing happens via the 'payment' topic

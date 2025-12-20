@@ -33,6 +33,10 @@ model User {
   registrationCountry String?   @map("registration_country") @db.VarChar(2)
   initialIp           String?   @map("initial_ip") @db.VarChar(45)
   onboardingComplete  Boolean   @default(false) @map("onboarding_complete")
+  
+  // Role & Seniority (synced with Clerk publicMetadata)
+  currentRole         String?   @map("current_role") @db.VarChar(50)
+  currentSeniority    String?   @map("current_seniority") @db.VarChar(30)
 
   // Relations
   interviews      Interview[]
@@ -51,6 +55,7 @@ model User {
   @@index([isActive])
   @@index([preferredLanguage])
   @@index([registrationRegion])
+  @@index([currentRole])
   @@map("users")
 }
 
@@ -295,10 +300,20 @@ model Interview {
   companyName     String           @map("company_name")
   jobDescription  String           @map("job_description") @db.Text
   
+  // Seniority and Language for LLM configuration
+  seniority       String?          @db.VarChar(30) // Intern, Junior, Mid, Senior, Staff, Principal, Manager
+  language        String?          @db.VarChar(10) // Language code used for the interview
+  
+  // Multilingual session tracking (for Retell agent switching)
+  agentId         String?          @map("agent_id") @db.VarChar(100) // Retell agent ID used
+  voiceId         String?          @map("voice_id") @db.VarChar(100) // Voice ID used
+  resumeScoreAtSession Int?        @map("resume_score_at_session") // Resume quality score at time of interview
+  
   // Resume stored as base64 or file reference
   resumeData      String?          @map("resume_data") @db.Text
   resumeFileName  String?          @map("resume_file_name")
   resumeMimeType  String?          @map("resume_mime_type")
+  resumeId        String?          @map("resume_id") @db.Uuid // Reference to ResumeDocument if using saved resume
   
   // Interview Results
   status          InterviewStatus  @default(PENDING)
@@ -337,6 +352,9 @@ model Interview {
   @@index([createdAt])
   @@index([jobTitle])
   @@index([companyName])
+  @@index([seniority])
+  @@index([language])
+  @@index([resumeId])
   @@map("interviews")
 }
 
@@ -459,9 +477,15 @@ model Payment {
   id                  String        @id @default(uuid()) @db.Uuid
   userId              String        @map("user_id") @db.Uuid
   
+  // Payment provider (for multi-provider support)
+  provider            PaymentProvider @default(MERCADOPAGO)
+  
   // MercadoPago identifiers
   mercadoPagoId       String?       @unique @map("mercadopago_id")
   preferenceId        String?       @map("preference_id")
+  
+  // Generic provider payment ID (for PayPal, Stripe, etc.)
+  providerPaymentId   String?       @map("provider_payment_id") @db.VarChar(255)
   
   // Package details
   packageId           String        @map("package_id")
@@ -471,10 +495,16 @@ model Payment {
   // Payment amounts
   amountUSD           Float         @map("amount_usd") @db.DoublePrecision
   amountBRL           Float         @map("amount_brl") @db.DoublePrecision
+  currency            String?       @db.VarChar(3) // ISO 4217 currency code
+  exchangeRate        Float?        @map("exchange_rate") @db.DoublePrecision
   
   // Payment status
   status              PaymentStatus @default(PENDING)
   statusDetail        String?       @map("status_detail")
+  
+  // Webhook idempotency (prevents duplicate processing)
+  webhookIdempotencyKey String?     @unique @map("webhook_idempotency_key") @db.VarChar(255)
+  webhookProcessedAt    DateTime?   @map("webhook_processed_at")
   
   // Timestamps
   paidAt              DateTime?     @map("paid_at")
@@ -486,6 +516,7 @@ model Payment {
 
   @@index([userId])
   @@index([mercadoPagoId])
+  @@index([provider])
   @@index([status])
   @@index([createdAt])
   @@map("payments")
@@ -675,6 +706,12 @@ enum PaymentStatus {
   CANCELLED   // Payment cancelled
   REFUNDED    // Payment refunded
   IN_PROCESS  // Payment being processed
+}
+
+enum PaymentProvider {
+  MERCADOPAGO // Mercado Pago (LATAM primary)
+  PAYPAL      // PayPal (Global)
+  STRIPE      // Stripe (Future)
 }
 
 enum CreditTransactionType {

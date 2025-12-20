@@ -25,8 +25,9 @@ export type SupportedLanguageCode =
   | 'es-AR'  // Spanish (Argentina)
   | 'fr-FR'  // French (France)
   | 'ru-RU'  // Russian
-  | 'zh-CN'  // Chinese (Simplified/Mandarin only - Cantonese not supported)
+  | 'zh-CN'  // Chinese (Simplified/Mandarin) - also used for Taiwan
   | 'hi-IN'; // Hindi (India)
+  // Note: zh-TW (Traditional Chinese) is NOT supported in voice - Taiwan users use zh-CN
 
 /**
  * Base language codes for app localization (without region)
@@ -119,11 +120,11 @@ export const LANGUAGE_CONFIGS: Record<SupportedLanguageCode, LanguageConfig> = {
     code: 'zh-CN',
     baseCode: 'zh',
     name: '简体中文',
-    englishName: 'Chinese (Mandarin)',
+    englishName: 'Chinese (Simplified)',
     flag: '🇨🇳',
     rtl: false,
   },
-  // Note: zh-TW (Cantonese/Traditional) is NOT supported
+  // Note: zh-TW (Traditional Chinese) is NOT supported in Retell voice - Taiwan users use zh-CN
   'hi-IN': {
     code: 'hi-IN',
     baseCode: 'hi',

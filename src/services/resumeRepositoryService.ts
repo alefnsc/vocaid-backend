@@ -588,7 +588,15 @@ export async function getResumeVersionHistory(
     let currentId: string | null = resumeId;
     
     while (currentId) {
-      const version = await prisma.resumeDocument?.findFirst({
+      const versionResult: {
+        id: string;
+        version: number;
+        createdAt: Date;
+        fileName: string;
+        fileSize: number;
+        qualityScore: number | null;
+        parentVersionId: string | null;
+      } | null = await prisma.resumeDocument.findFirst({
         where: { 
           id: currentId,
           userId: user.id
@@ -604,16 +612,16 @@ export async function getResumeVersionHistory(
         }
       });
       
-      if (version) {
+      if (versionResult) {
         versions.push({
-          id: version.id,
-          version: version.version,
-          createdAt: version.createdAt,
-          fileName: version.fileName,
-          fileSize: version.fileSize,
-          qualityScore: version.qualityScore || undefined
+          id: versionResult.id,
+          version: versionResult.version,
+          createdAt: versionResult.createdAt,
+          fileName: versionResult.fileName,
+          fileSize: versionResult.fileSize,
+          qualityScore: versionResult.qualityScore || undefined
         });
-        currentId = version.parentVersionId;
+        currentId = versionResult.parentVersionId;
       } else {
         break;
       }

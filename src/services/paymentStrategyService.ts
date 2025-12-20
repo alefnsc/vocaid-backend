@@ -68,7 +68,6 @@ export const CREDIT_PACKAGES: Record<string, CreditPackage> = {
       'fr-FR': 'Parfait pour commencer',
       'ru-RU': 'Идеально для начала',
       'zh-CN': '入门的完美选择',
-      'zh-TW': '入門的完美選擇',
       'hi-IN': 'शुरू करने के लिए बिल्कुल सही',
     },
   },
@@ -94,7 +93,6 @@ export const CREDIT_PACKAGES: Record<string, CreditPackage> = {
       'fr-FR': 'Idéal pour une préparation ciblée',
       'ru-RU': 'Отлично для целенаправленной подготовки',
       'zh-CN': '专注准备的最佳选择',
-      'zh-TW': '專注準備的最佳選擇',
       'hi-IN': 'केंद्रित तैयारी के लिए बढ़िया',
     },
   },
@@ -120,7 +118,6 @@ export const CREDIT_PACKAGES: Record<string, CreditPackage> = {
       'fr-FR': 'Idéal pour une pratique régulière',
       'ru-RU': 'Идеально для регулярной практики',
       'zh-CN': '定期练习的理想选择',
-      'zh-TW': '定期練習的理想選擇',
       'hi-IN': 'नियमित अभ्यास के लिए आदर्श',
     },
   },
@@ -541,7 +538,6 @@ class PayPalProvider implements IPaymentProvider {
       'fr-FR': 'fr_FR',
       'ru-RU': 'ru_RU',
       'zh-CN': 'zh_CN',
-      'zh-TW': 'zh_TW',
       'hi-IN': 'en_IN', // PayPal doesn't support Hindi, fallback to English India
     };
     return localeMap[language] || 'en_US';

@@ -343,6 +343,7 @@ export async function logUsage(record: UsageRecord): Promise<boolean> {
     await prisma.usageLog.create({
       data: {
         userId: user.id,
+        eventType: `${record.resourceType}_used`,
         resourceType: record.resourceType,
         amount: record.amount,
         interviewId: record.interviewId,

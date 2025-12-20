@@ -69,12 +69,19 @@ function getTrackingInfo(req: Request): {
   userAgent: string | undefined;
   referrer: string | undefined;
 } {
+  const forwardedFor = req.headers['x-forwarded-for'];
+  const forwardedIp = typeof forwardedFor === 'string' 
+    ? forwardedFor.split(',')[0]?.trim() 
+    : Array.isArray(forwardedFor) 
+      ? forwardedFor[0]?.split(',')[0]?.trim() 
+      : undefined;
+      
+  const refererHeader = req.headers['referer'] || req.headers['referrer'];
+  
   return {
-    ipAddress:
-      (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
-      req.socket.remoteAddress,
+    ipAddress: forwardedIp || req.socket.remoteAddress,
     userAgent: req.headers['user-agent'],
-    referrer: req.headers['referer'] || req.headers['referrer'],
+    referrer: typeof refererHeader === 'string' ? refererHeader : Array.isArray(refererHeader) ? refererHeader[0] : undefined,
   };
 }
 
