@@ -392,3 +392,299 @@ export async function getInterviewForDownload(id: string, clerkId: string) {
 
   return interview;
 }
+
+// ========================================
+// CLONE & RETRY FUNCTIONALITY
+// ========================================
+
+interface CloneInterviewOptions {
+  useLatestResume?: boolean;
+  resumeId?: string; // From resume repository
+  updateJobDescription?: string;
+}
+
+/**
+ * Clone an interview to retry with same job details
+ * Creates a new interview with the same job info but fresh status
+ */
+export async function cloneInterview(
+  originalInterviewId: string,
+  clerkId: string,
+  options: CloneInterviewOptions = {}
+) {
+  dbLogger.info('Cloning interview', { originalInterviewId, clerkId });
+  
+  // Get original interview
+  const original = await prisma.interview.findFirst({
+    where: {
+      id: originalInterviewId,
+      user: { clerkId }
+    },
+    select: {
+      userId: true,
+      jobTitle: true,
+      companyName: true,
+      jobDescription: true,
+      resumeData: true,
+      resumeFileName: true,
+      resumeMimeType: true
+    }
+  });
+  
+  if (!original) {
+    throw new Error('Original interview not found');
+  }
+  
+  // Determine resume data to use
+  let resumeData = original.resumeData;
+  let resumeFileName = original.resumeFileName;
+  let resumeMimeType = original.resumeMimeType;
+  
+  if (options.resumeId) {
+    // Use resume from repository
+    const user = await prisma.user.findUnique({
+      where: { clerkId },
+      select: { id: true }
+    });
+    
+    if (user) {
+      const resume = await prisma.resumeDocument?.findFirst({
+        where: {
+          id: options.resumeId,
+          userId: user.id,
+          isActive: true
+        },
+        select: {
+          base64Data: true,
+          fileName: true,
+          mimeType: true
+        }
+      });
+      
+      if (resume) {
+        resumeData = resume.base64Data;
+        resumeFileName = resume.fileName;
+        resumeMimeType = resume.mimeType;
+      }
+    }
+  } else if (options.useLatestResume) {
+    // Use latest (primary) resume from repository
+    const user = await prisma.user.findUnique({
+      where: { clerkId },
+      select: { id: true }
+    });
+    
+    if (user) {
+      const primaryResume = await prisma.resumeDocument?.findFirst({
+        where: {
+          userId: user.id,
+          isPrimary: true,
+          isActive: true
+        },
+        select: {
+          base64Data: true,
+          fileName: true,
+          mimeType: true
+        }
+      });
+      
+      if (primaryResume) {
+        resumeData = primaryResume.base64Data;
+        resumeFileName = primaryResume.fileName;
+        resumeMimeType = primaryResume.mimeType;
+      }
+    }
+  }
+  
+  // Create cloned interview
+  const clonedInterview = await prisma.interview.create({
+    data: {
+      userId: original.userId,
+      jobTitle: original.jobTitle,
+      companyName: original.companyName,
+      jobDescription: options.updateJobDescription || original.jobDescription,
+      resumeData,
+      resumeFileName,
+      resumeMimeType,
+      status: 'PENDING'
+    }
+  });
+  
+  dbLogger.info('Interview cloned', { 
+    originalId: originalInterviewId, 
+    newId: clonedInterview.id 
+  });
+  
+  return clonedInterview;
+}
+
+/**
+ * Get suggested retake candidates (interviews that could benefit from practice)
+ */
+export async function getSuggestedRetakes(
+  clerkId: string,
+  limit: number = 5
+) {
+  const user = await prisma.user.findUnique({
+    where: { clerkId },
+    select: { id: true }
+  });
+  
+  if (!user) return [];
+  
+  // Find completed interviews with low scores (under 70)
+  const lowScoreInterviews = await prisma.interview.findMany({
+    where: {
+      userId: user.id,
+      status: 'COMPLETED',
+      score: { lt: 70, not: null }
+    },
+    select: {
+      id: true,
+      jobTitle: true,
+      companyName: true,
+      score: true,
+      createdAt: true
+    },
+    orderBy: { score: 'asc' },
+    take: limit
+  });
+  
+  return lowScoreInterviews.map(interview => ({
+    ...interview,
+    reason: 'Score below 70 - practice recommended'
+  }));
+}
+
+/**
+ * Get interview history for a specific role/company combination
+ */
+export async function getInterviewHistory(
+  clerkId: string,
+  options: {
+    jobTitle?: string;
+    companyName?: string;
+  }
+) {
+  const user = await prisma.user.findUnique({
+    where: { clerkId },
+    select: { id: true }
+  });
+  
+  if (!user) return [];
+  
+  const where: Prisma.InterviewWhereInput = {
+    userId: user.id,
+    status: 'COMPLETED'
+  };
+  
+  if (options.jobTitle) {
+    where.jobTitle = { contains: options.jobTitle, mode: 'insensitive' };
+  }
+  if (options.companyName) {
+    where.companyName = { contains: options.companyName, mode: 'insensitive' };
+  }
+  
+  const interviews = await prisma.interview.findMany({
+    where,
+    select: {
+      id: true,
+      jobTitle: true,
+      companyName: true,
+      score: true,
+      createdAt: true,
+      callDuration: true
+    },
+    orderBy: { createdAt: 'desc' }
+  });
+  
+  // Calculate trend
+  const scores = interviews.map(i => i.score).filter((s): s is number => s !== null);
+  const avgScore = scores.length > 0 
+    ? scores.reduce((a, b) => a + b, 0) / scores.length 
+    : null;
+  
+  // Score improvement (first vs last if > 1 interview)
+  let scoreImprovement = null;
+  if (scores.length >= 2) {
+    const firstScore = scores[scores.length - 1];
+    const lastScore = scores[0];
+    scoreImprovement = lastScore - firstScore;
+  }
+  
+  return {
+    interviews,
+    stats: {
+      totalAttempts: interviews.length,
+      averageScore: avgScore ? Math.round(avgScore * 10) / 10 : null,
+      scoreImprovement,
+      bestScore: scores.length > 0 ? Math.max(...scores) : null
+    }
+  };
+}
+
+/**
+ * Create interview from resume repository
+ */
+export async function createInterviewFromResume(
+  clerkId: string,
+  resumeId: string,
+  jobDetails: {
+    jobTitle: string;
+    companyName: string;
+    jobDescription: string;
+  }
+) {
+  dbLogger.info('Creating interview from resume repository', { 
+    clerkId, 
+    resumeId 
+  });
+  
+  const user = await prisma.user.findUnique({
+    where: { clerkId },
+    select: { id: true }
+  });
+  
+  if (!user) {
+    throw new Error('User not found');
+  }
+  
+  // Get resume from repository
+  const resume = await prisma.resumeDocument?.findFirst({
+    where: {
+      id: resumeId,
+      userId: user.id,
+      isActive: true
+    },
+    select: {
+      base64Data: true,
+      fileName: true,
+      mimeType: true
+    }
+  });
+  
+  if (!resume) {
+    throw new Error('Resume not found in repository');
+  }
+  
+  // Create interview
+  const interview = await prisma.interview.create({
+    data: {
+      userId: user.id,
+      jobTitle: jobDetails.jobTitle,
+      companyName: jobDetails.companyName,
+      jobDescription: jobDetails.jobDescription,
+      resumeData: resume.base64Data,
+      resumeFileName: resume.fileName,
+      resumeMimeType: resume.mimeType,
+      status: 'PENDING'
+    }
+  });
+  
+  dbLogger.info('Interview created from resume repository', { 
+    interviewId: interview.id, 
+    resumeId 
+  });
+  
+  return interview;
+}

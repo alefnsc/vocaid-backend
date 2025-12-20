@@ -1292,3 +1292,550 @@ export async function getStudyRecommendations(
   };
 }
 
+// ========================================
+// ENHANCED DASHBOARD FILTERS
+// ========================================
+
+/**
+ * Date range presets for dashboard filtering
+ */
+export type DateRangePreset = 'today' | 'last7days' | 'last30days' | 'last90days' | 'thisMonth' | 'lastMonth' | 'thisYear' | 'allTime' | 'custom';
+
+export interface AdvancedFilters {
+  dateRange: {
+    preset?: DateRangePreset;
+    startDate?: Date;
+    endDate?: Date;
+  };
+  roles?: string[];
+  companies?: string[];
+  scoreRange?: {
+    min?: number;
+    max?: number;
+  };
+  sortBy?: 'date' | 'score' | 'duration' | 'company' | 'role';
+  sortOrder?: 'asc' | 'desc';
+}
+
+export interface FilteredAnalyticsResult {
+  interviews: InterviewSummary[];
+  summary: {
+    totalInterviews: number;
+    avgScore: number;
+    bestScore: number;
+    worstScore: number;
+    totalDuration: number;
+    scoreImprovement: number; // vs previous period
+  };
+  charts: {
+    scoreTimeSeries: TimeSeriesDataPoint[];
+    scoresByRole: ScoreByRole[];
+    scoresByCompany: ScoreByCompany[];
+  };
+}
+
+export interface InterviewSummary {
+  id: string;
+  date: Date;
+  role: string;
+  company: string;
+  score: number;
+  duration: number;
+  status: string;
+}
+
+export interface ComparisonResult {
+  current: InterviewSummary;
+  comparison: InterviewSummary | null;
+  differences: {
+    overallScore: number;
+    duration: number;
+    communicationScore?: number;
+    technicalScore?: number;
+    confidenceScore?: number;
+  };
+  improvements: string[];
+  regressions: string[];
+}
+
+/**
+ * Calculate date range from preset
+ */
+export function getDateRangeFromPreset(preset: DateRangePreset): { startDate: Date; endDate: Date } {
+  const now = new Date();
+  const endDate = new Date(now);
+  let startDate: Date;
+  
+  switch (preset) {
+    case 'today':
+      startDate = new Date(now);
+      startDate.setHours(0, 0, 0, 0);
+      endDate.setHours(23, 59, 59, 999);
+      break;
+      
+    case 'last7days':
+      startDate = new Date(now);
+      startDate.setDate(startDate.getDate() - 7);
+      break;
+      
+    case 'last30days':
+      startDate = new Date(now);
+      startDate.setDate(startDate.getDate() - 30);
+      break;
+      
+    case 'last90days':
+      startDate = new Date(now);
+      startDate.setDate(startDate.getDate() - 90);
+      break;
+      
+    case 'thisMonth':
+      startDate = new Date(now.getFullYear(), now.getMonth(), 1);
+      break;
+      
+    case 'lastMonth':
+      startDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+      endDate.setDate(0); // Last day of previous month
+      break;
+      
+    case 'thisYear':
+      startDate = new Date(now.getFullYear(), 0, 1);
+      break;
+      
+    case 'allTime':
+    default:
+      startDate = new Date(0); // Beginning of time
+      break;
+  }
+  
+  return { startDate, endDate };
+}
+
+/**
+ * Get filtered analytics with advanced filtering
+ */
+export async function getFilteredAnalytics(
+  clerkId: string,
+  filters: AdvancedFilters
+): Promise<FilteredAnalyticsResult | null> {
+  const user = await prisma.user.findUnique({
+    where: { clerkId },
+    select: { id: true }
+  });
+  
+  if (!user) return null;
+  
+  // Build date range
+  let startDate: Date | undefined;
+  let endDate: Date | undefined;
+  
+  if (filters.dateRange.preset && filters.dateRange.preset !== 'custom') {
+    const range = getDateRangeFromPreset(filters.dateRange.preset);
+    startDate = range.startDate;
+    endDate = range.endDate;
+  } else if (filters.dateRange.startDate || filters.dateRange.endDate) {
+    startDate = filters.dateRange.startDate;
+    endDate = filters.dateRange.endDate;
+  }
+  
+  // Build where clause for interviews
+  const whereClause: any = {
+    userId: user.id,
+    status: 'COMPLETED'
+  };
+  
+  if (startDate || endDate) {
+    whereClause.createdAt = {};
+    if (startDate) whereClause.createdAt.gte = startDate;
+    if (endDate) whereClause.createdAt.lte = endDate;
+  }
+  
+  if (filters.roles && filters.roles.length > 0) {
+    whereClause.jobTitle = { in: filters.roles };
+  }
+  
+  if (filters.companies && filters.companies.length > 0) {
+    whereClause.companyName = { in: filters.companies };
+  }
+  
+  if (filters.scoreRange) {
+    whereClause.score = {};
+    if (filters.scoreRange.min !== undefined) whereClause.score.gte = filters.scoreRange.min;
+    if (filters.scoreRange.max !== undefined) whereClause.score.lte = filters.scoreRange.max;
+  }
+  
+  // Build order by
+  const orderBy: any = {};
+  const sortBy = filters.sortBy || 'date';
+  const sortOrder = filters.sortOrder || 'desc';
+  
+  switch (sortBy) {
+    case 'score':
+      orderBy.score = sortOrder;
+      break;
+    case 'duration':
+      orderBy.callDuration = sortOrder;
+      break;
+    case 'company':
+      orderBy.companyName = sortOrder;
+      break;
+    case 'role':
+      orderBy.jobTitle = sortOrder;
+      break;
+    case 'date':
+    default:
+      orderBy.createdAt = sortOrder;
+  }
+  
+  // Get interviews
+  const interviews = await prisma.interview.findMany({
+    where: whereClause,
+    select: {
+      id: true,
+      createdAt: true,
+      jobTitle: true,
+      companyName: true,
+      score: true,
+      callDuration: true,
+      status: true
+    },
+    orderBy
+  });
+  
+  // Calculate summary
+  const scores = interviews.map(i => i.score || 0).filter(s => s > 0);
+  const totalDuration = interviews.reduce((sum, i) => sum + (i.callDuration || 0), 0);
+  
+  // Calculate improvement vs previous period
+  let scoreImprovement = 0;
+  if (startDate && endDate) {
+    const periodLength = endDate.getTime() - startDate.getTime();
+    const previousStart = new Date(startDate.getTime() - periodLength);
+    const previousEnd = new Date(startDate.getTime() - 1);
+    
+    const previousInterviews = await prisma.interview.findMany({
+      where: {
+        userId: user.id,
+        status: 'COMPLETED',
+        createdAt: {
+          gte: previousStart,
+          lte: previousEnd
+        }
+      },
+      select: { score: true }
+    });
+    
+    const previousScores = previousInterviews.map(i => i.score || 0).filter(s => s > 0);
+    const previousAvg = previousScores.length > 0 
+      ? previousScores.reduce((a, b) => a + b, 0) / previousScores.length 
+      : 0;
+    const currentAvg = scores.length > 0 
+      ? scores.reduce((a, b) => a + b, 0) / scores.length 
+      : 0;
+    
+    scoreImprovement = previousAvg > 0 
+      ? Math.round(((currentAvg - previousAvg) / previousAvg) * 100)
+      : 0;
+  }
+  
+  // Get chart data
+  const [scoreTimeSeries, scoresByRole, scoresByCompany] = await Promise.all([
+    getScoreTimeSeries(clerkId, 'daily', { startDate, endDate }),
+    getScoresByRole(clerkId, { startDate, endDate }),
+    getScoresByCompany(clerkId, { startDate, endDate })
+  ]);
+  
+  return {
+    interviews: interviews.map(i => ({
+      id: i.id,
+      date: i.createdAt,
+      role: i.jobTitle,
+      company: i.companyName,
+      score: i.score || 0,
+      duration: i.callDuration || 0,
+      status: i.status
+    })),
+    summary: {
+      totalInterviews: interviews.length,
+      avgScore: scores.length > 0 
+        ? Math.round((scores.reduce((a, b) => a + b, 0) / scores.length) * 10) / 10
+        : 0,
+      bestScore: scores.length > 0 ? Math.max(...scores) : 0,
+      worstScore: scores.length > 0 ? Math.min(...scores) : 0,
+      totalDuration,
+      scoreImprovement
+    },
+    charts: {
+      scoreTimeSeries,
+      scoresByRole,
+      scoresByCompany
+    }
+  };
+}
+
+/**
+ * Compare two interviews
+ */
+export async function compareInterviews(
+  clerkId: string,
+  interviewId1: string,
+  interviewId2: string
+): Promise<ComparisonResult | null> {
+  const user = await prisma.user.findUnique({
+    where: { clerkId },
+    select: { id: true }
+  });
+  
+  if (!user) return null;
+  
+  // Get both interviews with score history
+  const [interview1, interview2, scoreHistory1, scoreHistory2] = await Promise.all([
+    prisma.interview.findFirst({
+      where: { id: interviewId1, userId: user.id },
+      select: {
+        id: true,
+        createdAt: true,
+        jobTitle: true,
+        companyName: true,
+        score: true,
+        callDuration: true,
+        status: true
+      }
+    }),
+    prisma.interview.findFirst({
+      where: { id: interviewId2, userId: user.id },
+      select: {
+        id: true,
+        createdAt: true,
+        jobTitle: true,
+        companyName: true,
+        score: true,
+        callDuration: true,
+        status: true
+      }
+    }),
+    prisma.interviewScoreHistory.findFirst({
+      where: { interviewId: interviewId1 }
+    }),
+    prisma.interviewScoreHistory.findFirst({
+      where: { interviewId: interviewId2 }
+    })
+  ]);
+  
+  if (!interview1) return null;
+  
+  const current: InterviewSummary = {
+    id: interview1.id,
+    date: interview1.createdAt,
+    role: interview1.jobTitle,
+    company: interview1.companyName,
+    score: interview1.score || 0,
+    duration: interview1.callDuration || 0,
+    status: interview1.status
+  };
+  
+  const comparison: InterviewSummary | null = interview2 ? {
+    id: interview2.id,
+    date: interview2.createdAt,
+    role: interview2.jobTitle,
+    company: interview2.companyName,
+    score: interview2.score || 0,
+    duration: interview2.callDuration || 0,
+    status: interview2.status
+  } : null;
+  
+  // Calculate differences
+  const differences = {
+    overallScore: comparison ? current.score - comparison.score : 0,
+    duration: comparison ? current.duration - comparison.duration : 0,
+    communicationScore: scoreHistory1 && scoreHistory2 
+      ? (scoreHistory1.communicationScore || 0) - (scoreHistory2.communicationScore || 0)
+      : undefined,
+    technicalScore: scoreHistory1 && scoreHistory2
+      ? (scoreHistory1.technicalScore || 0) - (scoreHistory2.technicalScore || 0)
+      : undefined,
+    confidenceScore: scoreHistory1 && scoreHistory2
+      ? (scoreHistory1.confidenceScore || 0) - (scoreHistory2.confidenceScore || 0)
+      : undefined
+  };
+  
+  // Identify improvements and regressions
+  const improvements: string[] = [];
+  const regressions: string[] = [];
+  
+  if (differences.overallScore > 5) improvements.push('Overall score improved significantly');
+  else if (differences.overallScore < -5) regressions.push('Overall score decreased');
+  
+  if (differences.communicationScore !== undefined) {
+    if (differences.communicationScore > 5) improvements.push('Communication skills improved');
+    else if (differences.communicationScore < -5) regressions.push('Communication score decreased');
+  }
+  
+  if (differences.technicalScore !== undefined) {
+    if (differences.technicalScore > 5) improvements.push('Technical responses improved');
+    else if (differences.technicalScore < -5) regressions.push('Technical depth decreased');
+  }
+  
+  if (differences.confidenceScore !== undefined) {
+    if (differences.confidenceScore > 5) improvements.push('Confidence level increased');
+    else if (differences.confidenceScore < -5) regressions.push('Confidence appeared lower');
+  }
+  
+  if (differences.duration > 60) improvements.push('Provided more thorough responses');
+  else if (differences.duration < -60) regressions.push('Interview was notably shorter');
+  
+  return {
+    current,
+    comparison,
+    differences,
+    improvements,
+    regressions
+  };
+}
+
+/**
+ * Get interview progression (same role/company over time)
+ */
+export async function getInterviewProgression(
+  clerkId: string,
+  options: {
+    role?: string;
+    company?: string;
+    limit?: number;
+  } = {}
+): Promise<{
+  interviews: InterviewSummary[];
+  trendLine: { date: string; score: number }[];
+  averageImprovement: number;
+}> {
+  const { role, company, limit = 20 } = options;
+  
+  const user = await prisma.user.findUnique({
+    where: { clerkId },
+    select: { id: true }
+  });
+  
+  if (!user) {
+    return { interviews: [], trendLine: [], averageImprovement: 0 };
+  }
+  
+  const whereClause: any = {
+    userId: user.id,
+    status: 'COMPLETED'
+  };
+  
+  if (role) whereClause.jobTitle = role;
+  if (company) whereClause.companyName = company;
+  
+  const interviews = await prisma.interview.findMany({
+    where: whereClause,
+    select: {
+      id: true,
+      createdAt: true,
+      jobTitle: true,
+      companyName: true,
+      score: true,
+      callDuration: true,
+      status: true
+    },
+    orderBy: { createdAt: 'asc' },
+    take: limit
+  });
+  
+  const summaries: InterviewSummary[] = interviews.map(i => ({
+    id: i.id,
+    date: i.createdAt,
+    role: i.jobTitle,
+    company: i.companyName,
+    score: i.score || 0,
+    duration: i.callDuration || 0,
+    status: i.status
+  }));
+  
+  // Calculate trend line
+  const trendLine = summaries.map(s => ({
+    date: s.date.toISOString().split('T')[0],
+    score: s.score
+  }));
+  
+  // Calculate average improvement between consecutive interviews
+  let totalImprovement = 0;
+  let comparisons = 0;
+  
+  for (let i = 1; i < summaries.length; i++) {
+    const improvement = summaries[i].score - summaries[i - 1].score;
+    totalImprovement += improvement;
+    comparisons++;
+  }
+  
+  const averageImprovement = comparisons > 0 
+    ? Math.round((totalImprovement / comparisons) * 10) / 10
+    : 0;
+  
+  return {
+    interviews: summaries,
+    trendLine,
+    averageImprovement
+  };
+}
+
+/**
+ * Get enhanced filter options with counts
+ */
+export async function getEnhancedFilterOptions(clerkId: string): Promise<{
+  roles: { name: string; count: number }[];
+  companies: { name: string; count: number }[];
+  dateRange: { earliest: Date | null; latest: Date | null };
+  scoreRange: { min: number; max: number };
+}> {
+  const user = await prisma.user.findUnique({
+    where: { clerkId },
+    select: { id: true }
+  });
+  
+  if (!user) {
+    return {
+      roles: [],
+      companies: [],
+      dateRange: { earliest: null, latest: null },
+      scoreRange: { min: 0, max: 100 }
+    };
+  }
+  
+  // Get roles with counts
+  const roleGroups = await prisma.interview.groupBy({
+    by: ['jobTitle'],
+    where: { userId: user.id, status: 'COMPLETED' },
+    _count: { id: true }
+  });
+  
+  // Get companies with counts
+  const companyGroups = await prisma.interview.groupBy({
+    by: ['companyName'],
+    where: { userId: user.id, status: 'COMPLETED' },
+    _count: { id: true }
+  });
+  
+  // Get date and score ranges
+  const aggregate = await prisma.interview.aggregate({
+    where: { userId: user.id, status: 'COMPLETED' },
+    _min: { createdAt: true, score: true },
+    _max: { createdAt: true, score: true }
+  });
+  
+  return {
+    roles: roleGroups
+      .map(r => ({ name: r.jobTitle, count: r._count.id }))
+      .sort((a, b) => b.count - a.count),
+    companies: companyGroups
+      .map(c => ({ name: c.companyName, count: c._count.id }))
+      .sort((a, b) => b.count - a.count),
+    dateRange: {
+      earliest: aggregate._min.createdAt,
+      latest: aggregate._max.createdAt
+    },
+    scoreRange: {
+      min: aggregate._min.score || 0,
+      max: aggregate._max.score || 100
+    }
+  };
+}

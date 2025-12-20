@@ -259,6 +259,38 @@ export async function getUserFromDatabase(clerkId: string) {
 }
 
 /**
+ * Update user public metadata (role, preferredLanguage)
+ * Used for profile updates from frontend
+ */
+export async function updateUserMetadata(
+  clerkId: string,
+  metadata: { role?: string; preferredLanguage?: string }
+) {
+  dbLogger.info('Updating user metadata', { clerkId, metadata });
+
+  try {
+    const clerkUser = await clerkClient.users.getUser(clerkId);
+    
+    // Merge with existing metadata
+    const updatedMetadata = {
+      ...clerkUser.publicMetadata,
+      ...(metadata.role && { role: metadata.role }),
+      ...(metadata.preferredLanguage && { preferredLanguage: metadata.preferredLanguage }),
+    };
+
+    await clerkClient.users.updateUser(clerkId, {
+      publicMetadata: updatedMetadata,
+    });
+
+    dbLogger.info('User metadata updated successfully', { clerkId, updatedMetadata });
+    return { success: true, metadata: updatedMetadata };
+  } catch (error: any) {
+    dbLogger.error('Failed to update user metadata', { clerkId, error: error.message });
+    throw new Error(`Failed to update metadata: ${error.message}`);
+  }
+}
+
+/**
  * Update user credits in both Clerk and local database
  */
 export async function updateUserCredits(

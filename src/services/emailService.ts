@@ -56,6 +56,24 @@ export interface SendFeedbackEmailParams {
   feedbackSummary?: string;
 }
 
+export interface AutomatedFeedbackEmailParams {
+  toEmail: string;
+  candidateName: string;
+  jobTitle: string;
+  companyName: string;
+  score: number;
+  interviewId: string;
+  strengths: string[];
+  improvements: string[];
+  recommendations: string[];
+  technicalScore: number;
+  communicationScore: number;
+  problemSolvingScore: number;
+  callDurationMinutes: number;
+  feedbackPdfBase64?: string | null;
+  language?: string; // For localized emails
+}
+
 export interface EmailResult {
   success: boolean;
   messageId?: string;
@@ -359,7 +377,496 @@ export async function sendWelcomeEmail(
   }
 }
 
+// ========================================
+// LOCALIZATION SUPPORT
+// ========================================
+
+interface EmailTranslations {
+  subject: string;
+  greeting: string;
+  completedIntro: string;
+  overallScore: string;
+  scoreLabels: { excellent: string; good: string; keepPracticing: string; needsImprovement: string };
+  duration: string;
+  minutes: string;
+  skillsBreakdown: string;
+  technical: string;
+  communication: string;
+  problemSolving: string;
+  strengths: string;
+  improvements: string;
+  recommendations: string;
+  viewFullFeedback: string;
+  attachmentNotice: string;
+  scheduleNext: string;
+  footer: string;
+}
+
+const emailTranslations: Record<string, EmailTranslations> = {
+  'en-US': {
+    subject: 'Your Interview Performance Report',
+    greeting: 'Hi',
+    completedIntro: 'You just completed your mock interview for',
+    overallScore: 'Overall Score',
+    scoreLabels: { excellent: 'Excellent!', good: 'Good Job!', keepPracticing: 'Keep Practicing', needsImprovement: 'Needs Improvement' },
+    duration: 'Duration',
+    minutes: 'minutes',
+    skillsBreakdown: 'Skills Breakdown',
+    technical: 'Technical',
+    communication: 'Communication',
+    problemSolving: 'Problem Solving',
+    strengths: 'What You Did Well',
+    improvements: 'Areas to Focus On',
+    recommendations: 'Personalized Tips',
+    viewFullFeedback: 'View Full Report',
+    attachmentNotice: 'Your detailed feedback PDF is attached to this email.',
+    scheduleNext: 'Schedule Next Practice',
+    footer: 'Keep practicing to ace your real interview!'
+  },
+  'pt-BR': {
+    subject: 'Seu Relatório de Desempenho na Entrevista',
+    greeting: 'Olá',
+    completedIntro: 'Você acabou de concluir sua entrevista simulada para',
+    overallScore: 'Pontuação Geral',
+    scoreLabels: { excellent: 'Excelente!', good: 'Bom Trabalho!', keepPracticing: 'Continue Praticando', needsImprovement: 'Precisa Melhorar' },
+    duration: 'Duração',
+    minutes: 'minutos',
+    skillsBreakdown: 'Análise de Competências',
+    technical: 'Técnico',
+    communication: 'Comunicação',
+    problemSolving: 'Resolução de Problemas',
+    strengths: 'O Que Você Fez Bem',
+    improvements: 'Áreas para Focar',
+    recommendations: 'Dicas Personalizadas',
+    viewFullFeedback: 'Ver Relatório Completo',
+    attachmentNotice: 'Seu feedback detalhado em PDF está anexado a este email.',
+    scheduleNext: 'Agendar Próxima Prática',
+    footer: 'Continue praticando para arrasar na entrevista real!'
+  },
+  'es-ES': {
+    subject: 'Tu Informe de Rendimiento en la Entrevista',
+    greeting: 'Hola',
+    completedIntro: 'Acabas de completar tu entrevista simulada para',
+    overallScore: 'Puntuación General',
+    scoreLabels: { excellent: '¡Excelente!', good: '¡Buen Trabajo!', keepPracticing: 'Sigue Practicando', needsImprovement: 'Necesita Mejorar' },
+    duration: 'Duración',
+    minutes: 'minutos',
+    skillsBreakdown: 'Análisis de Habilidades',
+    technical: 'Técnico',
+    communication: 'Comunicación',
+    problemSolving: 'Resolución de Problemas',
+    strengths: 'Lo Que Hiciste Bien',
+    improvements: 'Áreas de Enfoque',
+    recommendations: 'Consejos Personalizados',
+    viewFullFeedback: 'Ver Informe Completo',
+    attachmentNotice: 'Tu feedback detallado en PDF está adjunto a este email.',
+    scheduleNext: 'Programar Siguiente Práctica',
+    footer: '¡Sigue practicando para brillar en tu entrevista real!'
+  },
+  'fr-FR': {
+    subject: 'Votre Rapport de Performance d\'Entretien',
+    greeting: 'Bonjour',
+    completedIntro: 'Vous venez de terminer votre entretien simulé pour',
+    overallScore: 'Score Global',
+    scoreLabels: { excellent: 'Excellent !', good: 'Bon Travail !', keepPracticing: 'Continuez à Pratiquer', needsImprovement: 'À Améliorer' },
+    duration: 'Durée',
+    minutes: 'minutes',
+    skillsBreakdown: 'Analyse des Compétences',
+    technical: 'Technique',
+    communication: 'Communication',
+    problemSolving: 'Résolution de Problèmes',
+    strengths: 'Ce Que Vous Avez Bien Fait',
+    improvements: 'Points à Améliorer',
+    recommendations: 'Conseils Personnalisés',
+    viewFullFeedback: 'Voir le Rapport Complet',
+    attachmentNotice: 'Votre feedback détaillé en PDF est joint à cet email.',
+    scheduleNext: 'Planifier la Prochaine Session',
+    footer: 'Continuez à pratiquer pour réussir votre vrai entretien !'
+  },
+  'zh-CN': {
+    subject: '您的面试表现报告',
+    greeting: '您好',
+    completedIntro: '您刚刚完成了模拟面试',
+    overallScore: '总体评分',
+    scoreLabels: { excellent: '优秀！', good: '做得好！', keepPracticing: '继续练习', needsImprovement: '需要改进' },
+    duration: '时长',
+    minutes: '分钟',
+    skillsBreakdown: '技能分析',
+    technical: '技术能力',
+    communication: '沟通能力',
+    problemSolving: '解决问题能力',
+    strengths: '表现优秀的方面',
+    improvements: '需要关注的领域',
+    recommendations: '个性化建议',
+    viewFullFeedback: '查看完整报告',
+    attachmentNotice: '详细反馈PDF已附在此邮件中。',
+    scheduleNext: '安排下一次练习',
+    footer: '继续练习，在真正的面试中表现出色！'
+  },
+  'ru-RU': {
+    subject: 'Ваш Отчёт о Прохождении Собеседования',
+    greeting: 'Привет',
+    completedIntro: 'Вы только что завершили пробное собеседование на позицию',
+    overallScore: 'Общий Балл',
+    scoreLabels: { excellent: 'Отлично!', good: 'Хорошая Работа!', keepPracticing: 'Продолжайте Практиковаться', needsImprovement: 'Нужно Улучшить' },
+    duration: 'Длительность',
+    minutes: 'минут',
+    skillsBreakdown: 'Анализ Навыков',
+    technical: 'Технические',
+    communication: 'Коммуникация',
+    problemSolving: 'Решение Проблем',
+    strengths: 'Что Вы Сделали Хорошо',
+    improvements: 'Области для Улучшения',
+    recommendations: 'Персональные Советы',
+    viewFullFeedback: 'Посмотреть Полный Отчёт',
+    attachmentNotice: 'Подробный отзыв в формате PDF прикреплён к этому письму.',
+    scheduleNext: 'Запланировать Следующую Практику',
+    footer: 'Продолжайте практиковаться, чтобы блеснуть на реальном собеседовании!'
+  },
+  'hi-IN': {
+    subject: 'आपकी साक्षात्कार प्रदर्शन रिपोर्ट',
+    greeting: 'नमस्ते',
+    completedIntro: 'आपने अभी मॉक इंटरव्यू पूरा किया',
+    overallScore: 'कुल स्कोर',
+    scoreLabels: { excellent: 'उत्कृष्ट!', good: 'अच्छा काम!', keepPracticing: 'अभ्यास जारी रखें', needsImprovement: 'सुधार की जरूरत' },
+    duration: 'अवधि',
+    minutes: 'मिनट',
+    skillsBreakdown: 'कौशल विश्लेषण',
+    technical: 'तकनीकी',
+    communication: 'संचार',
+    problemSolving: 'समस्या समाधान',
+    strengths: 'आपने क्या अच्छा किया',
+    improvements: 'ध्यान देने योग्य क्षेत्र',
+    recommendations: 'व्यक्तिगत सुझाव',
+    viewFullFeedback: 'पूर्ण रिपोर्ट देखें',
+    attachmentNotice: 'आपकी विस्तृत प्रतिक्रिया PDF इस ईमेल में संलग्न है।',
+    scheduleNext: 'अगला अभ्यास शेड्यूल करें',
+    footer: 'वास्तविक साक्षात्कार में सफल होने के लिए अभ्यास जारी रखें!'
+  }
+};
+
+function getEmailTranslations(language?: string): EmailTranslations {
+  const lang = language || 'en-US';
+  return emailTranslations[lang] || emailTranslations['en-US'];
+}
+
+// ========================================
+// AUTOMATED FEEDBACK EMAIL
+// ========================================
+
+/**
+ * Generate automated feedback email HTML with detailed insights
+ */
+function generateAutomatedFeedbackEmailHtml(params: AutomatedFeedbackEmailParams): string {
+  const t = getEmailTranslations(params.language);
+  const { 
+    candidateName, jobTitle, companyName, score, interviewId,
+    strengths, improvements, recommendations,
+    technicalScore, communicationScore, problemSolvingScore,
+    callDurationMinutes
+  } = params;
+  
+  const scoreColor = score >= 80 ? '#22c55e' : score >= 60 ? '#5417C9' : score >= 40 ? '#eab308' : '#ef4444';
+  const scoreLabel = score >= 80 ? t.scoreLabels.excellent : 
+                     score >= 60 ? t.scoreLabels.good : 
+                     score >= 40 ? t.scoreLabels.keepPracticing : 
+                     t.scoreLabels.needsImprovement;
+  
+  const interviewDetailsUrl = `${FRONTEND_URL}/interview/${interviewId}`;
+  const scheduleNextUrl = `${FRONTEND_URL}/interview-setup`;
+  
+  // Generate skill bars
+  const skillBar = (label: string, score: number) => {
+    const percentage = (score / 5) * 100;
+    const barColor = score >= 4 ? '#22c55e' : score >= 3 ? '#5417C9' : score >= 2 ? '#eab308' : '#ef4444';
+    return `
+      <tr>
+        <td style="padding: 8px 0;">
+          <table role="presentation" width="100%">
+            <tr>
+              <td style="width: 120px; color: #6b7280; font-size: 14px;">${label}</td>
+              <td style="padding-left: 12px;">
+                <table role="presentation" width="100%" style="background-color: #e5e7eb; border-radius: 4px; height: 8px;">
+                  <tr>
+                    <td style="width: ${percentage}%; background-color: ${barColor}; border-radius: 4px;"></td>
+                    <td></td>
+                  </tr>
+                </table>
+              </td>
+              <td style="width: 40px; text-align: right; color: #374151; font-weight: 600; font-size: 14px;">${score}/5</td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    `;
+  };
+  
+  // Generate list items
+  const listItems = (items: string[], emoji: string) => 
+    items.slice(0, 3).map(item => `
+      <tr>
+        <td style="padding: 6px 0; color: #374151; font-size: 14px; line-height: 1.5;">
+          ${emoji} ${item}
+        </td>
+      </tr>
+    `).join('');
+
+  return `
+<!DOCTYPE html>
+<html lang="${params.language?.split('-')[0] || 'en'}">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${t.subject} - Vocaid</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f3f4f6;">
+  <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background-color: #f3f4f6;">
+    <tr>
+      <td align="center" style="padding: 40px 20px;">
+        <table role="presentation" cellpadding="0" cellspacing="0" width="600" style="background-color: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);">
+          
+          <!-- Header -->
+          <tr>
+            <td style="background: linear-gradient(135deg, #5417C9 0%, #7c3aed 100%); padding: 40px 30px; text-align: center;">
+              <img src="${FRONTEND_URL}/Main.png" alt="Vocaid" width="60" height="60" style="margin-bottom: 16px; border-radius: 12px;">
+              <h1 style="color: #ffffff; margin: 0; font-size: 26px; font-weight: 700;">${t.subject}</h1>
+              <p style="color: #e9d5ff; margin: 8px 0 0 0; font-size: 15px;">${t.completedIntro} <strong>${jobTitle}</strong> at <strong>${companyName}</strong></p>
+            </td>
+          </tr>
+          
+          <!-- Greeting & Score -->
+          <tr>
+            <td style="padding: 35px 30px 20px 30px;">
+              <p style="color: #374151; font-size: 16px; margin: 0 0 25px 0;">
+                ${t.greeting} <strong>${candidateName}</strong>,
+              </p>
+              
+              <!-- Score Card -->
+              <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background: linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%); border-radius: 16px;">
+                <tr>
+                  <td style="padding: 25px; text-align: center;">
+                    <table role="presentation" width="100%">
+                      <tr>
+                        <td style="text-align: center; width: 50%;">
+                          <div style="display: inline-block; width: 100px; height: 100px; border-radius: 50px; background-color: #ffffff; line-height: 100px; font-size: 36px; font-weight: 700; color: ${scoreColor}; box-shadow: 0 4px 12px rgba(84, 23, 201, 0.2);">
+                            ${Math.round(score)}%
+                          </div>
+                          <p style="color: ${scoreColor}; font-size: 16px; font-weight: 600; margin: 12px 0 0 0;">${scoreLabel}</p>
+                          <p style="color: #9ca3af; font-size: 12px; margin: 4px 0 0 0;">${t.overallScore}</p>
+                        </td>
+                        <td style="text-align: left; padding-left: 20px; vertical-align: middle;">
+                          <p style="color: #6b7280; font-size: 14px; margin: 0;">
+                            <span style="font-size: 20px;">⏱️</span> ${t.duration}
+                          </p>
+                          <p style="color: #374151; font-size: 24px; font-weight: 600; margin: 4px 0 0 0;">
+                            ${Math.round(callDurationMinutes)} ${t.minutes}
+                          </p>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          
+          <!-- Skills Breakdown -->
+          <tr>
+            <td style="padding: 0 30px 25px 30px;">
+              <h3 style="color: #374151; font-size: 16px; margin: 0 0 15px 0; font-weight: 600;">📊 ${t.skillsBreakdown}</h3>
+              <table role="presentation" width="100%" style="background-color: #f9fafb; border-radius: 12px; padding: 15px;">
+                ${skillBar(t.technical, technicalScore)}
+                ${skillBar(t.communication, communicationScore)}
+                ${skillBar(t.problemSolving, problemSolvingScore)}
+              </table>
+            </td>
+          </tr>
+          
+          ${strengths.length > 0 ? `
+          <!-- Strengths -->
+          <tr>
+            <td style="padding: 0 30px 20px 30px;">
+              <h3 style="color: #22c55e; font-size: 16px; margin: 0 0 12px 0; font-weight: 600;">💪 ${t.strengths}</h3>
+              <table role="presentation" width="100%" style="background-color: #f0fdf4; border-radius: 12px; padding: 15px; border-left: 4px solid #22c55e;">
+                ${listItems(strengths, '✓')}
+              </table>
+            </td>
+          </tr>
+          ` : ''}
+          
+          ${improvements.length > 0 ? `
+          <!-- Improvements -->
+          <tr>
+            <td style="padding: 0 30px 20px 30px;">
+              <h3 style="color: #eab308; font-size: 16px; margin: 0 0 12px 0; font-weight: 600;">🎯 ${t.improvements}</h3>
+              <table role="presentation" width="100%" style="background-color: #fefce8; border-radius: 12px; padding: 15px; border-left: 4px solid #eab308;">
+                ${listItems(improvements, '→')}
+              </table>
+            </td>
+          </tr>
+          ` : ''}
+          
+          ${recommendations.length > 0 ? `
+          <!-- Recommendations -->
+          <tr>
+            <td style="padding: 0 30px 25px 30px;">
+              <h3 style="color: #5417C9; font-size: 16px; margin: 0 0 12px 0; font-weight: 600;">💡 ${t.recommendations}</h3>
+              <table role="presentation" width="100%" style="background-color: #f5f3ff; border-radius: 12px; padding: 15px; border-left: 4px solid #5417C9;">
+                ${listItems(recommendations, '•')}
+              </table>
+            </td>
+          </tr>
+          ` : ''}
+          
+          <!-- CTA Buttons -->
+          <tr>
+            <td style="padding: 0 30px 30px 30px;">
+              <table role="presentation" cellpadding="0" cellspacing="0" width="100%">
+                <tr>
+                  <td align="center" style="padding: 10px 0;">
+                    <a href="${interviewDetailsUrl}" style="display: inline-block; background: linear-gradient(135deg, #5417C9 0%, #7c3aed 100%); color: #ffffff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-size: 15px; font-weight: 600; box-shadow: 0 4px 12px rgba(84, 23, 201, 0.3); margin-right: 10px;">
+                      ${t.viewFullFeedback} →
+                    </a>
+                    <a href="${scheduleNextUrl}" style="display: inline-block; background-color: #ffffff; color: #5417C9; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-size: 15px; font-weight: 600; border: 2px solid #5417C9;">
+                      ${t.scheduleNext}
+                    </a>
+                  </td>
+                </tr>
+              </table>
+              <p style="color: #9ca3af; font-size: 13px; text-align: center; margin: 20px 0 0 0;">
+                📎 ${t.attachmentNotice}
+              </p>
+            </td>
+          </tr>
+          
+          <!-- Footer -->
+          <tr>
+            <td style="background-color: #f9fafb; padding: 24px 30px; text-align: center; border-top: 1px solid #e5e7eb;">
+              <p style="color: #6b7280; font-size: 14px; margin: 0 0 8px 0; font-weight: 500;">
+                ${t.footer}
+              </p>
+              <p style="color: #9ca3af; font-size: 12px; margin: 0;">
+                © 2025 Vocaid - AI-Powered Interview Preparation
+              </p>
+              <p style="color: #9ca3af; font-size: 12px; margin: 8px 0 0 0;">
+                <a href="${FRONTEND_URL}" style="color: #5417C9; text-decoration: none;">Visit Vocaid</a> • 
+                <a href="${FRONTEND_URL}/about" style="color: #5417C9; text-decoration: none;">About</a>
+              </p>
+            </td>
+          </tr>
+          
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
+  `;
+}
+
+/**
+ * Send automated interview feedback email with detailed insights
+ * Called automatically after interview completion and feedback generation
+ */
+export async function sendAutomatedFeedbackEmail(params: AutomatedFeedbackEmailParams): Promise<EmailResult> {
+  const {
+    toEmail,
+    candidateName,
+    jobTitle,
+    companyName,
+    score,
+    interviewId,
+    feedbackPdfBase64,
+    language
+  } = params;
+
+  // Validate required params
+  if (!toEmail || !candidateName || !jobTitle || !interviewId) {
+    emailLogger.error('Missing required automated email parameters', { toEmail, candidateName, jobTitle, interviewId });
+    return { success: false, error: 'Missing required parameters' };
+  }
+
+  const t = getEmailTranslations(language);
+  
+  // Build attachments array
+  const attachments: Array<{ filename: string; content: string }> = [];
+  
+  if (feedbackPdfBase64) {
+    attachments.push({
+      filename: `${candidateName.replace(/\s+/g, '_')}_Interview_Feedback.pdf`,
+      content: feedbackPdfBase64
+    });
+  }
+
+  emailLogger.info('Sending automated feedback email', { 
+    to: toEmail, 
+    interviewId,
+    score: Math.round(score),
+    language,
+    hasAttachments: attachments.length 
+  });
+
+  // Get Resend client (lazy-loaded)
+  const resendClient = getResendClient();
+  
+  // If Resend is not configured, log and return success (for development)
+  if (!resendClient) {
+    emailLogger.warn('Resend not configured - automated email would be sent', { 
+      to: toEmail, 
+      subject: `${t.subject} - ${jobTitle} at ${companyName}`,
+      interviewId 
+    });
+    return { success: true, messageId: 'mock-no-resend' };
+  }
+
+  try {
+    const { data, error } = await resendClient.emails.send({
+      from: EMAIL_FROM,
+      to: [toEmail],
+      subject: `${t.subject} - ${jobTitle} at ${companyName}`,
+      html: generateAutomatedFeedbackEmailHtml(params),
+      attachments: attachments.length > 0 ? attachments : undefined
+    });
+
+    if (error) {
+      emailLogger.error('Resend API error for automated email', { error: error.message, toEmail, interviewId });
+      return { success: false, error: error.message };
+    }
+
+    emailLogger.info('Automated feedback email sent successfully', { 
+      messageId: data?.id, 
+      toEmail, 
+      interviewId 
+    });
+    
+    return { success: true, messageId: data?.id };
+  } catch (error: any) {
+    emailLogger.error('Failed to send automated feedback email', { 
+      error: error.message, 
+      toEmail, 
+      interviewId 
+    });
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Check if user has automated emails enabled (from profile preferences)
+ */
+export function shouldSendAutomatedEmail(userPreferences: Record<string, any> | null): boolean {
+  // Default to true if no preferences set (opt-out model)
+  if (!userPreferences) return true;
+  
+  // Check for explicit opt-out
+  if (userPreferences.automatedFeedbackEmails === false) return false;
+  if (userPreferences.emailNotifications === false) return false;
+  
+  return true;
+}
+
 export default {
   sendFeedbackEmail,
-  sendWelcomeEmail
+  sendWelcomeEmail,
+  sendAutomatedFeedbackEmail,
+  shouldSendAutomatedEmail
 };

@@ -35,12 +35,14 @@ model User {
   onboardingComplete  Boolean   @default(false) @map("onboarding_complete")
 
   // Relations
-  interviews    Interview[]
-  payments      Payment[]
-  signupRecord  SignupRecord?
-  scoreHistory  InterviewScoreHistory[]
-  usageLogs     UsageLog[]
-  chatSessions  ChatSession[]
+  interviews      Interview[]
+  payments        Payment[]
+  signupRecord    SignupRecord?
+  scoreHistory    InterviewScoreHistory[]
+  usageLogs       UsageLog[]
+  chatSessions    ChatSession[]
+  savedCards      SavedCard[]
+  resumeDocuments ResumeDocument[]
 
   @@index([clerkId])
   @@index([email])
@@ -48,6 +50,106 @@ model User {
   @@index([preferredLanguage])
   @@index([registrationRegion])
   @@map("users")
+}
+
+// ========================================
+// SAVED CARD MODEL
+// Stores tokenized payment cards for users
+// ========================================
+model SavedCard {
+  id            String    @id @default(uuid()) @db.Uuid
+  userId        String    @map("user_id") @db.Uuid
+  
+  // Card token from payment processor (not the actual card number)
+  token         String    @db.VarChar(255)
+  
+  // Display info
+  lastFour      String    @map("last_four") @db.VarChar(4)
+  brand         String    @db.VarChar(20) // visa, mastercard, amex, etc.
+  expiryMonth   String    @map("expiry_month") @db.VarChar(2)
+  expiryYear    String    @map("expiry_year") @db.VarChar(4)
+  holderName    String    @map("holder_name") @db.VarChar(100)
+  
+  // Status
+  isDefault     Boolean   @default(false) @map("is_default")
+  isVerified    Boolean   @default(false) @map("is_verified")
+  
+  // Timestamps
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+  
+  // Relations
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([userId])
+  @@index([isDefault])
+  @@map("saved_cards")
+}
+
+// ========================================
+// RESUME DOCUMENT MODEL
+// User's resume repository with version control
+// ========================================
+model ResumeDocument {
+  id              String    @id @default(uuid()) @db.Uuid
+  userId          String    @map("user_id") @db.Uuid
+  
+  // File data
+  fileName        String    @map("file_name") @db.VarChar(255)
+  mimeType        String    @map("mime_type") @db.VarChar(100)
+  fileSize        Int       @map("file_size")
+  base64Data      String    @map("base64_data") @db.Text
+  
+  // Metadata
+  title           String    @db.VarChar(255)
+  description     String?   @db.Text
+  tags            String[]  @default([])
+  
+  // Parsed content (populated by parser)
+  parsedText      String?   @map("parsed_text") @db.Text
+  parsedMetadata  Json?     @map("parsed_metadata") @db.JsonB
+  
+  // Version control
+  version         Int       @default(1)
+  parentVersionId String?   @map("parent_version_id") @db.Uuid
+  isLatest        Boolean   @default(true) @map("is_latest")
+  
+  // Quality score (from resume quality service)
+  qualityScore    Int?      @map("quality_score")
+  
+  // Status flags
+  isActive        Boolean   @default(true) @map("is_active")
+  isPrimary       Boolean   @default(false) @map("is_primary")
+  
+  // Timestamps
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  
+  // Relations
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parentVersion   ResumeDocument? @relation("ResumeVersions", fields: [parentVersionId], references: [id])
+  childVersions   ResumeDocument[] @relation("ResumeVersions")
+  
+  @@index([userId])
+  @@index([isPrimary])
+  @@index([isActive, isLatest])
+  @@index([tags])
+  @@map("resume_documents")
+}
+
+// ========================================
+// BLOCKED PHONE MODEL
+// Stores blocked phone numbers for abuse prevention
+// ========================================
+model BlockedPhone {
+  id            String    @id @default(uuid()) @db.Uuid
+  phoneNumber   String    @unique @map("phone_number") @db.VarChar(20)
+  reason        String    @db.Text
+  blockedBy     String    @map("blocked_by") // Admin or system ID
+  blockedAt     DateTime  @default(now()) @map("blocked_at")
+  
+  @@index([phoneNumber])
+  @@map("blocked_phones")
 }
 
 // ========================================
@@ -76,8 +178,11 @@ model SignupRecord {
   // Credit throttling tier: 'full', 'throttled', 'blocked'
   creditTier      String    @default("full") @map("credit_tier")
   
-  // Verification status
-  phoneVerified   Boolean   @default(false) @map("phone_verified")
+  // Phone verification
+  phoneNumber       String?   @map("phone_number") @db.VarChar(20)
+  phoneVerified     Boolean   @default(false) @map("phone_verified")
+  phoneVerifiedAt   DateTime? @map("phone_verified_at")
+  
   captchaCompleted Boolean  @default(false) @map("captcha_completed")
   linkedInId      String?   @map("linkedin_id")
   
@@ -98,6 +203,7 @@ model SignupRecord {
   @@index([emailDomain])
   @@index([freeCreditGranted])
   @@index([creditTier])
+  @@index([phoneNumber])
   @@index([phoneVerified])
   @@map("signup_records")
 }
@@ -350,25 +456,39 @@ model InterviewScoreHistory {
 
 // ========================================
 // USAGE LOG MODEL
-// Tracks user activity for analytics and monitoring
+// Tracks user activity for analytics, monitoring, and quota tracking
 // ========================================
 model UsageLog {
-  id          String    @id @default(uuid()) @db.Uuid
-  userId      String    @map("user_id") @db.Uuid
+  id            String    @id @default(uuid()) @db.Uuid
+  userId        String    @map("user_id") @db.Uuid
   
   // Event type: 'interview_started', 'interview_completed', 'credits_purchased', etc.
-  eventType   String    @map("event_type")
+  eventType     String    @map("event_type")
+  
+  // Resource type for quota tracking
+  resourceType  String?   @map("resource_type") @db.VarChar(50)
+  
+  // Amount consumed (for quota tracking)
+  amount        Int       @default(0)
+  
+  // Related interview (optional)
+  interviewId   String?   @map("interview_id") @db.Uuid
+  
+  // Description
+  description   String?   @db.Text
   
   // Flexible event data
-  eventData   Json?     @map("event_data") @db.JsonB
+  eventData     Json?     @map("event_data") @db.JsonB
   
   // For quick time-series queries
-  timestamp   DateTime  @default(now())
+  timestamp     DateTime  @default(now())
+  createdAt     DateTime  @default(now()) @map("created_at")
   
   // Relations
-  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, timestamp])
+  @@index([userId, resourceType, createdAt])
   @@index([eventType, timestamp])
   @@index([timestamp])
   @@map("usage_logs")

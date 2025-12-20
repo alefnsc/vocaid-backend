@@ -11,7 +11,10 @@ import * as userService from '../services/userService';
 import * as interviewService from '../services/interviewService';
 import * as paymentService from '../services/paymentService';
 import * as analyticsService from '../services/analyticsService';
-import { sendFeedbackEmail } from '../services/emailService';
+import { updateUserMetadata } from '../services/clerkService';
+import { sendFeedbackEmail, sendAutomatedFeedbackEmail, shouldSendAutomatedEmail } from '../services/emailService';
+import * as resumeRepositoryService from '../services/resumeRepositoryService';
+import * as recordingPlaybackService from '../services/recordingPlaybackService';
 import { dbLogger } from '../services/databaseService';
 import { apiLogger } from '../utils/logger';
 
@@ -128,6 +131,52 @@ router.get('/users/me', requireAuth, async (req: Request, res: Response) => {
     res.status(500).json({
       status: 'error',
       message: 'Failed to fetch user profile'
+    });
+  }
+});
+
+/**
+ * POST /api/users/metadata - Update user public metadata (role, preferredLanguage)
+ */
+const userMetadataSchema = z.object({
+  role: z.enum(['Recruiter', 'Candidate', 'Manager']).optional(),
+  preferredLanguage: z.string().min(2).max(10).optional(),
+}).refine((data) => data.role || data.preferredLanguage, {
+  message: 'At least one field (role or preferredLanguage) must be provided',
+});
+
+router.post('/users/metadata', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    
+    // Validate request body
+    const result = userMetadataSchema.safeParse(req.body);
+    if (!result.success) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Validation failed',
+        errors: result.error.errors.map(e => ({
+          field: e.path.join('.'),
+          message: e.message
+        }))
+      });
+    }
+    
+    const { role, preferredLanguage } = result.data;
+    
+    const updateResult = await updateUserMetadata(clerkId, { role, preferredLanguage });
+    
+    apiLogger.info('User metadata updated', { clerkId: clerkId.slice(0, 15), role, preferredLanguage });
+    
+    res.json({
+      status: 'success',
+      data: updateResult
+    });
+  } catch (error: any) {
+    dbLogger.error('Error updating user metadata', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to update user metadata'
     });
   }
 });
@@ -996,6 +1045,136 @@ router.post(
   }
 );
 
+/**
+ * POST /api/interviews/:interviewId/send-automated-feedback
+ * Send automated interview feedback email with detailed insights
+ * Called automatically after interview completion
+ */
+router.post(
+  '/interviews/:interviewId/send-automated-feedback',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const { interviewId } = req.params;
+      const clerkId = (req as any).clerkUserId;
+      
+      // Validate UUID
+      try {
+        uuidSchema.parse(interviewId);
+      } catch {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Invalid interview ID format'
+        });
+      }
+      
+      // Get interview with user data and feedback
+      const interview = await interviewService.getInterviewById(interviewId);
+      
+      if (!interview) {
+        return res.status(404).json({
+          status: 'error',
+          message: 'Interview not found'
+        });
+      }
+      
+      // Verify ownership
+      if (interview.user.clerkId !== clerkId) {
+        return res.status(403).json({
+          status: 'error',
+          message: 'Access denied'
+        });
+      }
+      
+      // Check if interview has feedback
+      if (!interview.score && !interview.feedbackText) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'No feedback available for this interview'
+        });
+      }
+      
+      // Check user preferences for automated emails
+      const userPreferences = interview.user.publicMetadata || {};
+      if (!shouldSendAutomatedEmail(userPreferences as Record<string, any>)) {
+        dbLogger.info('User has disabled automated feedback emails', { 
+          interviewId, 
+          clerkId 
+        });
+        return res.json({
+          status: 'skipped',
+          message: 'User has disabled automated feedback emails'
+        });
+      }
+      
+      // Parse feedback data from feedbackText
+      const strengths = parseFeedbackSection(interview.feedbackText, 'Strengths') || [];
+      const improvements = parseFeedbackSection(interview.feedbackText, 'Areas for Improvement') || 
+                          parseFeedbackSection(interview.feedbackText, 'Improvements') || [];
+      const recommendations = parseFeedbackSection(interview.feedbackText, 'Recommendations') || [];
+      
+      // Calculate call duration in minutes
+      const callDurationMinutes = interview.callDuration 
+        ? interview.callDuration / 60000 
+        : interview.endedAt && interview.startedAt 
+          ? (new Date(interview.endedAt).getTime() - new Date(interview.startedAt).getTime()) / 60000
+          : 10; // Default 10 minutes
+      
+      // Get user's preferred language
+      const userLanguage = (userPreferences as any).preferredLanguage || 
+                          (userPreferences as any).language ||
+                          'en-US';
+      
+      // Send automated feedback email
+      const result = await sendAutomatedFeedbackEmail({
+        toEmail: interview.user.email || '',
+        candidateName: `${interview.user.firstName || ''} ${interview.user.lastName || ''}`.trim() || 'Candidate',
+        jobTitle: interview.jobTitle,
+        companyName: interview.companyName,
+        score: interview.score || 0,
+        interviewId: interview.id,
+        strengths,
+        improvements,
+        recommendations,
+        technicalScore: 3, // Default - could be extracted from metrics
+        communicationScore: 3,
+        problemSolvingScore: 3,
+        callDurationMinutes: Math.round(callDurationMinutes),
+        feedbackPdfBase64: interview.feedbackPdf,
+        language: userLanguage
+      });
+      
+      if (!result.success) {
+        dbLogger.error('Failed to send automated feedback email', { 
+          interviewId, 
+          error: result.error 
+        });
+        return res.status(500).json({
+          status: 'error',
+          message: result.error || 'Failed to send email'
+        });
+      }
+      
+      dbLogger.info('Automated feedback email sent', { 
+        interviewId, 
+        messageId: result.messageId 
+      });
+      
+      res.json({
+        status: 'success',
+        message: 'Automated feedback email sent successfully',
+        messageId: result.messageId
+      });
+    } catch (error: any) {
+      dbLogger.error('Error sending automated feedback email', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to send automated feedback email'
+      });
+    }
+  }
+);
+
 // ==================== Analytics Routes ====================
 
 // Get interview analytics (confidence timeline, sentiment, WPM)
@@ -1161,5 +1340,1925 @@ router.post(
     }
   }
 );
+
+// ========================================
+// RESUME QUALITY SCORING ENDPOINTS
+// ========================================
+
+import { getResumeQualityService } from '../services/resumeQualityService';
+
+/**
+ * POST /resume/analyze
+ * Full resume quality analysis with AI
+ */
+router.post(
+  '/resume/analyze',
+  async (req: Request, res: Response) => {
+    try {
+      const userId = req.headers['x-user-id'] as string;
+      if (!userId) {
+        return res.status(401).json({
+          status: 'error',
+          message: 'Authentication required'
+        });
+      }
+
+      const { resumeText, jobTitle, jobDescription, targetCompany } = req.body;
+
+      if (!resumeText || typeof resumeText !== 'string') {
+        return res.status(400).json({
+          status: 'error',
+          message: 'resumeText is required'
+        });
+      }
+
+      const service = getResumeQualityService();
+      const metrics = await service.analyzeResume({
+        resumeText,
+        jobTitle,
+        jobDescription,
+        targetCompany
+      });
+
+      res.json({
+        status: 'success',
+        data: metrics
+      });
+    } catch (error: any) {
+      apiLogger.error('Resume analysis failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to analyze resume'
+      });
+    }
+  }
+);
+
+/**
+ * POST /resume/quick-scan
+ * Fast resume quality check without AI
+ */
+router.post(
+  '/resume/quick-scan',
+  async (req: Request, res: Response) => {
+    try {
+      const { resumeText } = req.body;
+
+      if (!resumeText || typeof resumeText !== 'string') {
+        return res.status(400).json({
+          status: 'error',
+          message: 'resumeText is required'
+        });
+      }
+
+      const service = getResumeQualityService();
+      const result = await service.quickScan(resumeText);
+
+      res.json({
+        status: 'success',
+        data: result
+      });
+    } catch (error: any) {
+      apiLogger.error('Resume quick scan failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to scan resume'
+      });
+    }
+  }
+);
+
+/**
+ * POST /resume/suggestions
+ * Generate improvement suggestions based on job description
+ */
+router.post(
+  '/resume/suggestions',
+  async (req: Request, res: Response) => {
+    try {
+      const userId = req.headers['x-user-id'] as string;
+      if (!userId) {
+        return res.status(401).json({
+          status: 'error',
+          message: 'Authentication required'
+        });
+      }
+
+      const { resumeText, jobDescription } = req.body;
+
+      if (!resumeText || !jobDescription) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Both resumeText and jobDescription are required'
+        });
+      }
+
+      const service = getResumeQualityService();
+      const suggestions = await service.generateImprovementSuggestions(resumeText, jobDescription);
+
+      res.json({
+        status: 'success',
+        data: suggestions
+      });
+    } catch (error: any) {
+      apiLogger.error('Resume suggestions failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to generate suggestions'
+      });
+    }
+  }
+);
+
+// ==================== Phone Verification Routes ====================
+
+import * as phoneVerificationService from '../services/phoneVerificationService';
+import * as deviceFingerprintService from '../services/deviceFingerprintService';
+import * as preAuthService from '../services/preAuthService';
+import * as usageQuotaService from '../services/usageQuotaService';
+
+/**
+ * POST /api/phone/send-otp
+ * Send OTP verification code to phone number
+ */
+router.post(
+  '/phone/send-otp',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const clerkId = (req as any).clerkUserId;
+      const { phoneNumber, language } = req.body;
+
+      if (!phoneNumber) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Phone number is required'
+        });
+      }
+
+      // Validate and format phone number
+      const formatted = phoneVerificationService.formatPhoneNumber(phoneNumber);
+      if (!formatted.isValid) {
+        return res.status(400).json({
+          status: 'error',
+          message: formatted.error || 'Invalid phone number format'
+        });
+      }
+
+      // Check if phone is blocked
+      const isBlocked = await phoneVerificationService.isPhoneBlocked(phoneNumber);
+      if (isBlocked) {
+        return res.status(403).json({
+          status: 'error',
+          message: 'This phone number cannot be used for verification'
+        });
+      }
+
+      // Send OTP
+      const result = await phoneVerificationService.sendOTP(
+        phoneNumber, 
+        clerkId,
+        language || 'en-US'
+      );
+
+      if (!result.success) {
+        return res.status(result.rateLimited ? 429 : 400).json({
+          status: 'error',
+          message: result.error,
+          rateLimited: result.rateLimited
+        });
+      }
+
+      res.json({
+        status: 'success',
+        message: 'Verification code sent',
+        remainingAttempts: result.remainingAttempts
+      });
+    } catch (error: any) {
+      apiLogger.error('Send OTP failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to send verification code'
+      });
+    }
+  }
+);
+
+/**
+ * POST /api/phone/verify-otp
+ * Verify OTP code
+ */
+router.post(
+  '/phone/verify-otp',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const clerkId = (req as any).clerkUserId;
+      const { phoneNumber, code } = req.body;
+
+      if (!phoneNumber || !code) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Phone number and verification code are required'
+        });
+      }
+
+      // Verify OTP
+      const result = await phoneVerificationService.verifyOTP(
+        phoneNumber, 
+        code,
+        clerkId
+      );
+
+      if (!result.success) {
+        return res.status(400).json({
+          status: 'error',
+          message: result.error,
+          attemptsRemaining: result.attemptsRemaining
+        });
+      }
+
+      if (!result.valid) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Invalid verification code',
+          attemptsRemaining: result.attemptsRemaining
+        });
+      }
+
+      res.json({
+        status: 'success',
+        message: 'Phone number verified successfully',
+        verified: true
+      });
+    } catch (error: any) {
+      apiLogger.error('Verify OTP failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to verify code'
+      });
+    }
+  }
+);
+
+/**
+ * GET /api/phone/status
+ * Get phone verification status for current user
+ */
+router.get(
+  '/phone/status',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const clerkId = (req as any).clerkUserId;
+
+      const status = await phoneVerificationService.getPhoneVerificationStatus(clerkId);
+
+      res.json({
+        status: 'success',
+        data: status
+      });
+    } catch (error: any) {
+      apiLogger.error('Get phone status failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to get verification status'
+      });
+    }
+  }
+);
+
+/**
+ * DELETE /api/phone/verification
+ * Remove phone verification (user can re-verify with different number)
+ */
+router.delete(
+  '/phone/verification',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const clerkId = (req as any).clerkUserId;
+
+      const success = await phoneVerificationService.removePhoneVerification(clerkId);
+
+      if (!success) {
+        return res.status(500).json({
+          status: 'error',
+          message: 'Failed to remove phone verification'
+        });
+      }
+
+      res.json({
+        status: 'success',
+        message: 'Phone verification removed'
+      });
+    } catch (error: any) {
+      apiLogger.error('Remove phone verification failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to remove verification'
+      });
+    }
+  }
+);
+
+/**
+ * POST /api/phone/validate
+ * Validate phone number format without sending OTP
+ */
+router.post(
+  '/phone/validate',
+  async (req: Request, res: Response) => {
+    try {
+      const { phoneNumber, defaultCountryCode } = req.body;
+
+      if (!phoneNumber) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Phone number is required'
+        });
+      }
+
+      const result = phoneVerificationService.formatPhoneNumber(
+        phoneNumber, 
+        defaultCountryCode
+      );
+
+      res.json({
+        status: 'success',
+        data: {
+          isValid: result.isValid,
+          formattedNumber: result.isValid ? result.formattedNumber : undefined,
+          countryCode: result.countryCode,
+          error: result.error
+        }
+      });
+    } catch (error: any) {
+      apiLogger.error('Phone validation failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to validate phone number'
+      });
+    }
+  }
+);
+
+// ==================== Device Fingerprint Routes ====================
+
+/**
+ * POST /api/device/fingerprint
+ * Store device fingerprint for a user
+ */
+router.post(
+  '/device/fingerprint',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const clerkId = (req as any).clerkUserId;
+      const fingerprint = req.body;
+
+      if (!fingerprint || !fingerprint.visitorId) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Device fingerprint with visitorId is required'
+        });
+      }
+
+      // Validate device
+      const validation = await deviceFingerprintService.validateDeviceForSignup(
+        fingerprint,
+        clerkId
+      );
+
+      // Store fingerprint even if not fully trusted (for audit)
+      const storeResult = await deviceFingerprintService.storeDeviceFingerprint(
+        clerkId,
+        fingerprint
+      );
+
+      if (!validation.allowed) {
+        apiLogger.warn('Device validation failed', { 
+          clerkId, 
+          reason: validation.reason,
+          trustScore: validation.trustScore
+        });
+        
+        return res.status(403).json({
+          status: 'error',
+          message: validation.reason,
+          trustScore: validation.trustScore,
+          warnings: validation.warnings
+        });
+      }
+
+      res.json({
+        status: 'success',
+        data: {
+          stored: storeResult.success,
+          isNewDevice: storeResult.isNewDevice,
+          linkedAccounts: storeResult.linkedAccounts,
+          trustScore: validation.trustScore,
+          trustTier: deviceFingerprintService.getTrustTier(validation.trustScore),
+          warnings: validation.warnings
+        }
+      });
+    } catch (error: any) {
+      apiLogger.error('Store device fingerprint failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to process device fingerprint'
+      });
+    }
+  }
+);
+
+/**
+ * POST /api/device/validate
+ * Validate device fingerprint without storing
+ */
+router.post(
+  '/device/validate',
+  async (req: Request, res: Response) => {
+    try {
+      const fingerprint = req.body;
+
+      if (!fingerprint || !fingerprint.visitorId) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Device fingerprint with visitorId is required'
+        });
+      }
+
+      // Analyze fingerprint
+      const analysis = deviceFingerprintService.analyzeFingerprint(fingerprint);
+
+      // Check if device is blocked
+      const isBlocked = await deviceFingerprintService.isDeviceBlocked(fingerprint.visitorId);
+
+      res.json({
+        status: 'success',
+        data: {
+          isValid: analysis.isValid && !isBlocked,
+          isTrusted: analysis.isTrusted,
+          trustScore: analysis.trustScore,
+          trustTier: deviceFingerprintService.getTrustTier(analysis.trustScore),
+          isBlocked,
+          flags: analysis.flags,
+          warnings: analysis.warnings
+        }
+      });
+    } catch (error: any) {
+      apiLogger.error('Device validation failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to validate device'
+      });
+    }
+  }
+);
+
+/**
+ * GET /api/device/linked-accounts
+ * Get accounts linked to a device fingerprint (admin only)
+ */
+router.get(
+  '/device/linked-accounts/:visitorId',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const { visitorId } = req.params;
+
+      // In production, add admin role check here
+      const linkedAccounts = await deviceFingerprintService.getLinkedAccounts(visitorId);
+
+      res.json({
+        status: 'success',
+        data: {
+          count: linkedAccounts.linkedAccounts,
+          isNewDevice: linkedAccounts.isNewDevice
+          // Don't expose account IDs unless admin
+        }
+      });
+    } catch (error: any) {
+      apiLogger.error('Get linked accounts failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to get linked accounts'
+      });
+    }
+  }
+);
+
+/**
+ * POST /api/device/block
+ * Block a device fingerprint (admin only)
+ */
+router.post(
+  '/device/block',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const clerkId = (req as any).clerkUserId;
+      const { visitorId, reason } = req.body;
+
+      // In production, add admin role check here
+      if (!visitorId || !reason) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'visitorId and reason are required'
+        });
+      }
+
+      const success = await deviceFingerprintService.blockDevice(
+        visitorId,
+        reason,
+        clerkId
+      );
+
+      if (!success) {
+        return res.status(500).json({
+          status: 'error',
+          message: 'Failed to block device'
+        });
+      }
+
+      res.json({
+        status: 'success',
+        message: 'Device blocked successfully'
+      });
+    } catch (error: any) {
+      apiLogger.error('Block device failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to block device'
+      });
+    }
+  }
+);
+
+// ==================== Pre-Authorization Card Routes ====================
+
+/**
+ * POST /api/cards/verify
+ * Perform zero-dollar pre-authorization to verify a card
+ */
+router.post(
+  '/cards/verify',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const clerkId = (req as any).clerkUserId;
+      const { cardNumber, expiryMonth, expiryYear, cvv, holderName, saveCard } = req.body;
+
+      // Validate required fields
+      if (!cardNumber || !expiryMonth || !expiryYear || !cvv || !holderName) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'All card details are required (cardNumber, expiryMonth, expiryYear, cvv, holderName)'
+        });
+      }
+
+      // Perform pre-authorization
+      const result = await preAuthService.performPreAuthorization({
+        number: cardNumber,
+        expiryMonth,
+        expiryYear,
+        cvv,
+        holderName
+      }, clerkId);
+
+      if (!result.success || !result.authorized) {
+        return res.status(400).json({
+          status: 'error',
+          message: result.error || 'Card verification failed',
+          errorCode: result.errorCode
+        });
+      }
+
+      // Optionally save the card
+      let savedCard = null;
+      if (saveCard && result.token) {
+        savedCard = await preAuthService.saveVerifiedCard(
+          clerkId,
+          result,
+          holderName,
+          expiryMonth,
+          expiryYear,
+          true // setAsDefault
+        );
+        
+        // Mark payment as verified for trust scoring
+        await preAuthService.markPaymentVerified(clerkId);
+      }
+
+      res.json({
+        status: 'success',
+        message: 'Card verified successfully',
+        data: {
+          lastFour: result.lastFour,
+          brand: result.brand,
+          avsVerified: result.avsVerified,
+          cvvVerified: result.cvvVerified,
+          saved: !!savedCard,
+          cardId: savedCard?.id
+        }
+      });
+    } catch (error: any) {
+      apiLogger.error('Card verification failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to verify card'
+      });
+    }
+  }
+);
+
+/**
+ * GET /api/cards
+ * Get user's saved cards
+ */
+router.get(
+  '/cards',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const clerkId = (req as any).clerkUserId;
+
+      const cards = await preAuthService.getUserCards(clerkId);
+
+      // Return cards without sensitive token data
+      const safeCards = cards.map(card => ({
+        id: card.id,
+        lastFour: card.lastFour,
+        brand: card.brand,
+        expiryMonth: card.expiryMonth,
+        expiryYear: card.expiryYear,
+        holderName: card.holderName,
+        isDefault: card.isDefault,
+        createdAt: card.createdAt
+      }));
+
+      res.json({
+        status: 'success',
+        data: safeCards
+      });
+    } catch (error: any) {
+      apiLogger.error('Get cards failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to get cards'
+      });
+    }
+  }
+);
+
+/**
+ * DELETE /api/cards/:cardId
+ * Delete a saved card
+ */
+router.delete(
+  '/cards/:cardId',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const clerkId = (req as any).clerkUserId;
+      const { cardId } = req.params;
+
+      const success = await preAuthService.deleteCard(clerkId, cardId);
+
+      if (!success) {
+        return res.status(404).json({
+          status: 'error',
+          message: 'Card not found or could not be deleted'
+        });
+      }
+
+      res.json({
+        status: 'success',
+        message: 'Card deleted successfully'
+      });
+    } catch (error: any) {
+      apiLogger.error('Delete card failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to delete card'
+      });
+    }
+  }
+);
+
+/**
+ * GET /api/cards/verification-status
+ * Check if user has a verified payment method
+ */
+router.get(
+  '/cards/verification-status',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const clerkId = (req as any).clerkUserId;
+
+      const hasVerified = await preAuthService.hasVerifiedPayment(clerkId);
+
+      res.json({
+        status: 'success',
+        data: {
+          hasVerifiedPayment: hasVerified
+        }
+      });
+    } catch (error: any) {
+      apiLogger.error('Check verification status failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to check verification status'
+      });
+    }
+  }
+);
+
+/**
+ * POST /api/cards/validate
+ * Validate card number format (client-side validation helper)
+ */
+router.post(
+  '/cards/validate',
+  async (req: Request, res: Response) => {
+    try {
+      const { cardNumber, expiryMonth, expiryYear, cvv } = req.body;
+
+      if (!cardNumber) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Card number is required'
+        });
+      }
+
+      const brand = preAuthService.detectCardBrand(cardNumber);
+      const isNumberValid = preAuthService.validateCardNumber(cardNumber);
+      const isExpiryValid = expiryMonth && expiryYear 
+        ? preAuthService.validateExpiryDate(expiryMonth, expiryYear)
+        : undefined;
+      const isCvvValid = cvv && brand 
+        ? preAuthService.validateCVV(cvv, brand)
+        : undefined;
+
+      res.json({
+        status: 'success',
+        data: {
+          brand,
+          isNumberValid,
+          isExpiryValid,
+          isCvvValid,
+          maskedNumber: isNumberValid ? preAuthService.maskCardNumber(cardNumber) : undefined
+        }
+      });
+    } catch (error: any) {
+      apiLogger.error('Card validation failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to validate card'
+      });
+    }
+  }
+);
+
+// ==================== Usage Quota Routes ====================
+
+/**
+ * GET /api/usage/summary
+ * Get comprehensive usage summary for current user
+ */
+router.get(
+  '/usage/summary',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const clerkId = (req as any).clerkUserId;
+
+      const summary = await usageQuotaService.getUsageSummary(clerkId);
+
+      res.json({
+        status: 'success',
+        data: summary
+      });
+    } catch (error: any) {
+      apiLogger.error('Get usage summary failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to get usage summary'
+      });
+    }
+  }
+);
+
+/**
+ * GET /api/usage/quota/:resource
+ * Check quota for a specific resource
+ */
+router.get(
+  '/usage/quota/:resource',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const clerkId = (req as any).clerkUserId;
+      const { resource } = req.params;
+
+      // Validate resource type
+      const validResources = [
+        'maxInterviewMinutes',
+        'maxInterviewsPerDay',
+        'maxAITokensPerInterview',
+        'maxAITokensTotal',
+        'maxResumesStored',
+        'maxChatMessagesPerDay',
+        'maxEmailsPerDay'
+      ];
+
+      if (!validResources.includes(resource)) {
+        return res.status(400).json({
+          status: 'error',
+          message: `Invalid resource. Valid resources: ${validResources.join(', ')}`
+        });
+      }
+
+      const quota = await usageQuotaService.checkQuota(
+        clerkId, 
+        resource as keyof typeof usageQuotaService.USAGE_TIERS.free.limits
+      );
+
+      res.json({
+        status: 'success',
+        data: quota
+      });
+    } catch (error: any) {
+      apiLogger.error('Check quota failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to check quota'
+      });
+    }
+  }
+);
+
+/**
+ * GET /api/usage/can-start-interview
+ * Check if user can start a new interview
+ */
+router.get(
+  '/usage/can-start-interview',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const clerkId = (req as any).clerkUserId;
+
+      const result = await usageQuotaService.canStartInterview(clerkId);
+
+      res.json({
+        status: 'success',
+        data: result
+      });
+    } catch (error: any) {
+      apiLogger.error('Check interview permission failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to check interview permission'
+      });
+    }
+  }
+);
+
+/**
+ * GET /api/usage/tier
+ * Get current user's tier information
+ */
+router.get(
+  '/usage/tier',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const clerkId = (req as any).clerkUserId;
+
+      const tier = await usageQuotaService.getUserTier(clerkId);
+
+      res.json({
+        status: 'success',
+        data: {
+          name: tier.name,
+          limits: tier.limits,
+          resetPeriod: tier.resetPeriod
+        }
+      });
+    } catch (error: any) {
+      apiLogger.error('Get tier info failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to get tier info'
+      });
+    }
+  }
+);
+
+/**
+ * POST /api/usage/log
+ * Log resource usage (internal/admin use)
+ */
+router.post(
+  '/usage/log',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const clerkId = (req as any).clerkUserId;
+      const { resourceType, amount, interviewId, description } = req.body;
+
+      if (!resourceType || amount === undefined) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'resourceType and amount are required'
+        });
+      }
+
+      const success = await usageQuotaService.logUsage({
+        userId: clerkId,
+        resourceType,
+        amount,
+        interviewId,
+        description,
+        timestamp: new Date()
+      });
+
+      if (!success) {
+        return res.status(500).json({
+          status: 'error',
+          message: 'Failed to log usage'
+        });
+      }
+
+      res.json({
+        status: 'success',
+        message: 'Usage logged successfully'
+      });
+    } catch (error: any) {
+      apiLogger.error('Log usage failed', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to log usage'
+      });
+    }
+  }
+);
+
+// ========================================
+// RESUME REPOSITORY ROUTES
+// Centralized resume management with version control
+// ========================================
+
+/**
+ * Get all resumes for the authenticated user
+ * GET /resumes
+ */
+router.get('/resumes', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const resumes = await resumeRepositoryService.getResumes(clerkId);
+    
+    res.json({
+      status: 'success',
+      data: resumes
+    });
+  } catch (error: any) {
+    apiLogger.error('Get resumes failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get resumes'
+    });
+  }
+});
+
+/**
+ * Get primary resume
+ * GET /resumes/primary
+ */
+router.get('/resumes/primary', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const includeData = req.query.includeData === 'true';
+    
+    const resume = await resumeRepositoryService.getPrimaryResume(clerkId, includeData);
+    
+    if (!resume) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'No primary resume set'
+      });
+    }
+    
+    res.json({
+      status: 'success',
+      data: resume
+    });
+  } catch (error: any) {
+    apiLogger.error('Get primary resume failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get primary resume'
+    });
+  }
+});
+
+/**
+ * Search resumes
+ * GET /resumes/search?q=...&tags=...
+ */
+router.get('/resumes/search', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const query = (req.query.q as string) || '';
+    const tags = req.query.tags ? (req.query.tags as string).split(',') : undefined;
+    
+    const resumes = await resumeRepositoryService.searchResumes(clerkId, query, tags);
+    
+    res.json({
+      status: 'success',
+      data: resumes
+    });
+  } catch (error: any) {
+    apiLogger.error('Search resumes failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to search resumes'
+    });
+  }
+});
+
+/**
+ * Get a specific resume by ID
+ * GET /resumes/:resumeId
+ */
+router.get('/resumes/:resumeId', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { resumeId } = req.params;
+    const includeData = req.query.includeData === 'true';
+    
+    const resume = await resumeRepositoryService.getResumeById(clerkId, resumeId, includeData);
+    
+    if (!resume) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Resume not found'
+      });
+    }
+    
+    res.json({
+      status: 'success',
+      data: resume
+    });
+  } catch (error: any) {
+    apiLogger.error('Get resume failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get resume'
+    });
+  }
+});
+
+/**
+ * Get resume version history
+ * GET /resumes/:resumeId/versions
+ */
+router.get('/resumes/:resumeId/versions', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { resumeId } = req.params;
+    
+    const versions = await resumeRepositoryService.getResumeVersionHistory(clerkId, resumeId);
+    
+    res.json({
+      status: 'success',
+      data: versions
+    });
+  } catch (error: any) {
+    apiLogger.error('Get resume versions failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get resume versions'
+    });
+  }
+});
+
+/**
+ * Create a new resume
+ * POST /resumes
+ */
+router.post('/resumes', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { fileName, mimeType, base64Data, title, description, tags, isPrimary } = req.body;
+    
+    if (!fileName || !mimeType || !base64Data) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'fileName, mimeType, and base64Data are required'
+      });
+    }
+    
+    // Validate file
+    const validation = resumeRepositoryService.validateResumeFile(base64Data, mimeType);
+    if (!validation.valid) {
+      return res.status(400).json({
+        status: 'error',
+        message: validation.error
+      });
+    }
+    
+    const resume = await resumeRepositoryService.createResume(clerkId, {
+      fileName,
+      mimeType,
+      base64Data,
+      title,
+      description,
+      tags,
+      isPrimary
+    });
+    
+    if (!resume) {
+      return res.status(500).json({
+        status: 'error',
+        message: 'Failed to create resume'
+      });
+    }
+    
+    res.status(201).json({
+      status: 'success',
+      data: {
+        id: resume.id,
+        title: resume.title,
+        fileName: resume.fileName,
+        version: resume.version,
+        isPrimary: resume.isPrimary
+      }
+    });
+  } catch (error: any) {
+    apiLogger.error('Create resume failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to create resume'
+    });
+  }
+});
+
+/**
+ * Update resume metadata
+ * PATCH /resumes/:resumeId
+ */
+router.patch('/resumes/:resumeId', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { resumeId } = req.params;
+    const { title, description, tags, isPrimary } = req.body;
+    
+    const resume = await resumeRepositoryService.updateResume(clerkId, resumeId, {
+      title,
+      description,
+      tags,
+      isPrimary
+    });
+    
+    if (!resume) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Resume not found'
+      });
+    }
+    
+    res.json({
+      status: 'success',
+      data: resume
+    });
+  } catch (error: any) {
+    apiLogger.error('Update resume failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to update resume'
+    });
+  }
+});
+
+/**
+ * Create a new version of a resume
+ * POST /resumes/:resumeId/versions
+ */
+router.post('/resumes/:resumeId/versions', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { resumeId } = req.params;
+    const { fileName, mimeType, base64Data } = req.body;
+    
+    if (!fileName || !mimeType || !base64Data) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'fileName, mimeType, and base64Data are required'
+      });
+    }
+    
+    // Validate file
+    const validation = resumeRepositoryService.validateResumeFile(base64Data, mimeType);
+    if (!validation.valid) {
+      return res.status(400).json({
+        status: 'error',
+        message: validation.error
+      });
+    }
+    
+    const resume = await resumeRepositoryService.createResumeVersion(clerkId, resumeId, {
+      fileName,
+      mimeType,
+      base64Data
+    });
+    
+    if (!resume) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Resume not found or failed to create version'
+      });
+    }
+    
+    res.status(201).json({
+      status: 'success',
+      data: {
+        id: resume.id,
+        title: resume.title,
+        fileName: resume.fileName,
+        version: resume.version
+      }
+    });
+  } catch (error: any) {
+    apiLogger.error('Create resume version failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to create resume version'
+    });
+  }
+});
+
+/**
+ * Set resume as primary
+ * POST /resumes/:resumeId/primary
+ */
+router.post('/resumes/:resumeId/primary', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { resumeId } = req.params;
+    
+    const success = await resumeRepositoryService.setPrimaryResume(clerkId, resumeId);
+    
+    if (!success) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Resume not found'
+      });
+    }
+    
+    res.json({
+      status: 'success',
+      message: 'Resume set as primary'
+    });
+  } catch (error: any) {
+    apiLogger.error('Set primary resume failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to set primary resume'
+    });
+  }
+});
+
+/**
+ * Delete a resume
+ * DELETE /resumes/:resumeId
+ */
+router.delete('/resumes/:resumeId', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { resumeId } = req.params;
+    
+    const success = await resumeRepositoryService.deleteResume(clerkId, resumeId);
+    
+    if (!success) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Resume not found'
+      });
+    }
+    
+    res.json({
+      status: 'success',
+      message: 'Resume deleted'
+    });
+  } catch (error: any) {
+    apiLogger.error('Delete resume failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to delete resume'
+    });
+  }
+});
+
+/**
+ * Validate a resume file before upload
+ * POST /resumes/validate
+ */
+router.post('/resumes/validate', async (req: Request, res: Response) => {
+  try {
+    const { base64Data, mimeType } = req.body;
+    
+    if (!base64Data || !mimeType) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'base64Data and mimeType are required'
+      });
+    }
+    
+    const validation = resumeRepositoryService.validateResumeFile(base64Data, mimeType);
+    
+    res.json({
+      status: 'success',
+      data: {
+        valid: validation.valid,
+        error: validation.error
+      }
+    });
+  } catch (error: any) {
+    apiLogger.error('Validate resume failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to validate resume'
+    });
+  }
+});
+
+// ========================================
+// ENHANCED ANALYTICS FILTERING ROUTES
+// Advanced filtering and comparison views
+// ========================================
+
+/**
+ * Get enhanced filter options with counts
+ * GET /analytics/filters/enhanced
+ */
+router.get('/analytics/filters/enhanced', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const filterOptions = await analyticsService.getEnhancedFilterOptions(clerkId);
+    
+    res.json({
+      status: 'success',
+      data: filterOptions
+    });
+  } catch (error: any) {
+    apiLogger.error('Get enhanced filter options failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get filter options'
+    });
+  }
+});
+
+/**
+ * Get filtered analytics with advanced filtering
+ * POST /analytics/filtered
+ */
+router.post('/analytics/filtered', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { dateRange, roles, companies, scoreRange, sortBy, sortOrder } = req.body;
+    
+    const filters: analyticsService.AdvancedFilters = {
+      dateRange: dateRange || { preset: 'last30days' },
+      roles,
+      companies,
+      scoreRange,
+      sortBy,
+      sortOrder
+    };
+    
+    // Parse dates if provided
+    if (filters.dateRange.startDate) {
+      filters.dateRange.startDate = new Date(filters.dateRange.startDate);
+    }
+    if (filters.dateRange.endDate) {
+      filters.dateRange.endDate = new Date(filters.dateRange.endDate);
+    }
+    
+    const result = await analyticsService.getFilteredAnalytics(clerkId, filters);
+    
+    if (!result) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'User not found'
+      });
+    }
+    
+    res.json({
+      status: 'success',
+      data: result
+    });
+  } catch (error: any) {
+    apiLogger.error('Get filtered analytics failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get filtered analytics'
+    });
+  }
+});
+
+/**
+ * Compare two interviews
+ * GET /analytics/compare?interview1=...&interview2=...
+ */
+router.get('/analytics/compare', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { interview1, interview2 } = req.query;
+    
+    if (!interview1 || !interview2) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Both interview1 and interview2 are required'
+      });
+    }
+    
+    const comparison = await analyticsService.compareInterviews(
+      clerkId,
+      interview1 as string,
+      interview2 as string
+    );
+    
+    if (!comparison) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Interview(s) not found'
+      });
+    }
+    
+    res.json({
+      status: 'success',
+      data: comparison
+    });
+  } catch (error: any) {
+    apiLogger.error('Compare interviews failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to compare interviews'
+    });
+  }
+});
+
+/**
+ * Get interview progression over time
+ * GET /analytics/progression?role=...&company=...
+ */
+router.get('/analytics/progression', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { role, company, limit } = req.query;
+    
+    const progression = await analyticsService.getInterviewProgression(clerkId, {
+      role: role as string | undefined,
+      company: company as string | undefined,
+      limit: limit ? parseInt(limit as string, 10) : undefined
+    });
+    
+    res.json({
+      status: 'success',
+      data: progression
+    });
+  } catch (error: any) {
+    apiLogger.error('Get progression failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get interview progression'
+    });
+  }
+});
+
+/**
+ * Get date range from preset
+ * GET /analytics/date-range/:preset
+ */
+router.get('/analytics/date-range/:preset', async (req: Request, res: Response) => {
+  try {
+    const { preset } = req.params;
+    
+    const validPresets = ['today', 'last7days', 'last30days', 'last90days', 'thisMonth', 'lastMonth', 'thisYear', 'allTime'];
+    if (!validPresets.includes(preset)) {
+      return res.status(400).json({
+        status: 'error',
+        message: `Invalid preset. Valid options: ${validPresets.join(', ')}`
+      });
+    }
+    
+    const range = analyticsService.getDateRangeFromPreset(preset as analyticsService.DateRangePreset);
+    
+    res.json({
+      status: 'success',
+      data: range
+    });
+  } catch (error: any) {
+    apiLogger.error('Get date range failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get date range'
+    });
+  }
+});
+
+// ========================================
+// RECORDING PLAYBACK ROUTES
+// Audio playback and transcript synchronization
+// ========================================
+
+/**
+ * Get complete playback data for an interview
+ * GET /recordings/:interviewId
+ */
+router.get('/recordings/:interviewId', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { interviewId } = req.params;
+    
+    const playbackData = await recordingPlaybackService.getPlaybackData(clerkId, interviewId);
+    
+    if (!playbackData) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Recording not found'
+      });
+    }
+    
+    res.json({
+      status: 'success',
+      data: playbackData
+    });
+  } catch (error: any) {
+    apiLogger.error('Get playback data failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get playback data'
+    });
+  }
+});
+
+/**
+ * Get recording info only
+ * GET /recordings/:interviewId/info
+ */
+router.get('/recordings/:interviewId/info', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { interviewId } = req.params;
+    
+    const recordingInfo = await recordingPlaybackService.getRecordingInfo(clerkId, interviewId);
+    
+    if (!recordingInfo) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Recording not found'
+      });
+    }
+    
+    res.json({
+      status: 'success',
+      data: recordingInfo
+    });
+  } catch (error: any) {
+    apiLogger.error('Get recording info failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get recording info'
+    });
+  }
+});
+
+/**
+ * Get synchronized transcript
+ * GET /recordings/:interviewId/transcript
+ */
+router.get('/recordings/:interviewId/transcript', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { interviewId } = req.params;
+    
+    const transcript = await recordingPlaybackService.getSynchronizedTranscript(clerkId, interviewId);
+    
+    if (!transcript) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Transcript not found'
+      });
+    }
+    
+    res.json({
+      status: 'success',
+      data: transcript
+    });
+  } catch (error: any) {
+    apiLogger.error('Get transcript failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get transcript'
+    });
+  }
+});
+
+/**
+ * Search transcript
+ * GET /recordings/:interviewId/transcript/search?q=...
+ */
+router.get('/recordings/:interviewId/transcript/search', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { interviewId } = req.params;
+    const query = req.query.q as string;
+    
+    if (!query) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Search query (q) is required'
+      });
+    }
+    
+    const transcript = await recordingPlaybackService.getSynchronizedTranscript(clerkId, interviewId);
+    
+    if (!transcript) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Transcript not found'
+      });
+    }
+    
+    const results = recordingPlaybackService.searchTranscript(transcript, query);
+    
+    res.json({
+      status: 'success',
+      data: {
+        query,
+        matches: results.length,
+        segments: results
+      }
+    });
+  } catch (error: any) {
+    apiLogger.error('Search transcript failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to search transcript'
+    });
+  }
+});
+
+/**
+ * Get playback markers
+ * GET /recordings/:interviewId/markers
+ */
+router.get('/recordings/:interviewId/markers', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { interviewId } = req.params;
+    
+    const markers = await recordingPlaybackService.generatePlaybackMarkers(clerkId, interviewId);
+    
+    res.json({
+      status: 'success',
+      data: markers
+    });
+  } catch (error: any) {
+    apiLogger.error('Get markers failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get playback markers'
+    });
+  }
+});
+
+/**
+ * Save custom marker
+ * POST /recordings/:interviewId/markers
+ */
+router.post('/recordings/:interviewId/markers', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { interviewId } = req.params;
+    const { timestamp, label, description, color } = req.body;
+    
+    if (timestamp === undefined || !label) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'timestamp and label are required'
+      });
+    }
+    
+    const marker = await recordingPlaybackService.saveCustomMarker(clerkId, interviewId, {
+      type: 'custom',
+      timestamp,
+      label,
+      description,
+      color
+    });
+    
+    if (!marker) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Interview not found'
+      });
+    }
+    
+    res.status(201).json({
+      status: 'success',
+      data: marker
+    });
+  } catch (error: any) {
+    apiLogger.error('Save marker failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to save marker'
+    });
+  }
+});
+
+/**
+ * Get segment at specific timestamp
+ * GET /recordings/:interviewId/segment?t=...
+ */
+router.get('/recordings/:interviewId/segment', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { interviewId } = req.params;
+    const timestamp = parseFloat(req.query.t as string);
+    
+    if (isNaN(timestamp)) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Valid timestamp (t) is required'
+      });
+    }
+    
+    const transcript = await recordingPlaybackService.getSynchronizedTranscript(clerkId, interviewId);
+    
+    if (!transcript) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Transcript not found'
+      });
+    }
+    
+    const segment = recordingPlaybackService.getSegmentAtTime(transcript, timestamp);
+    
+    res.json({
+      status: 'success',
+      data: segment
+    });
+  } catch (error: any) {
+    apiLogger.error('Get segment failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get segment'
+    });
+  }
+});
+
+// ========================================
+// INTERVIEW CLONE & RETRY ROUTES
+// Retry interviews with same job details
+// ========================================
+
+/**
+ * Clone an interview to retry
+ * POST /interviews/:interviewId/clone
+ */
+router.post('/interviews/:interviewId/clone', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { interviewId } = req.params;
+    const { useLatestResume, resumeId, updateJobDescription } = req.body;
+    
+    const clonedInterview = await interviewService.cloneInterview(
+      interviewId,
+      clerkId,
+      {
+        useLatestResume,
+        resumeId,
+        updateJobDescription
+      }
+    );
+    
+    res.status(201).json({
+      status: 'success',
+      data: {
+        id: clonedInterview.id,
+        jobTitle: clonedInterview.jobTitle,
+        companyName: clonedInterview.companyName,
+        status: clonedInterview.status,
+        message: 'Interview cloned successfully. Ready to start.'
+      }
+    });
+  } catch (error: any) {
+    apiLogger.error('Clone interview failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: error.message || 'Failed to clone interview'
+    });
+  }
+});
+
+/**
+ * Get suggested interviews to retake
+ * GET /interviews/suggested-retakes
+ */
+router.get('/interviews/suggested-retakes', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const limit = req.query.limit ? parseInt(req.query.limit as string, 10) : 5;
+    
+    const suggestions = await interviewService.getSuggestedRetakes(clerkId, limit);
+    
+    res.json({
+      status: 'success',
+      data: suggestions
+    });
+  } catch (error: any) {
+    apiLogger.error('Get suggested retakes failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get suggested retakes'
+    });
+  }
+});
+
+/**
+ * Get interview history for role/company
+ * GET /interviews/history?jobTitle=...&companyName=...
+ */
+router.get('/interviews/history', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { jobTitle, companyName } = req.query;
+    
+    const history = await interviewService.getInterviewHistory(clerkId, {
+      jobTitle: jobTitle as string | undefined,
+      companyName: companyName as string | undefined
+    });
+    
+    res.json({
+      status: 'success',
+      data: history
+    });
+  } catch (error: any) {
+    apiLogger.error('Get interview history failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get interview history'
+    });
+  }
+});
+
+/**
+ * Create interview from resume repository
+ * POST /interviews/from-resume
+ */
+router.post('/interviews/from-resume', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const clerkId = (req as any).clerkUserId;
+    const { resumeId, jobTitle, companyName, jobDescription } = req.body;
+    
+    if (!resumeId || !jobTitle || !companyName || !jobDescription) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'resumeId, jobTitle, companyName, and jobDescription are required'
+      });
+    }
+    
+    const interview = await interviewService.createInterviewFromResume(
+      clerkId,
+      resumeId,
+      { jobTitle, companyName, jobDescription }
+    );
+    
+    res.status(201).json({
+      status: 'success',
+      data: {
+        id: interview.id,
+        jobTitle: interview.jobTitle,
+        companyName: interview.companyName,
+        status: interview.status,
+        message: 'Interview created from resume repository'
+      }
+    });
+  } catch (error: any) {
+    apiLogger.error('Create interview from resume failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: error.message || 'Failed to create interview from resume'
+    });
+  }
+});
 
 export default router;
