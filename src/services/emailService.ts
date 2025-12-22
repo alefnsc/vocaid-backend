@@ -1,12 +1,17 @@
 /**
  * Email Service
- * Handles email delivery using Resend SDK
+ * Handles email delivery using Resend SDK with idempotency and tracking
  */
 
+import { PrismaClient, EmailSendStatus } from '@prisma/client';
 import logger from '../utils/logger';
+import { v4 as uuidv4 } from 'uuid';
 
 // Create email logger
 const emailLogger = logger.child({ component: 'email' });
+
+// Prisma client for email logging
+const prisma = new PrismaClient();
 
 // Lazy-load Resend to avoid initialization errors when API key is missing
 let resend: any = null;
@@ -33,6 +38,81 @@ function getResendClient(): any {
   }
   
   return resend;
+}
+
+/**
+ * Generate idempotency key for email
+ * Uses interviewId + templateType to prevent duplicate sends
+ */
+export function generateEmailIdempotencyKey(interviewId: string, templateType: string): string {
+  return `email_${interviewId}_${templateType}_${Date.now()}`;
+}
+
+/**
+ * Check if email was already sent (idempotency check)
+ */
+export async function checkEmailAlreadySent(interviewId: string): Promise<boolean> {
+  try {
+    const interview = await prisma.interview.findUnique({
+      where: { id: interviewId },
+      select: { emailSendStatus: true, emailSentAt: true }
+    });
+    
+    return interview?.emailSendStatus === 'SENT';
+  } catch (error) {
+    emailLogger.error('Error checking email status', { interviewId, error });
+    return false;
+  }
+}
+
+/**
+ * Log email to database for audit trail
+ */
+export async function logEmailToDatabase(params: {
+  interviewId: string;
+  toEmail: string;
+  subject: string;
+  templateType: string;
+  status: EmailSendStatus;
+  messageId?: string;
+  errorMessage?: string;
+  idempotencyKey?: string;
+  language?: string;
+  hasAttachment?: boolean;
+  attachmentSize?: number;
+}): Promise<void> {
+  try {
+    await prisma.emailLog.create({
+      data: {
+        interviewId: params.interviewId,
+        toEmail: params.toEmail,
+        subject: params.subject,
+        templateType: params.templateType,
+        status: params.status,
+        messageId: params.messageId,
+        errorMessage: params.errorMessage,
+        idempotencyKey: params.idempotencyKey,
+        language: params.language,
+        hasAttachment: params.hasAttachment || false,
+        attachmentSize: params.attachmentSize,
+        sentAt: params.status === 'SENT' ? new Date() : null
+      }
+    });
+    
+    // Also update the interview record
+    await prisma.interview.update({
+      where: { id: params.interviewId },
+      data: {
+        emailSendStatus: params.status,
+        emailSentAt: params.status === 'SENT' ? new Date() : undefined,
+        emailLastError: params.errorMessage,
+        emailMessageId: params.messageId,
+        emailIdempotencyKey: params.idempotencyKey
+      }
+    });
+  } catch (error: any) {
+    emailLogger.error('Failed to log email to database', { error: error.message, interviewId: params.interviewId });
+  }
 }
 
 // Email configuration
@@ -767,6 +847,7 @@ function generateAutomatedFeedbackEmailHtml(params: AutomatedFeedbackEmailParams
 /**
  * Send automated interview feedback email with detailed insights
  * Called automatically after interview completion and feedback generation
+ * Includes idempotency checking and database logging
  */
 export async function sendAutomatedFeedbackEmail(params: AutomatedFeedbackEmailParams): Promise<EmailResult> {
   const {
@@ -786,10 +867,20 @@ export async function sendAutomatedFeedbackEmail(params: AutomatedFeedbackEmailP
     return { success: false, error: 'Missing required parameters' };
   }
 
+  // Idempotency check - skip if already sent
+  const alreadySent = await checkEmailAlreadySent(interviewId);
+  if (alreadySent) {
+    emailLogger.info('Email already sent, skipping (idempotency)', { interviewId, toEmail });
+    return { success: true, messageId: 'already-sent' };
+  }
+
   const t = getEmailTranslations(language);
+  const subject = `${t.subject} - ${jobTitle} at ${companyName}`;
+  const idempotencyKey = generateEmailIdempotencyKey(interviewId, 'automated_feedback');
   
   // Build attachments array
   const attachments: Array<{ filename: string; content: string }> = [];
+  const attachmentSize = feedbackPdfBase64 ? Buffer.byteLength(feedbackPdfBase64, 'base64') : 0;
   
   if (feedbackPdfBase64) {
     attachments.push({
@@ -803,7 +894,8 @@ export async function sendAutomatedFeedbackEmail(params: AutomatedFeedbackEmailP
     interviewId,
     score: Math.round(score),
     language,
-    hasAttachments: attachments.length 
+    hasAttachments: attachments.length,
+    idempotencyKey
   });
 
   // Get Resend client (lazy-loaded)
@@ -813,9 +905,24 @@ export async function sendAutomatedFeedbackEmail(params: AutomatedFeedbackEmailP
   if (!resendClient) {
     emailLogger.warn('Resend not configured - automated email would be sent', { 
       to: toEmail, 
-      subject: `${t.subject} - ${jobTitle} at ${companyName}`,
+      subject,
       interviewId 
     });
+    
+    // Still log to database for tracking
+    await logEmailToDatabase({
+      interviewId,
+      toEmail,
+      subject,
+      templateType: 'automated_feedback',
+      status: 'SKIPPED',
+      idempotencyKey,
+      language,
+      hasAttachment: attachments.length > 0,
+      attachmentSize,
+      errorMessage: 'Resend not configured'
+    });
+    
     return { success: true, messageId: 'mock-no-resend' };
   }
 
@@ -823,13 +930,28 @@ export async function sendAutomatedFeedbackEmail(params: AutomatedFeedbackEmailP
     const { data, error } = await resendClient.emails.send({
       from: EMAIL_FROM,
       to: [toEmail],
-      subject: `${t.subject} - ${jobTitle} at ${companyName}`,
+      subject,
       html: generateAutomatedFeedbackEmailHtml(params),
       attachments: attachments.length > 0 ? attachments : undefined
     });
 
     if (error) {
       emailLogger.error('Resend API error for automated email', { error: error.message, toEmail, interviewId });
+      
+      // Log failure to database
+      await logEmailToDatabase({
+        interviewId,
+        toEmail,
+        subject,
+        templateType: 'automated_feedback',
+        status: 'FAILED',
+        errorMessage: error.message,
+        idempotencyKey,
+        language,
+        hasAttachment: attachments.length > 0,
+        attachmentSize
+      });
+      
       return { success: false, error: error.message };
     }
 
@@ -839,6 +961,20 @@ export async function sendAutomatedFeedbackEmail(params: AutomatedFeedbackEmailP
       interviewId 
     });
     
+    // Log success to database
+    await logEmailToDatabase({
+      interviewId,
+      toEmail,
+      subject,
+      templateType: 'automated_feedback',
+      status: 'SENT',
+      messageId: data?.id,
+      idempotencyKey,
+      language,
+      hasAttachment: attachments.length > 0,
+      attachmentSize
+    });
+    
     return { success: true, messageId: data?.id };
   } catch (error: any) {
     emailLogger.error('Failed to send automated feedback email', { 
@@ -846,6 +982,21 @@ export async function sendAutomatedFeedbackEmail(params: AutomatedFeedbackEmailP
       toEmail, 
       interviewId 
     });
+    
+    // Log failure to database
+    await logEmailToDatabase({
+      interviewId,
+      toEmail,
+      subject,
+      templateType: 'automated_feedback',
+      status: 'FAILED',
+      errorMessage: error.message,
+      idempotencyKey,
+      language,
+      hasAttachment: attachments.length > 0,
+      attachmentSize
+    });
+    
     return { success: false, error: error.message };
   }
 }
@@ -868,5 +1019,8 @@ export default {
   sendFeedbackEmail,
   sendWelcomeEmail,
   sendAutomatedFeedbackEmail,
-  shouldSendAutomatedEmail
+  shouldSendAutomatedEmail,
+  checkEmailAlreadySent,
+  generateEmailIdempotencyKey,
+  logEmailToDatabase
 };

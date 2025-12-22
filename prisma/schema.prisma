@@ -336,6 +336,13 @@ model Interview {
   wpmAverage      Float?           @map("wpm_average") @db.DoublePrecision // Words per minute average
   confidenceTimeline Json?         @map("confidence_timeline") @db.JsonB // Array of {timestamp, value, tone, pace}
   
+  // Email Tracking Fields (for post-interview feedback email)
+  emailSentAt        DateTime?     @map("email_sent_at")
+  emailSendStatus    EmailSendStatus @default(PENDING) @map("email_send_status")
+  emailLastError     String?       @map("email_last_error") @db.Text
+  emailIdempotencyKey String?      @unique @map("email_idempotency_key") @db.VarChar(255)
+  emailMessageId     String?       @map("email_message_id") @db.VarChar(255) // Resend message ID
+  
   // Timestamps
   createdAt       DateTime         @default(now()) @map("created_at")
   updatedAt       DateTime         @updatedAt @map("updated_at")
@@ -345,6 +352,7 @@ model Interview {
   metrics         InterviewMetric[]
   scoreHistory    InterviewScoreHistory[]
   transcriptSegments TranscriptSegment[]
+  emailLogs       EmailLog[]
 
   @@index([userId])
   @@index([retellCallId])
@@ -355,6 +363,7 @@ model Interview {
   @@index([seniority])
   @@index([language])
   @@index([resumeId])
+  @@index([emailSendStatus])
   @@map("interviews")
 }
 
@@ -726,6 +735,13 @@ enum CreditTransactionType {
   EXPIRE      // Credits expired (if implementing expiry)
 }
 
+enum EmailSendStatus {
+  PENDING     // Email not yet sent
+  SENT        // Email sent successfully
+  FAILED      // Email failed to send
+  SKIPPED     // Email skipped (user opted out)
+}
+
 enum LeadType {
   DEMO_REQUEST     // B2B demo request
   EARLY_ACCESS     // Early access signup for B2B modules
@@ -736,6 +752,49 @@ enum LeadSource {
   PLATFORM_SHOWCASE // From platform showcase section
   PRICING_PAGE     // From pricing page
   OTHER            // Other sources
+}
+
+// ========================================
+// EMAIL LOG MODEL
+// Audit trail for all sent emails
+// ========================================
+model EmailLog {
+  id              String          @id @default(uuid()) @db.Uuid
+  
+  // Reference to interview
+  interviewId     String          @map("interview_id") @db.Uuid
+  
+  // Email details
+  toEmail         String          @map("to_email") @db.VarChar(255)
+  subject         String          @db.VarChar(500)
+  templateType    String          @map("template_type") @db.VarChar(50) // 'feedback', 'welcome', 'automated_feedback'
+  
+  // Delivery tracking
+  status          EmailSendStatus @default(PENDING)
+  messageId       String?         @map("message_id") @db.VarChar(255) // Resend message ID
+  errorMessage    String?         @map("error_message") @db.Text
+  
+  // Idempotency
+  idempotencyKey  String?         @unique @map("idempotency_key") @db.VarChar(255)
+  
+  // Metadata
+  language        String?         @db.VarChar(10)
+  hasAttachment   Boolean         @default(false) @map("has_attachment")
+  attachmentSize  Int?            @map("attachment_size") // Size in bytes
+  
+  // Timestamps
+  sentAt          DateTime?       @map("sent_at")
+  createdAt       DateTime        @default(now()) @map("created_at")
+  
+  // Relations
+  interview       Interview       @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  
+  @@index([interviewId])
+  @@index([status])
+  @@index([toEmail])
+  @@index([templateType])
+  @@index([createdAt])
+  @@map("email_logs")
 }
 
 // ========================================
