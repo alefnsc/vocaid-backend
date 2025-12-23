@@ -37,6 +37,10 @@ model User {
   // Role & Seniority (synced with Clerk publicMetadata)
   currentRole         String?   @map("current_role") @db.VarChar(50)
   currentSeniority    String?   @map("current_seniority") @db.VarChar(30)
+  
+  // Auth providers used (google, apple, microsoft, linkedin, email)
+  authProviders       String[]  @map("auth_providers") @db.VarChar(30)
+  lastAuthProvider    String?   @map("last_auth_provider") @db.VarChar(30)
 
   // Relations
   interviews      Interview[]

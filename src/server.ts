@@ -274,6 +274,10 @@ app.use('/api/leads', leadsRoutes);
 import emailRoutes from './routes/emailRoutes';
 app.use('/api/email', emailRoutes);
 
+// Mount auth routes (PayPal OAuth + mock endpoints for dev)
+import authRoutes from './routes/authRoutes';
+app.use('/api/auth', authRoutes);
+
 // ===== AUTHENTICATION MIDDLEWARE =====
 
 // Verify user ID from header matches Clerk format and is present
@@ -403,10 +407,18 @@ app.get('/get-call/:callId', async (req: Request, res: Response) => {
 /**
  * Generate feedback for interview
  * GET /get-feedback-for-interview/:callId
+ * 
+ * Query params:
+ * - structured=true: Return new structured feedback format alongside legacy
+ * - seniority: Candidate seniority level (intern, junior, mid, senior, staff, principal)
+ * - language: Feedback language code (en, es, pt-BR, zh-CN)
  */
 app.get('/get-feedback-for-interview/:callId', async (req: Request, res: Response) => {
   try {
     const { callId } = req.params;
+    const useStructured = req.query.structured === 'true' || process.env.USE_STRUCTURED_FEEDBACK === 'true';
+    const seniority = (req.query.seniority as string) || 'mid';
+    const language = (req.query.language as string) || 'en';
 
     // Get call details from Retell
     const call: any = await retellService.getCall(callId);
@@ -431,10 +443,39 @@ app.get('/get-feedback-for-interview/:callId', async (req: Request, res: Respons
     feedbackLogger.info('Processing feedback request', { 
       callId, 
       callStatus,
+      useStructured,
+      seniority,
+      language,
       transcriptLength: Array.isArray(call.transcript) ? call.transcript.length : 'unknown'
     });
 
-    // Generate feedback with call status for accurate scoring
+    // Use structured feedback if enabled
+    if (useStructured) {
+      const { structured, legacy } = await feedbackService.generateStructuredFeedback(
+        call.transcript as any,
+        call.metadata?.job_title || 'Unknown Position',
+        call.metadata?.job_description || '',
+        call.metadata?.first_name || 'Candidate',
+        callStatus,
+        {
+          seniority: seniority as any,
+          language: language as any,
+          resumeUsed: !!call.metadata?.interviewee_cv,
+          interviewId: call.metadata?.interview_id || callId
+        }
+      );
+
+      return res.json({
+        status: 'success',
+        call_id: callId,
+        feedback: legacy,  // Legacy format for backward compatibility
+        structured_feedback: structured,  // New structured format (null if generation failed)
+        call_status: callStatus,
+        version: structured ? '2.0' : '1.0'
+      });
+    }
+
+    // Legacy feedback generation (backward compatible)
     const feedback = await feedbackService.generateFeedback(
       call.transcript as any,
       call.metadata?.job_title || 'Unknown Position',
@@ -447,7 +488,8 @@ app.get('/get-feedback-for-interview/:callId', async (req: Request, res: Respons
       status: 'success',
       call_id: callId,
       feedback: feedback,
-      call_status: callStatus
+      call_status: callStatus,
+      version: '1.0'
     });
   } catch (error: any) {
     feedbackLogger.error('Error in /get-feedback-for-interview', { callId: req.params.callId, error: error.message });
