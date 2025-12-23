@@ -1,30 +1,21 @@
 /**
  * Authentication Routes
  * 
- * OAuth endpoints for PayPal and mock OAuth for local development.
- * PayPal OAuth is separate from Clerk since it's for payment account linking.
- * Mock endpoints enable local testing without provider dashboard configuration.
+ * Mock OAuth endpoints for local development testing.
+ * Enables testing OAuth UI flows without provider dashboard configuration.
+ * Production OAuth is handled entirely by Clerk (Google, Apple, Microsoft).
  * 
  * @module routes/authRoutes
  */
 
 import { Router, Request, Response } from 'express';
-import { PrismaClient, PaymentProvider } from '@prisma/client';
+import { PrismaClient } from '@prisma/client';
 
 const router = Router();
 const prisma = new PrismaClient();
 
 // Environment checks
 const isDevelopment = process.env.NODE_ENV === 'development';
-const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
-const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || '';
-const PAYPAL_SANDBOX = process.env.PAYPAL_SANDBOX === 'true';
-const PAYPAL_BASE_URL = PAYPAL_SANDBOX 
-  ? 'https://www.sandbox.paypal.com' 
-  : 'https://www.paypal.com';
-const PAYPAL_API_URL = PAYPAL_SANDBOX
-  ? 'https://api-m.sandbox.paypal.com'
-  : 'https://api-m.paypal.com';
 
 // Logger
 const authLogger = {
@@ -34,136 +25,35 @@ const authLogger = {
 };
 
 // ========================================
-// PAYPAL OAUTH ENDPOINTS
+// AUTH PROVIDER TRACKING
 // ========================================
 
 /**
- * Start PayPal OAuth flow
- * POST /api/auth/paypal/start
+ * Track auth provider used for login
+ * POST /api/auth/track-provider
  * 
- * Returns the PayPal authorization URL for the frontend to redirect to.
+ * Called after successful OAuth to track which provider was used.
  */
-router.post('/paypal/start', async (req: Request, res: Response) => {
+router.post('/track-provider', async (req: Request, res: Response) => {
   try {
-    const { redirectUrl, mode } = req.body;
+    const { clerkUserId, provider } = req.body;
 
-    if (!PAYPAL_CLIENT_ID) {
-      return res.status(500).json({
-        status: 'error',
-        message: 'PayPal is not configured',
-      });
-    }
-
-    // Build PayPal OAuth URL
-    const state = Buffer.from(JSON.stringify({
-      timestamp: Date.now(),
-      mode: mode || 'signIn',
-    })).toString('base64');
-
-    const scopes = [
-      'openid',
-      'email',
-      'profile',
-      // 'https://uri.paypal.com/services/paypalattributes', // Full name, verified info
-    ].join(' ');
-
-    const authUrl = new URL(`${PAYPAL_BASE_URL}/signin/authorize`);
-    authUrl.searchParams.set('client_id', PAYPAL_CLIENT_ID);
-    authUrl.searchParams.set('response_type', 'code');
-    authUrl.searchParams.set('scope', scopes);
-    authUrl.searchParams.set('redirect_uri', redirectUrl);
-    authUrl.searchParams.set('state', state);
-    authUrl.searchParams.set('flowEntry', 'static');
-
-    authLogger.info('PayPal OAuth started', { redirectUrl, mode });
-
-    res.json({
-      status: 'success',
-      authUrl: authUrl.toString(),
-    });
-  } catch (error: any) {
-    authLogger.error('PayPal OAuth start failed', { error: error.message });
-    res.status(500).json({
-      status: 'error',
-      message: 'Failed to start PayPal authentication',
-    });
-  }
-});
-
-/**
- * Handle PayPal OAuth callback
- * POST /api/auth/paypal/callback
- * 
- * Exchanges the authorization code for tokens and stores the connection.
- */
-router.post('/paypal/callback', async (req: Request, res: Response) => {
-  try {
-    const { code, state, clerkUserId } = req.body;
-
-    if (!code) {
+    if (!clerkUserId || !provider) {
       return res.status(400).json({
         status: 'error',
-        message: 'Authorization code is required',
+        message: 'clerkUserId and provider are required',
       });
     }
 
-    if (!clerkUserId) {
+    const validProviders = ['google', 'apple', 'microsoft', 'email'];
+    if (!validProviders.includes(provider)) {
       return res.status(400).json({
         status: 'error',
-        message: 'User must be logged in to connect PayPal',
+        message: 'Invalid provider. Use: google, apple, microsoft, email',
       });
     }
 
-    // Parse state
-    let stateData: any = {};
-    try {
-      stateData = JSON.parse(Buffer.from(state, 'base64').toString());
-    } catch (e) {
-      authLogger.warn('Failed to parse OAuth state', { state });
-    }
-
-    // Exchange code for tokens
-    const tokenResponse = await fetch(`${PAYPAL_API_URL}/v1/oauth2/token`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Authorization': `Basic ${Buffer.from(`${PAYPAL_CLIENT_ID}:${PAYPAL_CLIENT_SECRET}`).toString('base64')}`,
-      },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
-        code,
-      }),
-    });
-
-    if (!tokenResponse.ok) {
-      const errorData = await tokenResponse.json().catch(() => ({}));
-      authLogger.error('PayPal token exchange failed', { error: errorData });
-      throw new Error('Failed to exchange authorization code');
-    }
-
-    interface PayPalTokenResponse {
-      access_token: string;
-      refresh_token?: string;
-      expires_in?: number;
-      scope?: string;
-    }
-
-    const tokens = await tokenResponse.json() as PayPalTokenResponse;
-    const { access_token, refresh_token, expires_in, scope } = tokens;
-
-    // Get user info from PayPal
-    const userInfoResponse = await fetch(`${PAYPAL_API_URL}/v1/identity/openidconnect/userinfo?schema=openid`, {
-      headers: {
-        'Authorization': `Bearer ${access_token}`,
-      },
-    });
-
-    let paypalUserInfo: any = {};
-    if (userInfoResponse.ok) {
-      paypalUserInfo = await userInfoResponse.json();
-    }
-
-    // Find the user in our database
+    // Find and update user
     const user = await prisma.user.findUnique({
       where: { clerkId: clerkUserId },
     });
@@ -175,115 +65,31 @@ router.post('/paypal/callback', async (req: Request, res: Response) => {
       });
     }
 
-    // Calculate token expiry (default to 1 hour if not provided)
-    const tokenExpiresAt = new Date(Date.now() + ((expires_in || 3600) * 1000));
+    // Update auth providers array (add if not present)
+    const currentProviders = user.authProviders || [];
+    const updatedProviders = currentProviders.includes(provider)
+      ? currentProviders
+      : [...currentProviders, provider];
 
-    // Upsert PayPal connection
-    const connection = await prisma.paymentProviderConnection.upsert({
-      where: {
-        userId_provider: {
-          userId: user.id,
-          provider: PaymentProvider.PAYPAL,
-        },
-      },
-      update: {
-        accessToken: access_token,
-        refreshToken: refresh_token,
-        tokenExpiresAt,
-        scopes: scope?.split(' ') || [],
-        providerAccountId: paypalUserInfo.user_id || paypalUserInfo.payer_id,
-        providerEmail: paypalUserInfo.email,
-        isActive: true,
-        lastUsedAt: new Date(),
-        updatedAt: new Date(),
-      },
-      create: {
-        userId: user.id,
-        provider: PaymentProvider.PAYPAL,
-        accessToken: access_token,
-        refreshToken: refresh_token,
-        tokenExpiresAt,
-        scopes: scope?.split(' ') || [],
-        providerAccountId: paypalUserInfo.user_id || paypalUserInfo.payer_id,
-        providerEmail: paypalUserInfo.email,
-        isActive: true,
-        connectedAt: new Date(),
-      },
-    });
-
-    authLogger.info('PayPal account connected', {
-      userId: user.id,
-      paypalEmail: paypalUserInfo.email,
-    });
-
-    res.json({
-      status: 'success',
-      message: 'PayPal account connected successfully',
-      connection: {
-        provider: connection.provider,
-        email: connection.providerEmail,
-        connectedAt: connection.connectedAt,
-      },
-    });
-  } catch (error: any) {
-    authLogger.error('PayPal callback failed', { error: error.message });
-    res.status(500).json({
-      status: 'error',
-      message: error.message || 'Failed to complete PayPal authentication',
-    });
-  }
-});
-
-/**
- * Disconnect PayPal account
- * DELETE /api/auth/paypal/disconnect
- */
-router.delete('/paypal/disconnect', async (req: Request, res: Response) => {
-  try {
-    const clerkUserId = req.headers['x-user-id'] as string;
-
-    if (!clerkUserId) {
-      return res.status(401).json({
-        status: 'error',
-        message: 'Authentication required',
-      });
-    }
-
-    const user = await prisma.user.findUnique({
-      where: { clerkId: clerkUserId },
-    });
-
-    if (!user) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'User not found',
-      });
-    }
-
-    // Soft delete - mark as inactive
-    await prisma.paymentProviderConnection.updateMany({
-      where: {
-        userId: user.id,
-        provider: PaymentProvider.PAYPAL,
-      },
+    await prisma.user.update({
+      where: { id: user.id },
       data: {
-        isActive: false,
-        accessToken: null,
-        refreshToken: null,
+        authProviders: updatedProviders,
+        lastAuthProvider: provider,
       },
     });
 
-    authLogger.info('PayPal account disconnected', { userId: user.id });
+    authLogger.info('Auth provider tracked', { userId: user.id, provider });
 
     res.json({
       status: 'success',
-      message: 'PayPal account disconnected',
+      message: 'Auth provider tracked',
     });
   } catch (error: any) {
-    authLogger.error('PayPal disconnect failed', { error: error.message });
+    authLogger.error('Track provider failed', { error: error.message });
     res.status(500).json({
       status: 'error',
-      message: 'Failed to disconnect PayPal account',
+      message: 'Failed to track auth provider',
     });
   }
 });
@@ -303,28 +109,30 @@ if (isDevelopment) {
    */
   router.get('/mock/oauth/start', (req: Request, res: Response) => {
     const { provider, redirectUrl } = req.query;
+    const providerStr = provider as string;
 
-    if (!provider || !['microsoft', 'linkedin', 'apple', 'paypal', 'google'].includes(provider as string)) {
+    if (!providerStr || !['microsoft', 'apple', 'google'].includes(providerStr)) {
       return res.status(400).json({
         status: 'error',
-        message: 'Invalid provider. Use: microsoft, linkedin, apple, paypal, google',
+        message: 'Invalid provider. Use: microsoft, apple, google',
       });
     }
 
     const mockState = Buffer.from(JSON.stringify({
-      provider,
+      provider: providerStr,
       timestamp: Date.now(),
       mock: true,
     })).toString('base64');
 
-    const callbackUrl = `${redirectUrl || '/auth/callback'}?mock=1&provider=${provider}&state=${mockState}&code=mock_auth_code_${provider}`;
+    const baseRedirect = redirectUrl || '/auth/callback';
+    const callbackUrl = baseRedirect + '?mock=1&provider=' + providerStr + '&state=' + mockState + '&code=mock_auth_code_' + providerStr;
 
-    authLogger.info('Mock OAuth started', { provider, callbackUrl });
+    authLogger.info('Mock OAuth started', { provider: providerStr, callbackUrl });
 
     res.json({
       status: 'success',
       redirectUrl: callbackUrl,
-      provider,
+      provider: providerStr,
       mock: true,
     });
   });
@@ -333,7 +141,7 @@ if (isDevelopment) {
    * Handle mock OAuth callback
    * POST /api/auth/mock/oauth/callback
    * 
-   * Simulates successful OAuth by creating a mock user session.
+   * Simulates successful OAuth by returning mock user data.
    */
   router.post('/mock/oauth/callback', async (req: Request, res: Response) => {
     const { provider, code, clerkUserId } = req.body;
@@ -347,18 +155,17 @@ if (isDevelopment) {
 
     // Generate mock user data
     const mockUser = {
-      id: `mock_${provider}_${Date.now()}`,
-      email: `mock.user.${provider}@example.com`,
+      id: 'mock_' + provider + '_' + Date.now(),
+      email: 'mock.user.' + provider + '@example.com',
       firstName: 'Mock',
-      lastName: `${provider.charAt(0).toUpperCase() + provider.slice(1)} User`,
+      lastName: provider.charAt(0).toUpperCase() + provider.slice(1) + ' User',
       provider,
-      accessToken: `mock_access_token_${provider}_${Date.now()}`,
-      refreshToken: `mock_refresh_token_${provider}_${Date.now()}`,
+      accessToken: 'mock_access_token_' + provider + '_' + Date.now(),
     };
 
     authLogger.info('Mock OAuth callback', { provider, mockUser: mockUser.email });
 
-    // If clerkUserId provided, we can optionally upsert a mock connection
+    // If clerkUserId provided, track the provider
     if (clerkUserId) {
       try {
         const user = await prisma.user.findUnique({
@@ -366,40 +173,21 @@ if (isDevelopment) {
         });
 
         if (user) {
-          // For PayPal mock, create an actual connection record
-          if (provider === 'paypal') {
-            await prisma.paymentProviderConnection.upsert({
-              where: {
-                userId_provider: {
-                  userId: user.id,
-                  provider: PaymentProvider.PAYPAL,
-                },
-              },
-              update: {
-                accessToken: mockUser.accessToken,
-                refreshToken: mockUser.refreshToken,
-                tokenExpiresAt: new Date(Date.now() + 3600000),
-                providerAccountId: mockUser.id,
-                providerEmail: mockUser.email,
-                isActive: true,
-                lastUsedAt: new Date(),
-              },
-              create: {
-                userId: user.id,
-                provider: PaymentProvider.PAYPAL,
-                accessToken: mockUser.accessToken,
-                refreshToken: mockUser.refreshToken,
-                tokenExpiresAt: new Date(Date.now() + 3600000),
-                scopes: ['openid', 'email', 'profile'],
-                providerAccountId: mockUser.id,
-                providerEmail: mockUser.email,
-                isActive: true,
-              },
-            });
-          }
+          const currentProviders = user.authProviders || [];
+          const updatedProviders = currentProviders.includes(provider)
+            ? currentProviders
+            : [...currentProviders, provider];
+
+          await prisma.user.update({
+            where: { id: user.id },
+            data: {
+              authProviders: updatedProviders,
+              lastAuthProvider: provider,
+            },
+          });
         }
       } catch (e) {
-        authLogger.warn('Mock user connection failed (non-blocking)', { error: (e as Error).message });
+        authLogger.warn('Mock user update failed (non-blocking)', { error: (e as Error).message });
       }
     }
 
@@ -407,7 +195,7 @@ if (isDevelopment) {
       status: 'success',
       mock: true,
       user: mockUser,
-      message: `Mock ${provider} authentication successful`,
+      message: 'Mock ' + provider + ' authentication successful',
     });
   });
 }
