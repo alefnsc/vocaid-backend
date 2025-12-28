@@ -236,7 +236,7 @@ constructor() {
 ### XML-Tagged Prompt Structure
 ```xml
 <agent_identity>
-  <name>Voxly</name>
+  <name>Vocaid</name>
   <role>Professional AI Interview Coach</role>
 </agent_identity>
 
@@ -279,10 +279,10 @@ constructor() {
 ### Language-Specific Greetings
 ```typescript
 const greetings = {
-  'pt-BR': "Olá {candidateName}! Bem-vindo à sua entrevista simulada com a Voxly...",
-  'es-ES': "¡Hola {candidateName}! Bienvenido a tu entrevista simulada con Voxly...",
-  'fr-FR': "Bonjour {candidateName} ! Bienvenue à votre entretien simulé avec Voxly...",
-  'zh-CN': "您好 {candidateName}！欢迎参加 Voxly 模拟面试...",
+  'pt-BR': "Olá {candidateName}! Bem-vindo à sua entrevista simulada com a Vocaid...",
+  'es-ES': "¡Hola {candidateName}! Bienvenido a tu entrevista simulada con Vocaid...",
+  'fr-FR': "Bonjour {candidateName} ! Bienvenue à votre entretien simulé avec Vocaid...",
+  'zh-CN': "您好 {candidateName}！欢迎参加 Vocaid 模拟面试...",
   // ...
 };
 ```
@@ -307,7 +307,7 @@ i18n
     supportedLngs: ['en-US', 'en-GB', 'pt-BR', 'es-ES', 'fr-FR', 'ru-RU', 'zh-CN', 'hi-IN'],
     detection: {
       order: ['localStorage', 'navigator', 'htmlTag'],
-      lookupLocalStorage: 'voxly_language',
+      lookupLocalStorage: 'Vocaid_language',
       caches: ['localStorage'],
     },
   });

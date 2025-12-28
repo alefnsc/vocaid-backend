@@ -282,7 +282,8 @@ function addRequestId(req: Request, res: Response, next: NextFunction) {
 function errorResponse(
   res: Response,
   code: keyof typeof ERROR_CODES,
-  customMessage?: string
+  customMessage?: string,
+  requestId?: string
 ) {
   const error = ERROR_CODES[code];
   return res.status(error.status).json({
@@ -290,7 +291,8 @@ function errorResponse(
     error: {
       code,
       message: customMessage || error.message
-    }
+    },
+    ...(requestId && { requestId })
   });
 }
 
@@ -329,7 +331,7 @@ router.post(
           errors: parseResult.error.flatten() 
         });
         return errorResponse(res, 'VALIDATION_ERROR', 
-          parseResult.error.errors[0]?.message);
+          parseResult.error.errors[0]?.message, requestId);
       }
       
       const { interviewId, pdfBase64, fileName, locale, meta } = parseResult.data;
@@ -346,12 +348,12 @@ router.post(
         });
         
         if (pdfValidation.error?.includes('exceeds maximum')) {
-          return errorResponse(res, 'PAYLOAD_TOO_LARGE', pdfValidation.error);
+          return errorResponse(res, 'PAYLOAD_TOO_LARGE', pdfValidation.error, requestId);
         }
         if (pdfValidation.error?.includes('Base64')) {
-          return errorResponse(res, 'INVALID_BASE64');
+          return errorResponse(res, 'INVALID_BASE64', undefined, requestId);
         }
-        return errorResponse(res, 'INVALID_PDF', pdfValidation.error);
+        return errorResponse(res, 'INVALID_PDF', pdfValidation.error, requestId);
       }
       
       emailLogger.info('PDF validated', {
@@ -381,30 +383,18 @@ router.post(
       
       if (!interview) {
         emailLogger.warn('Interview not found', { requestId, interviewId });
-        return res.status(404).json({
-          ok: false,
-          error: {
-            code: 'NOT_FOUND',
-            message: 'Interview not found'
-          }
-        });
+        return errorResponse(res, 'NOT_FOUND', undefined, requestId);
       }
       
       // Verify ownership
       if (interview.user.clerkId !== clerkId) {
-        emailLogger.warn('Access denied - user does not own interview', { 
+        emailLogger.warn('Access denied', { 
           requestId, 
           interviewId,
-          interviewOwner: interview.user.clerkId?.slice(0, 10) + '...',
+          owner: interview.user.clerkId?.slice(0, 10) + '...',
           requester: clerkId?.slice(0, 10) + '...'
         });
-        return res.status(403).json({
-          ok: false,
-          error: {
-            code: 'FORBIDDEN',
-            message: 'Access denied'
-          }
-        });
+        return errorResponse(res, 'FORBIDDEN', undefined, requestId);
       }
       
       // ========================================
@@ -412,21 +402,20 @@ router.post(
       // ========================================
       const alreadySent = await checkEmailAlreadySent(interviewId);
       if (alreadySent) {
-        emailLogger.info('Email already sent (idempotency)', { requestId, interviewId });
+        emailLogger.info('Email already sent (idempotent)', { requestId, interviewId });
         return res.json({
           ok: true,
           messageId: interview.emailMessageId || 'already-sent',
-          status: 'already_sent'
+          status: 'already_sent',
+          requestId
         });
       }
       
-      // Generate idempotency key
       const idempotencyKey = generateEmailIdempotencyKey(interviewId, 'feedback');
       
       // ========================================
       // 5. ATOMIC STATUS UPDATE (SENDING)
       // ========================================
-      // Try to atomically set status to SENDING only if currently PENDING or FAILED
       const updateResult = await prisma.interview.updateMany({
         where: {
           id: interviewId,
@@ -439,18 +428,32 @@ router.post(
         }
       });
       
-      // If no rows updated, email is already being sent or was sent
       if (updateResult.count === 0) {
-        emailLogger.info('Email already in progress or sent', { requestId, interviewId });
+        emailLogger.info('Email already in progress', { requestId, interviewId });
         return res.json({
           ok: true,
           messageId: 'in-progress',
-          status: 'in_progress'
+          status: 'in_progress',
+          requestId
         });
       }
       
       // ========================================
-      // 6. SEND EMAIL VIA RESEND
+      // 6. PREPARE PDF (temp file for large PDFs)
+      // ========================================
+      let pdfContent = pdfBase64;
+      const useTempFile = pdfValidation.decodedSize > TEMP_FILE_THRESHOLD;
+      
+      if (useTempFile) {
+        emailLogger.info('Using temp file for large PDF', {
+          requestId,
+          size: `${Math.round(pdfValidation.decodedSize / 1024)}KB`
+        });
+        tempFilePath = writePdfToTempFile(pdfBase64, interviewId);
+      }
+      
+      // ========================================
+      // 7. SEND EMAIL VIA RESEND
       // ========================================
       const recipientEmail = interview.user.email;
       if (!recipientEmail) {
@@ -461,20 +464,13 @@ router.post(
             emailLastError: 'User has no email address'
           }
         });
-        return res.status(400).json({
-          ok: false,
-          error: {
-            code: 'NO_EMAIL',
-            message: 'User does not have an email address'
-          }
-        });
+        return errorResponse(res, 'NO_EMAIL', undefined, requestId);
       }
       
       const candidateName = [interview.user.firstName, interview.user.lastName]
         .filter(Boolean)
         .join(' ') || 'Candidate';
       
-      // Use user's language preference or locale from request
       const language = locale || interview.user.preferredLanguage || 'en-US';
       
       const result = await sendFeedbackEmail({
@@ -484,14 +480,14 @@ router.post(
         companyName: meta?.company || interview.companyName,
         score: interview.score || 0,
         interviewId: interview.id,
-        feedbackPdfBase64: pdfBase64,
+        feedbackPdfBase64: pdfContent,
         resumeBase64: null,
         resumeFileName: null,
         feedbackSummary: interview.feedbackText?.split('\n')[0] || undefined
       });
       
       // ========================================
-      // 7. UPDATE STATUS BASED ON RESULT
+      // 8. UPDATE STATUS & LOG
       // ========================================
       if (result.success) {
         await prisma.interview.update({
@@ -504,7 +500,6 @@ router.post(
           }
         });
         
-        // Log to EmailLog table
         await logEmailToDatabase({
           interviewId,
           toEmail: recipientEmail,
@@ -518,27 +513,27 @@ router.post(
           attachmentSize: pdfValidation.decodedSize
         });
         
-        emailLogger.info('Feedback email sent successfully', { 
+        emailLogger.info('Email sent successfully', { 
           requestId, 
           interviewId, 
-          messageId: result.messageId 
+          messageId: result.messageId,
+          size: `${Math.round(pdfValidation.decodedSize / 1024)}KB`
         });
         
         return res.json({
           ok: true,
-          messageId: result.messageId
+          messageId: result.messageId,
+          requestId
         });
       } else {
-        // Update status to FAILED
         await prisma.interview.update({
           where: { id: interviewId },
           data: {
             emailSendStatus: 'FAILED',
-            emailLastError: result.error?.slice(0, 500) // Sanitize and limit error length
+            emailLastError: result.error?.slice(0, 500)
           }
         });
         
-        // Log failure
         await logEmailToDatabase({
           interviewId,
           toEmail: recipientEmail,
@@ -552,57 +547,49 @@ router.post(
           attachmentSize: pdfValidation.decodedSize
         });
         
-        emailLogger.error('Failed to send feedback email', { 
+        emailLogger.error('Email send failed', { 
           requestId, 
           interviewId, 
           error: result.error 
         });
         
-        return res.status(500).json({
-          ok: false,
-          error: {
-            code: 'SEND_FAILED',
-            message: 'Failed to send email. Please try again.'
-          }
-        });
+        return errorResponse(res, 'SEND_FAILED', undefined, requestId);
       }
       
     } catch (error: any) {
-      emailLogger.error('Unexpected error in email route', { 
+      emailLogger.error('Unexpected error', { 
         requestId, 
         error: error.message,
         stack: error.stack?.slice(0, 500)
       });
       
-      return res.status(500).json({
-        ok: false,
-        error: {
-          code: 'INTERNAL_ERROR',
-          message: 'An unexpected error occurred'
-        }
-      });
+      return errorResponse(res, 'INTERNAL_ERROR', undefined, requestId);
+      
+    } finally {
+      // Cleanup temp file
+      if (tempFilePath) {
+        cleanupTempFile(tempFilePath);
+      }
     }
   }
 );
 
 // ========================================
-// GET STATUS ENDPOINT (for retry UI)
+// GET STATUS ENDPOINT
 // ========================================
 router.get(
   '/status/:interviewId',
+  addRequestId,
   ensureJsonResponse,
   requireAuth,
   async (req: Request, res: Response) => {
     const clerkId = (req as any).clerkUserId;
+    const requestId = (req as any).requestId;
     const { interviewId } = req.params;
     
-    // Validate UUID
     const uuidResult = z.string().uuid().safeParse(interviewId);
     if (!uuidResult.success) {
-      return res.status(400).json({
-        ok: false,
-        error: { code: 'INVALID_ID', message: 'Invalid interview ID format' }
-      });
+      return errorResponse(res, 'VALIDATION_ERROR', 'Invalid interview ID format', requestId);
     }
     
     const interview = await prisma.interview.findUnique({
@@ -613,17 +600,66 @@ router.get(
     });
     
     if (!interview || interview.user.clerkId !== clerkId) {
-      return res.status(404).json({
-        ok: false,
-        error: { code: 'NOT_FOUND', message: 'Interview not found' }
-      });
+      return errorResponse(res, 'NOT_FOUND', undefined, requestId);
     }
     
     return res.json({
       ok: true,
       status: interview.emailSendStatus,
       sentAt: interview.emailSentAt,
-      error: interview.emailSendStatus === 'FAILED' ? interview.emailLastError : null
+      messageId: interview.emailMessageId,
+      canRetry: ['PENDING', 'FAILED'].includes(interview.emailSendStatus),
+      requestId
+    });
+  }
+);
+
+// ========================================
+// RETRY ENDPOINT
+// ========================================
+router.post(
+  '/retry/:interviewId',
+  addRequestId,
+  ensureJsonResponse,
+  requireAuth,
+  async (req: Request, res: Response) => {
+    const clerkId = (req as any).clerkUserId;
+    const requestId = (req as any).requestId;
+    const { interviewId } = req.params;
+    
+    const uuidResult = z.string().uuid().safeParse(interviewId);
+    if (!uuidResult.success) {
+      return errorResponse(res, 'VALIDATION_ERROR', 'Invalid interview ID format', requestId);
+    }
+    
+    // Reset status to allow retry
+    const result = await prisma.interview.updateMany({
+      where: {
+        id: interviewId,
+        user: { clerkId },
+        emailSendStatus: 'FAILED'
+      },
+      data: {
+        emailSendStatus: 'PENDING',
+        emailLastError: null
+      }
+    });
+    
+    if (result.count === 0) {
+      return res.status(400).json({
+        ok: false,
+        error: {
+          code: 'CANNOT_RETRY',
+          message: 'Email cannot be retried (already sent or not failed)'
+        },
+        requestId
+      });
+    }
+    
+    return res.json({
+      ok: true,
+      message: 'Email status reset. Please submit PDF to send again.',
+      requestId
     });
   }
 );

@@ -1,7 +1,7 @@
-# Voxly - Backend
+# Vocaid - Backend
 
 <p align="center">
-  <strong>Backend Server for Voxly Interview Platform</strong><br>
+  <strong>Backend Server for Vocaid Interview Platform</strong><br>
   Retell Custom LLM, OpenAI Integration, and MercadoPago Payment Processing
 </p>
 
@@ -64,8 +64,8 @@
 
 ```bash
 # Clone repository
-git clone https://github.com/alefnsc/voxly-backend.git
-cd voxly-backend
+git clone https://github.com/alefnsc/Vocaid-backend.git
+cd Vocaid-backend
 
 # Install dependencies
 npm install
@@ -84,7 +84,7 @@ Server runs at http://localhost:3001
 
 ```bash
 curl http://localhost:3001/health
-# Returns: {"status":"ok","message":"Voxly Backend is running","timestamp":"..."}
+# Returns: {"status":"ok","message":"Vocaid Backend is running","timestamp":"..."}
 ```
 
 ### Environment Variables
@@ -164,7 +164,7 @@ MAX_INTERVIEW_DURATION_MINUTES=15
 ### Project Structure
 
 ```
-voxly-backend/
+Vocaid-backend/
 ├── src/
 │   ├── server.ts                 # Main Express server + WebSocket
 │   ├── prompts/
@@ -486,11 +486,11 @@ server {
 #### 4. Deploy Application
 
 ```bash
-git clone https://github.com/alefnsc/voxly-backend.git
-cd voxly-backend
+git clone https://github.com/alefnsc/Vocaid-backend.git
+cd Vocaid-backend
 npm install
 npm run build
-pm2 start dist/server.js --name voxly-backend
+pm2 start dist/server.js --name Vocaid-backend
 pm2 save
 pm2 startup
 ```

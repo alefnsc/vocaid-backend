@@ -6,6 +6,7 @@
 import { PrismaClient, EmailSendStatus } from '@prisma/client';
 import logger from '../utils/logger';
 import { v4 as uuidv4 } from 'uuid';
+import { getConsentByEmail } from './consentService';
 
 // Create email logger
 const emailLogger = logger.child({ component: 'email' });
@@ -117,7 +118,7 @@ export async function logEmailToDatabase(params: {
 
 // Email configuration
 const EMAIL_FROM = process.env.EMAIL_FROM || 'Vocaid <onboarding@resend.dev>';
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://voxly-frontend-pearl.vercel.app';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://vocaid.ai';
 
 // ========================================
 // INTERFACES
@@ -158,6 +159,8 @@ export interface EmailResult {
   success: boolean;
   messageId?: string;
   error?: string;
+  skipped?: boolean;  // True if email was not sent due to consent/idempotency
+  reason?: string;    // Reason for skipping
 }
 
 // ========================================
@@ -276,6 +279,7 @@ function generateFeedbackEmailHtml(params: {
 
 /**
  * Send interview feedback email with optional attachments
+ * Respects consent: Checks transactional opt-in before sending
  */
 export async function sendFeedbackEmail(params: SendFeedbackEmailParams): Promise<EmailResult> {
   const {
@@ -295,6 +299,20 @@ export async function sendFeedbackEmail(params: SendFeedbackEmailParams): Promis
   if (!toEmail || !candidateName || !jobTitle || !interviewId) {
     emailLogger.error('Missing required email parameters', { toEmail, candidateName, jobTitle, interviewId });
     return { success: false, error: 'Missing required parameters' };
+  }
+
+  // Check transactional consent before sending
+  const consent = await getConsentByEmail(toEmail);
+  if (!consent.canSendTransactional) {
+    emailLogger.info('Feedback email blocked - user opted out of transactional emails', { 
+      toEmail, 
+      interviewId 
+    });
+    return { 
+      success: false, 
+      skipped: true, 
+      reason: 'Transactional emails disabled by user preference'
+    };
   }
 
   const interviewDetailsUrl = `${FRONTEND_URL}/interview/${interviewId}`;

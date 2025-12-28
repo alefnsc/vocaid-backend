@@ -54,6 +54,7 @@ const registerMultilingualCallSchema = z.object({
 const createPaymentSchema = z.object({
   packageId: z.enum(['starter', 'intermediate', 'professional']),
   language: z.string().refine(isValidLanguageCode, 'Invalid language code').optional(),
+  provider: z.enum(['mercadopago', 'paypal']).optional(),
 });
 
 // ========================================
@@ -355,12 +356,20 @@ router.post('/payment/create', requireAuth, async (req: Request, res: Response) 
   try {
     const clerkId = (req as any).clerkUserId;
     const body = createPaymentSchema.parse(req.body);
+    const isDevelopment = process.env.NODE_ENV === 'development';
     
     // Get user preferences for language and region
     const preferences = await getUserPreferences(clerkId);
     const language = (body.language || preferences?.language || 'en-US') as SupportedLanguageCode;
     const region = preferences?.region || 'GLOBAL';
-    const currency = getCurrencyForRegion(region);
+    
+    // Determine currency based on provider
+    // MercadoPago requires a LATAM currency, PayPal uses USD
+    let currency = getCurrencyForRegion(region);
+    if (body.provider === 'mercadopago' && currency === 'USD') {
+      // Default to ARS for MercadoPago when USD would be used
+      currency = 'ARS';
+    }
     
     // Get package info
     const pkg = CREDIT_PACKAGES[body.packageId];
@@ -371,12 +380,19 @@ router.post('/payment/create', requireAuth, async (req: Request, res: Response) 
       });
     }
     
-    // Get user email from Clerk
-    const { clerkClient } = await import('@clerk/express');
-    const clerkUser = await clerkClient.users.getUser(clerkId);
-    const userEmail = clerkUser.emailAddresses[0]?.emailAddress || '';
+    // Get user email from Clerk (with development fallback)
+    let userEmail = '';
+    if (isDevelopment && clerkId.startsWith('test_')) {
+      // Development mode: use mock email for test users
+      userEmail = `${clerkId}@test.vocaid.com`;
+      paymentLogger.info('Using mock email for test user', { clerkId, userEmail });
+    } else {
+      const { clerkClient } = await import('@clerk/express');
+      const clerkUser = await clerkClient.users.getUser(clerkId);
+      userEmail = clerkUser.emailAddresses[0]?.emailAddress || '';
+    }
     
-    // Create payment with geo-based provider
+    // Create payment with geo-based provider (or user-specified provider)
     const gateway = getPaymentGateway();
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
     const webhookUrl = process.env.WEBHOOK_BASE_URL;
@@ -394,7 +410,7 @@ router.post('/payment/create', requireAuth, async (req: Request, res: Response) 
       failureUrl: `${frontendUrl}/payment/failure`,
       pendingUrl: `${frontendUrl}/payment/pending`,
       webhookUrl: webhookUrl ? `${webhookUrl}/webhook/payment` : undefined,
-    });
+    }, body.provider); // Pass user-specified provider
     
     paymentLogger.info('Payment created', {
       provider: result.selectedProvider,

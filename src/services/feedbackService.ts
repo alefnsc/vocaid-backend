@@ -1,9 +1,22 @@
 import OpenAI from 'openai';
 import { feedbackLogger } from '../utils/logger';
+import {
+  FeedbackGenerationService,
+  InterviewContext,
+  TranscriptSegment
+} from './feedbackGenerationService';
+import { Seniority, SupportedLanguage, StructuredFeedback } from '../types/feedback';
 
 /**
  * Feedback generation service using OpenAI
+ * 
+ * This service provides both:
+ * - Legacy feedback format (FeedbackData) for backward compatibility
+ * - New structured feedback format (StructuredFeedback) via FeedbackGenerationService
  */
+
+// Feature flag: Use new feedback generation service
+const USE_STRUCTURED_FEEDBACK = process.env.USE_STRUCTURED_FEEDBACK === 'true';
 
 export interface InterviewTranscript {
   role: 'agent' | 'user';
@@ -32,11 +45,146 @@ export interface CallStatus {
 
 export class FeedbackService {
   private openai: OpenAI;
+  private structuredService: FeedbackGenerationService;
 
   constructor(openaiApiKey: string) {
     this.openai = new OpenAI({
       apiKey: openaiApiKey
     });
+    this.structuredService = new FeedbackGenerationService(openaiApiKey);
+  }
+
+  /**
+   * Convert StructuredFeedback to legacy FeedbackData format
+   * Ensures backward compatibility with existing frontend
+   */
+  private convertToLegacyFormat(structured: StructuredFeedback): FeedbackData {
+    // Calculate ratings (convert 0-5 competency scores to 1-5 scale)
+    const getCompetencyScore = (key: string): number => {
+      const comp = structured.competencies.find(c => c.key === key);
+      return comp ? Math.max(1, Math.round(comp.score)) : 3;
+    };
+
+    // Map overall score (0-100) to 1-5 rating
+    const overallRating = Math.max(1, Math.min(5, Math.round(structured.overallScore / 20)));
+
+    return {
+      overall_rating: overallRating,
+      strengths: structured.strengths.map(s => s.title + (s.evidence ? `: ${s.evidence}` : '')),
+      areas_for_improvement: structured.improvements.map(i => i.title + (i.howToImprove ? ` - ${i.howToImprove}` : '')),
+      technical_skills_rating: getCompetencyScore('technicalDepth'),
+      communication_skills_rating: Math.max(1, Math.round(structured.communication.overallScore)),
+      problem_solving_rating: getCompetencyScore('problemSolving'),
+      detailed_feedback: structured.executiveSummary,
+      recommendations: structured.studyPlan.map(s => `${s.topic}: ${s.rationale}`),
+      was_interrupted: structured.session.wasInterrupted
+    };
+  }
+
+  /**
+   * Build InterviewContext from legacy parameters
+   */
+  private buildInterviewContext(
+    normalizedTranscript: InterviewTranscript[],
+    jobTitle: string,
+    jobDescription: string,
+    candidateName: string,
+    callStatus?: CallStatus,
+    metadata?: {
+      seniority?: Seniority;
+      language?: SupportedLanguage;
+      resumeUsed?: boolean;
+      interviewId?: string;
+    }
+  ): InterviewContext {
+    const wasInterrupted = this.isInterviewInterrupted(callStatus, normalizedTranscript.length);
+    const durationSeconds = (callStatus?.call_duration_ms || 0) / 1000;
+
+    // Convert to TranscriptSegment format
+    const transcriptSegments: TranscriptSegment[] = normalizedTranscript.map(t => ({
+      role: t.role,
+      content: t.content,
+      timestamp: t.timestamp,
+      words: t.content.split(/\s+/).length
+    }));
+
+    return {
+      sessionId: metadata?.interviewId || `session_${Date.now()}`,
+      roleTitle: jobTitle,
+      seniority: metadata?.seniority || 'mid',
+      language: metadata?.language || 'en',
+      jobDescription,
+      candidateName,
+      resumeUsed: metadata?.resumeUsed ?? false,
+      transcript: transcriptSegments,
+      durationSeconds,
+      wasInterrupted,
+      interruptionReason: callStatus?.end_call_reason || callStatus?.disconnection_reason
+    };
+  }
+
+  /**
+   * Generate feedback using the new structured service
+   * Returns both structured and legacy format
+   */
+  async generateStructuredFeedback(
+    transcript: any,
+    jobTitle: string,
+    jobDescription: string,
+    candidateName: string,
+    callStatus?: CallStatus,
+    metadata?: {
+      seniority?: Seniority;
+      language?: SupportedLanguage;
+      resumeUsed?: boolean;
+      interviewId?: string;
+    }
+  ): Promise<{ structured: StructuredFeedback | null; legacy: FeedbackData }> {
+    const normalizedTranscript = this.normalizeTranscript(transcript);
+    
+    // Quick rejection for empty/minimal transcripts
+    if (normalizedTranscript.length < 4) {
+      feedbackLogger.warn('Transcript too short for structured feedback', {
+        messageCount: normalizedTranscript.length
+      });
+      const legacyFallback = await this.generateFeedback(
+        transcript, jobTitle, jobDescription, candidateName, callStatus
+      );
+      return { structured: null, legacy: legacyFallback };
+    }
+
+    const context = this.buildInterviewContext(
+      normalizedTranscript, jobTitle, jobDescription, candidateName, callStatus, metadata
+    );
+
+    feedbackLogger.info('Generating structured feedback', {
+      sessionId: context.sessionId,
+      roleTitle: context.roleTitle,
+      seniority: context.seniority,
+      transcriptLength: context.transcript.length
+    });
+
+    const result = await this.structuredService.generate(context);
+
+    if (result.success && result.feedback) {
+      const legacyFormat = this.convertToLegacyFormat(result.feedback);
+      feedbackLogger.info('Structured feedback generated successfully', {
+        sessionId: context.sessionId,
+        overallScore: result.feedback.overallScore,
+        competencyCount: result.feedback.competencies.length,
+        processingTimeMs: result.processingTimeMs
+      });
+      return { structured: result.feedback, legacy: legacyFormat };
+    }
+
+    // Fallback to legacy generation if structured fails
+    feedbackLogger.warn('Structured feedback failed, falling back to legacy', {
+      error: result.error
+    });
+    const legacyFallback = await this.generateFeedback(
+      transcript, jobTitle, jobDescription, candidateName, callStatus
+    );
+    return { structured: null, legacy: legacyFallback };
   }
 
   /**

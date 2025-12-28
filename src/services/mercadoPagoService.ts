@@ -1,8 +1,9 @@
 import { MercadoPagoConfig, Preference, Payment } from 'mercadopago';
 import { clerkClient } from '@clerk/express';
 import { paymentLogger } from '../utils/logger';
-import { updateUserCredits } from './clerkService';
-import { addPurchasedCredits } from './creditsWalletService';
+import { updateUserCredits, getUserFromDatabase } from './clerkService';
+import { addPurchasedCredits, getWalletBalance } from './creditsWalletService';
+import { sendPurchaseReceiptEmail, PurchaseEmailData, UserEmailData } from './transactionalEmailService';
 
 // Import payment service for database operations (lazy to avoid circular deps)
 let paymentDbService: typeof import('./paymentService') | null = null;
@@ -322,7 +323,76 @@ export class MercadoPagoService {
             }
 
             // Add credits to user - this is the critical operation
-            await this.addCreditsToUser(userId, credits, String(paymentId));
+            const newBalance = await this.addCreditsToUser(userId, credits, String(paymentId));
+
+            // ========================================
+            // SEND PURCHASE RECEIPT EMAIL (non-blocking, idempotent)
+            // ========================================
+            try {
+              // Get user info for email
+              const dbUser = await getUserFromDatabase(userId);
+              
+              if (dbUser && dbUser.email) {
+                // Get package info
+                const pkg = CREDIT_PACKAGES[packageId];
+                
+                const purchaseData: PurchaseEmailData = {
+                  user: {
+                    id: dbUser.id,
+                    clerkId: dbUser.clerkId,
+                    email: dbUser.email,
+                    firstName: dbUser.firstName,
+                    lastName: dbUser.lastName,
+                    preferredLanguage: dbUser.preferredLanguage
+                  },
+                  paymentId: String(paymentId),
+                  provider: 'mercadopago',
+                  packageName: pkg?.name || packageId,
+                  creditsAmount: credits,
+                  amountPaid: pkg?.priceBRL || 0,
+                  currency: 'BRL',
+                  newBalance: newBalance,
+                  paidAt: new Date()
+                };
+                
+                // Fire and forget
+                sendPurchaseReceiptEmail(purchaseData)
+                  .then(result => {
+                    if (result.success && !result.skipped) {
+                      paymentLogger.info('Purchase receipt email sent', { 
+                        userId, 
+                        paymentId, 
+                        messageId: result.messageId 
+                      });
+                    } else if (result.skipped) {
+                      paymentLogger.info('Purchase receipt already sent (idempotent)', { 
+                        userId, 
+                        paymentId 
+                      });
+                    } else {
+                      paymentLogger.warn('Purchase receipt email failed (non-blocking)', { 
+                        userId, 
+                        paymentId, 
+                        error: result.error 
+                      });
+                    }
+                  })
+                  .catch(err => {
+                    paymentLogger.error('Purchase receipt email error (non-blocking)', { 
+                      userId, 
+                      paymentId, 
+                      error: err.message 
+                    });
+                  });
+              }
+            } catch (emailError: any) {
+              // Non-blocking - credits already added
+              paymentLogger.warn('Could not prepare receipt email (non-blocking)', { 
+                error: emailError.message,
+                userId,
+                paymentId
+              });
+            }
 
             return {
               success: true,

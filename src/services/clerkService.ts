@@ -14,7 +14,8 @@ import { addCredits as walletAddCredits, initializeWalletWithBonus } from './cre
 // CONFIGURATION
 // ========================================
 
-const FREE_TRIAL_CREDITS = parseInt(process.env.FREE_TRIAL_CREDITS || '1', 10);
+// New accounts receive 15 free trial credits (was 1)
+const FREE_TRIAL_CREDITS = parseInt(process.env.FREE_TRIAL_CREDITS || '5', 10);
 
 // ========================================
 // TYPES
@@ -294,6 +295,37 @@ export async function updateUserMetadata(
   } catch (error: any) {
     dbLogger.error('Failed to update user metadata', { clerkId, error: error.message });
     throw new Error(`Failed to update metadata: ${error.message}`);
+  }
+}
+
+/**
+ * Update user public metadata with arbitrary fields
+ * Used for consent sync, onboarding status, etc.
+ */
+export async function updateUserPublicMetadata(
+  clerkId: string,
+  metadata: Record<string, any>
+) {
+  dbLogger.info('Updating user public metadata', { clerkId, metadataKeys: Object.keys(metadata) });
+
+  try {
+    const clerkUser = await clerkClient.users.getUser(clerkId);
+    
+    // Merge with existing metadata
+    const updatedMetadata = {
+      ...clerkUser.publicMetadata,
+      ...metadata,
+    };
+
+    await clerkClient.users.updateUser(clerkId, {
+      publicMetadata: updatedMetadata,
+    });
+
+    dbLogger.info('User public metadata updated successfully', { clerkId });
+    return { success: true, metadata: updatedMetadata };
+  } catch (error: any) {
+    dbLogger.error('Failed to update user public metadata', { clerkId, error: error.message });
+    throw new Error(`Failed to update public metadata: ${error.message}`);
   }
 }
 

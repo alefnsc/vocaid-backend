@@ -57,11 +57,24 @@ export const interviewStatusSchema = z.enum([
   'CANCELLED'
 ]);
 
+export const senioritySchema = z.enum([
+  'intern',
+  'junior',
+  'mid',
+  'senior',
+  'staff',
+  'principal'
+]);
+
 export const createInterviewSchema = z.object({
   userId: uuidSchema.or(clerkUserIdSchema),
   jobTitle: z.string().min(1).max(200).transform(val => val.trim()),
+  seniority: senioritySchema.optional().default('mid'),
   companyName: z.string().min(1).max(200).transform(val => val.trim()),
-  jobDescription: z.string().min(200).max(50000).transform(val => val.trim()),
+  // Reduced minimum from 200 to 50 to accommodate shorter job postings
+  // The AI interviewer can still conduct meaningful interviews with less context
+  jobDescription: z.string().min(50).max(50000).transform(val => val.trim()),
+  language: z.string().max(10).optional().default('en-US'),
   resumeData: z.string().optional(), // Base64 encoded
   resumeFileName: z.string().max(255).optional(),
   resumeMimeType: z.string().max(100).optional()

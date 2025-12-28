@@ -1,6 +1,6 @@
 # Environment Variables Documentation
 
-This document describes all environment variables required for the Voxly Backend application.
+This document describes all environment variables required for the Vocaid Backend application.
 
 ## Core Application
 
@@ -9,7 +9,7 @@ This document describes all environment variables required for the Voxly Backend
 | `PORT` | No | `3001` | Server port |
 | `NODE_ENV` | No | `development` | Environment mode (`development`, `production`, `test`) |
 | `DATABASE_URL` | Yes | - | PostgreSQL connection string |
-| `WEBHOOK_BASE_URL` | Yes | - | Base URL for webhooks (e.g., `https://api.voxly.com`) |
+| `WEBHOOK_BASE_URL` | Yes | - | Base URL for webhooks (e.g., `https://api.Vocaid.com`) |
 
 ## Clerk Authentication
 
@@ -43,7 +43,8 @@ This document describes all environment variables required for the Voxly Backend
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `RESEND_API_KEY` | Yes | Resend API key for sending emails |
-| `EMAIL_FROM_ADDRESS` | No | Default sender email (default: `Voxly <noreply@voxly.com>`) |
+| `EMAIL_PROVIDER_MODE` | No | Email provider mode: `mock` (log only, no send) or `resend` (send via Resend). If not set, defaults to `resend` when RESEND_API_KEY is present, otherwise `mock`. Useful for local development and testing. |
+| `EMAIL_FROM_ADDRESS` | No | Default sender email (default: `Vocaid <noreply@Vocaid.com>`) |
 | `EMAIL_REPLY_TO` | No | Reply-to email address |
 
 ## Payment Services
@@ -92,6 +93,14 @@ This document describes all environment variables required for the Voxly Backend
 | `ENABLE_PREAUTH` | No | `false` | Enable card pre-authorization |
 | `ENABLE_AUTOMATED_EMAILS` | No | `true` | Enable automated feedback emails |
 | `ENABLE_RESUME_REPOSITORY` | No | `true` | Enable resume library feature |
+| `BETA_FEEDBACK_ENABLED` | No | `true` | Enable closed beta feedback endpoint. Set to `false` to disable after beta. |
+
+## Beta Feedback (Closed Beta)
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `BETA_FEEDBACK_ENABLED` | No | `true` | Feature flag for beta feedback route |
+| `FORMSPREE_BETA_FEEDBACK_URL` | No | - | Formspree endpoint for beta feedback. If not set, feedback is logged but not emailed. |
 
 ## Logging
 
@@ -115,8 +124,8 @@ This document describes all environment variables required for the Voxly Backend
 # Core
 PORT=3001
 NODE_ENV=development
-DATABASE_URL=postgresql://user:password@localhost:5432/voxly
-WEBHOOK_BASE_URL=https://api.voxly.com
+DATABASE_URL=postgresql://user:password@localhost:5432/Vocaid
+WEBHOOK_BASE_URL=https://api.Vocaid.com
 
 # Clerk
 CLERK_PUBLISHABLE_KEY=pk_test_...

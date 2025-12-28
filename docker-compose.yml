@@ -1,4 +1,4 @@
-# Docker Compose for Voxly Backend Development
+# Docker Compose for Vocaid Backend Development
 # Usage: docker-compose up -d (for development with Postgres)
 
 version: '3.8'
@@ -7,19 +7,19 @@ services:
   # PostgreSQL Database
   postgres:
     image: postgres:16-alpine
-    container_name: voxly-postgres
+    container_name: Vocaid-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-voxly}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-voxly_dev_password}
-      POSTGRES_DB: ${POSTGRES_DB:-voxly}
+      POSTGRES_USER: ${POSTGRES_USER:-Vocaid}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-Vocaid_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-Vocaid}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init-db:/docker-entrypoint-initdb.d
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-voxly}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-Vocaid}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -27,10 +27,10 @@ services:
   # pgAdmin (Optional - for database management UI)
   pgadmin:
     image: dpage/pgadmin4:latest
-    container_name: voxly-pgadmin
+    container_name: Vocaid-pgadmin
     restart: unless-stopped
     environment:
-      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@voxly.ai}
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@Vocaid.ai}
       PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
       PGADMIN_CONFIG_SERVER_MODE: 'False'
     ports:
@@ -50,4 +50,4 @@ volumes:
 
 networks:
   default:
-    name: voxly-network
+    name: Vocaid-network

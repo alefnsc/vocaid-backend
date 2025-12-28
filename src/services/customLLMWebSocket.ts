@@ -4,7 +4,8 @@ import { getFieldPrompt, formatInitialMessage } from '../prompts/fieldPrompts';
 import { 
   generateMultilingualSystemPrompt, 
   generateInitialGreeting,
-  getLanguageSpecificPhrases 
+  getLanguageSpecificPhrases,
+  generateInterviewAlignedPrompt
 } from '../prompts/multilingualPrompts';
 import { 
   analyzeResumeJobCongruency, 
@@ -15,6 +16,16 @@ import {
 import { InterviewTimer } from '../utils/interviewTimer';
 import { wsLogger } from '../utils/logger';
 import { SupportedLanguageCode, isValidLanguageCode, getLanguageConfig } from '../types/multilingual';
+import { getCallContext } from './callContextService';
+import { 
+  createInterviewSession,
+  recordFirstAgentUtterance,
+  updateSessionTokens,
+  finalizeSession,
+  incrementClarificationTurns,
+  type CreateSessionParams,
+  type FinalizeSessionParams,
+} from './interviewSessionService';
 
 /**
  * Retell Custom LLM WebSocket Handler
@@ -54,6 +65,7 @@ interface CustomLLMRequest {
     resume_file_name?: string;
     resume_mime_type?: string;
     interview_id?: string;
+    preferred_language?: string; // User's preferred language (e.g., 'en-US', 'pt-BR', 'es-ES')
   };
   // Retell LLM dynamic variables passed during call
   retell_llm_dynamic_variables?: {
@@ -62,6 +74,7 @@ interface CustomLLMRequest {
     company_name?: string;
     job_description?: string;
     interviewee_cv?: string;
+    preferred_language?: string; // User's preferred language
   };
 }
 
@@ -106,11 +119,21 @@ export class CustomLLMWebSocketHandler {
   private reminderCount: number = 0; // Track how many reminders we've sent
   private readonly MAX_REMINDERS = 2; // After this many reminders, end call gracefully
   private isProcessing: boolean = false; // Prevent concurrent processing
+  
+  // Metrics tracking
+  private sessionId: string | null = null; // InterviewSession ID for metrics
+  private totalPromptTokens: number = 0;
+  private totalCompletionTokens: number = 0;
+  private turnCount: number = 0;
+  private clarificationCount: number = 0;
+  private callStartTime: Date | null = null;
+  private firstUtteranceSent: boolean = false;
 
   constructor(ws: WebSocket, openai: OpenAI, callId?: string) {
     this.ws = ws;
     this.openai = openai;
     this.callId = callId || '';
+    this.callStartTime = new Date(); // Record call start for metrics
     this.interviewTimer = new InterviewTimer(
       parseInt(process.env.MAX_INTERVIEW_DURATION_MINUTES || '15')
     );
@@ -219,25 +242,53 @@ export class CustomLLMWebSocketHandler {
 
   /**
    * Handle call_details event (newer API - replaces call_started)
+   * 
+   * IMPORTANT: Retell may not forward all custom metadata fields to the Custom LLM.
+   * We use the CallContext service to retrieve stored context (especially preferred_language)
+   * that was saved when the call was registered via /register-call.
    */
   private async handleCallDetails(request: CustomLLMRequest) {
-    // Extract metadata from various possible locations
-    const metadata = request.metadata || 
-                     request.retell_llm_dynamic_variables || 
-                     request.call?.metadata ||
-                     request.call?.retell_llm_dynamic_variables ||
-                     {};
+    // Extract metadata from various possible locations (Retell sends it differently)
+    const retellMetadata = request.metadata || 
+                           request.retell_llm_dynamic_variables || 
+                           request.call?.metadata ||
+                           request.call?.retell_llm_dynamic_variables ||
+                           {};
     
-    wsLogger.info('Call details received', {
-      callId: request.call?.call_id || request.call_id,
-      candidate: metadata.first_name || 'Unknown',
-      position: metadata.job_title || 'Unknown',
-      company: metadata.company_name || 'Unknown',
-      hasCV: !!metadata.interviewee_cv
+    // Get stored CallContext (contains preferred_language reliably)
+    const callId = request.call?.call_id || request.call_id || this.callId;
+    const storedContext = getCallContext(callId);
+    
+    wsLogger.info('Call details received - merging contexts', {
+      callId,
+      retellMetadataLanguage: retellMetadata.preferred_language,
+      storedContextLanguage: storedContext?.preferredLanguage,
+      candidate: retellMetadata.first_name || storedContext?.candidateName || 'Unknown',
+      position: retellMetadata.job_title || storedContext?.jobTitle || 'Unknown',
+      company: retellMetadata.company_name || storedContext?.companyName || 'Unknown',
+      hasCV: !!retellMetadata.interviewee_cv || !!storedContext?.intervieweeCV,
+      hasStoredContext: !!storedContext,
     });
     
-    // Store metadata
-    this.metadata = metadata;
+    // Merge metadata: prioritize stored context for language (since Retell may not forward it)
+    this.metadata = {
+      ...retellMetadata,
+      // Use stored context as authoritative source for language
+      preferred_language: storedContext?.preferredLanguage || retellMetadata.preferred_language || 'en-US',
+      // Fill in any missing fields from stored context
+      first_name: retellMetadata.first_name || storedContext?.candidateName?.split(' ')[0],
+      job_title: retellMetadata.job_title || storedContext?.jobTitle,
+      company_name: retellMetadata.company_name || storedContext?.companyName,
+      job_description: retellMetadata.job_description || storedContext?.jobDescription,
+      interviewee_cv: retellMetadata.interviewee_cv || storedContext?.intervieweeCV,
+    };
+    
+    wsLogger.info('Merged metadata for interview', {
+      callId,
+      finalLanguage: this.metadata.preferred_language,
+      candidate: this.metadata.first_name,
+      position: this.metadata.job_title,
+    });
 
     // Proceed to start the interview (same logic as handleCallStarted)
     await this.startInterview();
@@ -245,17 +296,28 @@ export class CustomLLMWebSocketHandler {
 
   /**
    * Handle call started event (legacy API)
+   * Also uses CallContext for language reliability
    */
   private async handleCallStarted(request: CustomLLMRequest) {
+    const callId = request.call_id || this.callId;
+    const storedContext = getCallContext(callId);
+    
     wsLogger.info('Call session started (legacy)', {
-      callId: request.call_id,
-      candidate: request.metadata?.first_name || 'Unknown',
-      position: request.metadata?.job_title || 'Unknown',
-      company: request.metadata?.company_name || 'Unknown'
+      callId,
+      storedContextLanguage: storedContext?.preferredLanguage,
+      candidate: request.metadata?.first_name || storedContext?.candidateName || 'Unknown',
+      position: request.metadata?.job_title || storedContext?.jobTitle || 'Unknown',
+      company: request.metadata?.company_name || storedContext?.companyName || 'Unknown'
     });
     
-    // Store metadata
-    this.metadata = request.metadata;
+    // Merge metadata with stored context
+    this.metadata = {
+      ...request.metadata,
+      preferred_language: storedContext?.preferredLanguage || request.metadata?.preferred_language || 'en-US',
+      first_name: request.metadata?.first_name || storedContext?.candidateName?.split(' ')[0],
+      job_title: request.metadata?.job_title || storedContext?.jobTitle,
+      company_name: request.metadata?.company_name || storedContext?.companyName,
+    };
 
     // Start the interview
     await this.startInterview();
@@ -268,6 +330,7 @@ export class CustomLLMWebSocketHandler {
    * 1. Detecting preferred_language from metadata
    * 2. Generating language-specific system prompts
    * 3. Using localized greetings and transitions
+   * 4. Creating InterviewSession for metrics tracking
    */
   private async startInterview() {
     // OPTIMIZATION: Perform congruency check in BACKGROUND after greeting
@@ -287,6 +350,9 @@ export class CustomLLMWebSocketHandler {
       isMultilingual,
       candidateName: this.metadata?.first_name,
     });
+
+    // Create InterviewSession for metrics tracking (async, non-blocking)
+    this.createSessionForMetrics(preferredLanguage);
 
     // Proceed with normal interview start
     if (this.metadata) {
@@ -315,53 +381,22 @@ export class CustomLLMWebSocketHandler {
         );
       }
       
-      // OPTIMIZED: Condensed system prompt to reduce tokens and processing time
-      // Truncate job description and resume to essential parts
-      const truncatedJobDesc = (this.metadata.job_description || '').substring(0, 500);
-      const truncatedCV = (this.metadata.interviewee_cv || '').substring(0, 1000);
+      // OPTIMIZED: Use interview-aligned prompt for better questioning
+      // Get seniority from metadata or default to 'mid'
+      const seniority = this.metadata.seniority || 'mid';
       
-      // Build system prompt with language context
-      if (isMultilingual) {
-        // Use multilingual system prompt with language-specific instructions
-        const multilingualPrompt = generateMultilingualSystemPrompt(
-          preferredLanguage,
-          this.detectFieldFromJobTitle(this.metadata.job_title || '')
-        );
-        
-        this.systemPrompt = `${multilingualPrompt}
-
-<interview_context>
-  <candidate>${this.metadata.first_name}</candidate>
-  <position>${this.metadata.job_title}</position>
-  <company>${this.metadata.company_name}</company>
-</interview_context>
-
-<job_description>
-${truncatedJobDesc}
-</job_description>
-
-<candidate_resume>
-${truncatedCV}
-</candidate_resume>
-
-<response_rules>
-  <rule>Keep responses to 1-2 sentences maximum</rule>
-  <rule>Ask ONE question at a time</rule>
-  <rule>Reference specific items from the candidate's resume</rule>
-  <rule>Conduct the ENTIRE interview in ${getLanguageConfig(preferredLanguage).name}</rule>
-</response_rules>`;
-      } else {
-        // Use standard English prompt
-        this.systemPrompt = `${fieldPrompt.systemPrompt}
-
-CONTEXT: ${this.metadata.first_name} for ${this.metadata.job_title} at ${this.metadata.company_name}
-
-JOB: ${truncatedJobDesc}
-
-RESUME: ${truncatedCV}
-
-RULES: 1-2 sentences max. ONE question at a time. Reference their resume.`;
-      }
+      // Use the new interview-aligned prompt generator
+      this.systemPrompt = generateInterviewAlignedPrompt({
+        language: preferredLanguage,
+        roleTitle: this.metadata.job_title || 'Position',
+        seniority: seniority,
+        companyName: this.metadata.company_name,
+        jobDescription: this.metadata.job_description,
+        resumeContext: this.metadata.interviewee_cv,
+        roleCountry: this.metadata.role_country,
+        // B2B mode disabled for now (feature flagged OFF)
+        dynamicConfig: undefined,
+      });
 
       this.conversationHistory.push({
         role: 'system',
@@ -418,6 +453,8 @@ Ask one question at a time and adapt based on candidate responses.`;
   /**
    * Get preferred language from metadata
    * Falls back to 'en-US' if not specified
+   * 
+   * Now uses CallContext as authoritative source (merged in handleCallDetails)
    */
   private getPreferredLanguage(): SupportedLanguageCode {
     // Check various locations where language might be specified
@@ -426,11 +463,21 @@ Ask one question at a time and adapt based on candidate responses.`;
                               languageConfig?.code ||
                               this.metadata?.language_code;
     
+    let resolvedLanguage: SupportedLanguageCode = 'en-US';
+    
     if (preferredLanguage && isValidLanguageCode(preferredLanguage)) {
-      return preferredLanguage;
+      resolvedLanguage = preferredLanguage;
     }
     
-    return 'en-US'; // Default fallback
+    wsLogger.info('Language resolved for interview', {
+      callId: this.callId,
+      preferredLanguage: this.metadata?.preferred_language,
+      languageConfig: languageConfig?.code,
+      languageCode: this.metadata?.language_code,
+      resolvedLanguage,
+    });
+    
+    return resolvedLanguage;
   }
 
   /**
@@ -809,6 +856,171 @@ INSTRUCTIONS:
   }
 
   /**
+   * Create InterviewSession for metrics tracking
+   * Runs async to not block interview start
+   */
+  private async createSessionForMetrics(language: SupportedLanguageCode) {
+    try {
+      // Get interview ID from metadata (if available)
+      const interviewId = this.metadata?.interview_id;
+      
+      if (!interviewId) {
+        wsLogger.debug('No interview ID available - skipping session creation', { 
+          callId: this.callId 
+        });
+        return;
+      }
+
+      const session = await createInterviewSession({
+        interviewId,
+        retellCallId: this.callId,
+        language,
+        roleTitle: this.metadata?.job_title || 'Unknown',
+        seniority: this.metadata?.seniority || 'mid',
+        roleCountry: this.metadata?.role_country,
+      });
+
+      if (session) {
+        this.sessionId = session.id;
+        wsLogger.info('Interview session created for metrics', {
+          callId: this.callId,
+          sessionId: session.id,
+          interviewId,
+        });
+      }
+    } catch (error: any) {
+      wsLogger.error('Failed to create interview session', {
+        callId: this.callId,
+        error: error.message,
+      });
+      // Non-blocking - don't fail the interview if metrics fail
+    }
+  }
+
+  /**
+   * Record first agent utterance for latency metrics
+   */
+  private async recordFirstUtteranceMetrics() {
+    if (this.firstUtteranceSent) {
+      return;
+    }
+
+    this.firstUtteranceSent = true;
+    
+    // Use interviewId for recording first utterance
+    const interviewId = this.metadata?.interview_id;
+    if (!interviewId) {
+      return;
+    }
+    
+    try {
+      await recordFirstAgentUtterance(interviewId);
+      wsLogger.debug('First utterance recorded', { 
+        callId: this.callId,
+        interviewId 
+      });
+    } catch (error: any) {
+      wsLogger.warn('Failed to record first utterance', {
+        callId: this.callId,
+        error: error.message,
+      });
+    }
+  }
+
+  /**
+   * Log token usage from OpenAI response
+   */
+  private async logTokenUsage(promptTokens: number, completionTokens: number, model: string) {
+    this.totalPromptTokens += promptTokens;
+    this.totalCompletionTokens += completionTokens;
+    this.turnCount++;
+
+    const interviewId = this.metadata?.interview_id;
+    if (!interviewId) {
+      return;
+    }
+
+    try {
+      await updateSessionTokens(interviewId, {
+        promptTokens,
+        completionTokens,
+        llmModel: model,
+        llmProvider: 'openai',
+      });
+    } catch (error: any) {
+      wsLogger.warn('Failed to log token usage', {
+        callId: this.callId,
+        error: error.message,
+      });
+    }
+  }
+
+  /**
+   * Complete the interview session with final metrics
+   */
+  private async completeSession(endReason: string) {
+    const interviewId = this.metadata?.interview_id;
+    if (!interviewId) {
+      return;
+    }
+
+    try {
+      // Map string end reason to InterviewEndReason enum value
+      const endReasonMap: Record<string, 'COMPLETED' | 'USER_HANGUP' | 'TIME_LIMIT' | 'TECHNICAL_ERROR' | 'INCOMPATIBILITY' | 'SILENCE_TIMEOUT' | 'AGENT_ERROR'> = {
+        'normal': 'COMPLETED',
+        'completed': 'COMPLETED',
+        'max_duration': 'TIME_LIMIT',
+        'time_exceeded': 'TIME_LIMIT',
+        'silence': 'SILENCE_TIMEOUT',
+        'incompatibility': 'INCOMPATIBILITY',
+        'mismatch': 'INCOMPATIBILITY',
+        'error': 'TECHNICAL_ERROR',
+        'user_ended': 'USER_HANGUP',
+        'user_hangup': 'USER_HANGUP',
+        'agent_error': 'AGENT_ERROR',
+      };
+      
+      const mappedReason = endReasonMap[endReason.toLowerCase()] || 'COMPLETED';
+
+      await finalizeSession(interviewId, {
+        endReason: mappedReason,
+        completionRate: this.calculateCompletionRate(),
+        retellDurationSec: Math.floor(this.interviewTimer.getElapsedMinutes() * 60),
+        retellDisconnectReason: endReason,
+      });
+
+      wsLogger.info('Interview session completed', {
+        callId: this.callId,
+        interviewId,
+        turnCount: this.turnCount,
+        totalTokens: this.totalPromptTokens + this.totalCompletionTokens,
+        endReason: mappedReason,
+      });
+    } catch (error: any) {
+      wsLogger.error('Failed to complete session', {
+        callId: this.callId,
+        error: error.message,
+      });
+    }
+  }
+
+  /**
+   * Calculate interview completion rate (0-1)
+   * Based on typical interview phases completed
+   */
+  private calculateCompletionRate(): number {
+    const elapsed = this.interviewTimer.getElapsedMinutes();
+    const maxDuration = parseInt(process.env.MAX_INTERVIEW_DURATION_MINUTES || '15');
+    
+    // Completion is based on time spent vs max duration
+    // Also consider if interview ended prematurely
+    let rate = elapsed / maxDuration;
+    
+    // Cap at 1.0
+    return Math.min(rate, 1.0);
+  }
+
+  /**
    * Exponential backoff delay calculator
    */
   private getRetryDelay(attempt: number): number {
@@ -835,26 +1047,36 @@ INSTRUCTIONS:
     this.pruneConversationHistory();
     
     let lastError: Error | null = null;
+    const model = 'gpt-4o-mini';
     
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
       try {
         let fullResponse = '';
         let chunkCount = 0;
+        let promptTokens = 0;
+        let completionTokens = 0;
 
-        // Use OpenAI streaming directly
+        // Use OpenAI streaming with usage tracking
         const stream = await this.openai.chat.completions.create({
-          model: 'gpt-4o-mini',
+          model,
           messages: this.conversationHistory.map(m => ({ role: m.role, content: m.content })),
           temperature: 0.4,
           max_tokens: 100,
           presence_penalty: 0.5,
           frequency_penalty: 0.3,
-          stream: true
+          stream: true,
+          stream_options: { include_usage: true },
         });
 
         for await (const chunk of stream) {
           const content = chunk.choices[0]?.delta?.content || '';
           const isComplete = chunk.choices[0]?.finish_reason !== null;
+          
+          // Capture usage data (comes in final chunk with stream_options)
+          if (chunk.usage) {
+            promptTokens = chunk.usage.prompt_tokens || 0;
+            completionTokens = chunk.usage.completion_tokens || 0;
+          }
           
           if (content) {
             fullResponse += content;
@@ -886,8 +1108,15 @@ INSTRUCTIONS:
           callId: this.callId, 
           responseId: this.responseId,
           chunkCount,
-          responseLength: fullResponse.length
+          responseLength: fullResponse.length,
+          promptTokens,
+          completionTokens,
         });
+
+        // Log token usage for metrics
+        if (promptTokens > 0 || completionTokens > 0) {
+          this.logTokenUsage(promptTokens, completionTokens, model);
+        }
 
         // Add to conversation history
         this.conversationHistory.push({
@@ -949,6 +1178,9 @@ INSTRUCTIONS:
     });
     
     this.ws.send(JSON.stringify(response));
+
+    // Record first utterance for latency metrics
+    this.recordFirstUtteranceMetrics();
 
     this.conversationHistory.push({
       role: 'assistant',
@@ -1044,6 +1276,11 @@ INSTRUCTIONS:
     });
     this.ws.send(JSON.stringify(response));
 
+    // Complete session early if call is ending (for accurate timing)
+    if (endCall) {
+      this.completeSession(reason);
+    }
+
     this.conversationHistory.push({
       role: 'assistant',
       content: content
@@ -1057,6 +1294,8 @@ INSTRUCTIONS:
    */
   handleError(error: Error) {
     wsLogger.error('WebSocket error', { callId: this.callId, error: error.message });
+    // Complete session with error reason
+    this.completeSession('error');
   }
 
   /**
@@ -1065,7 +1304,12 @@ INSTRUCTIONS:
   handleClose() {
     wsLogger.info('WebSocket connection closed', { 
       callId: this.callId,
-      duration: this.interviewTimer.getFormattedElapsedTime()
+      duration: this.interviewTimer.getFormattedElapsedTime(),
+      totalTokens: this.totalPromptTokens + this.totalCompletionTokens,
+      turnCount: this.turnCount,
     });
+    
+    // Complete the session with final metrics
+    this.completeSession('normal');
   }
 }

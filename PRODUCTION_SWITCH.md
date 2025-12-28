@@ -1,6 +1,6 @@
-# Voxly Production Switch Guide
+# Vocaid Production Switch Guide
 
-Complete documentation for switching Voxly from development to production environment.
+Complete documentation for switching Vocaid from development to production environment.
 
 ---
 
@@ -304,7 +304,7 @@ headers: {
 
 - [ ] **Update Database**
   ```bash
-  DATABASE_URL=postgresql://user:pass@production-host:5432/voxly_prod
+  DATABASE_URL=postgresql://user:pass@production-host:5432/Vocaid_prod
   ```
 
 - [ ] **Reduce Logging**
@@ -350,7 +350,7 @@ headers: {
 
 3. **Redeploy:**
    ```bash
-   cd voxly-frontend
+   cd Vocaid-frontend
    npx vercel --prod
    ```
 
@@ -420,19 +420,19 @@ After going live, verify:
 
 ```bash
 # Backend: Switch to production
-cd voxly-backend
+cd Vocaid-backend
 sed -i '' 's/NODE_ENV=development/NODE_ENV=production/' .env
 
 # Frontend: Switch to production
-cd voxly-frontend
+cd Vocaid-frontend
 sed -i '' 's/REACT_APP_ENV=development/REACT_APP_ENV=production/' .env
 
 # Deploy frontend to Vercel production
-cd voxly-frontend
+cd Vocaid-frontend
 npx vercel --prod
 
 # Backend: Run in production mode
-cd voxly-backend
+cd Vocaid-backend
 NODE_ENV=production npm start
 ```
 

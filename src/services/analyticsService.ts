@@ -8,10 +8,18 @@
  * - Percentile calculations
  * - Interview volume analytics
  * - Usage logging
+ * - Caching layer for performance optimization
  */
 
 import { prisma, dbLogger } from './databaseService';
 import { Prisma } from '@prisma/client';
+import {
+  getOrComputeAnalytics,
+  invalidateUserCache,
+  CACHE_KEYS,
+  getGlobalSnapshot,
+  SNAPSHOT_TYPES,
+} from './analyticsCachingService';
 
 // ========================================
 // TYPES
@@ -114,6 +122,14 @@ export async function recordInterviewScore(
         company: record.company,
         score: scores.overall
       }
+    });
+
+    // Invalidate analytics cache for this user (new data available)
+    invalidateUserCache(userId).catch(err => {
+      dbLogger.warn('Failed to invalidate user cache after score recording', { 
+        userId, 
+        error: err 
+      });
     });
 
     return record;
@@ -737,35 +753,46 @@ export async function getAvailableFilters(clerkId: string): Promise<{
 
 /**
  * Get comprehensive dashboard analytics
+ * Uses caching layer for performance optimization
  */
 export async function getDashboardAnalytics(
   clerkId: string,
-  period: TimePeriod = 'monthly'
+  period: TimePeriod = 'monthly',
+  options?: { forceRefresh?: boolean }
 ) {
-  const [
-    scoresByRole,
-    scoresByCompany,
-    scoreTimeSeries,
-    interviewVolume,
-    percentile,
-    filters
-  ] = await Promise.all([
-    getScoresByRole(clerkId, { limit: 5 }),
-    getScoresByCompany(clerkId, { limit: 5 }),
-    getScoreTimeSeries(clerkId, period),
-    getInterviewVolume(clerkId, period),
-    getUserPercentile(clerkId),
-    getAvailableFilters(clerkId)
-  ]);
+  // Use cache-through pattern for dashboard data
+  return getOrComputeAnalytics(
+    clerkId,
+    CACHE_KEYS.DASHBOARD,
+    async () => {
+      const [
+        scoresByRole,
+        scoresByCompany,
+        scoreTimeSeries,
+        interviewVolume,
+        percentile,
+        filters
+      ] = await Promise.all([
+        getScoresByRole(clerkId, { limit: 5 }),
+        getScoresByCompany(clerkId, { limit: 5 }),
+        getScoreTimeSeries(clerkId, period),
+        getInterviewVolume(clerkId, period),
+        getUserPercentile(clerkId),
+        getAvailableFilters(clerkId)
+      ]);
 
-  return {
-    scoresByRole,
-    scoresByCompany,
-    scoreTimeSeries,
-    interviewVolume,
-    percentile,
-    filters
-  };
+      return {
+        scoresByRole,
+        scoresByCompany,
+        scoreTimeSeries,
+        interviewVolume,
+        percentile,
+        filters,
+        cachedAt: new Date().toISOString()
+      };
+    },
+    { forceRefresh: options?.forceRefresh }
+  );
 }
 
 // ========================================

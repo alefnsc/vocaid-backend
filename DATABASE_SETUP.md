@@ -1,6 +1,6 @@
 # Database Setup Guide
 
-This guide covers setting up the PostgreSQL database for Voxly, including local development with Docker and production deployment on GCP.
+This guide covers setting up the PostgreSQL database for Vocaid, including local development with Docker and production deployment on GCP.
 
 ## Table of Contents
 
@@ -26,7 +26,7 @@ This guide covers setting up the PostgreSQL database for Voxly, including local 
 
 ```bash
 # Navigate to backend directory
-cd voxly-backend
+cd Vocaid-backend
 
 # Start PostgreSQL and pgAdmin containers
 docker-compose up -d
@@ -52,7 +52,7 @@ Create or update your `.env` file:
 
 ```env
 # Database Configuration
-DATABASE_URL="postgresql://voxly:voxly_password@localhost:5432/voxly?schema=public"
+DATABASE_URL="postgresql://Vocaid:Vocaid_password@localhost:5432/Vocaid?schema=public"
 
 # Node Environment
 NODE_ENV=development
@@ -82,14 +82,14 @@ npm run dev
 
 1. Open http://localhost:5050 in your browser
 2. Login with:
-   - Email: `admin@voxly.ai`
+   - Email: `admin@Vocaid.ai`
    - Password: `admin_password`
 3. Add a new server:
    - Host: `postgres` (Docker network name)
    - Port: `5432`
-   - Database: `voxly`
-   - Username: `voxly`
-   - Password: `voxly_password`
+   - Database: `Vocaid`
+   - Username: `Vocaid`
+   - Password: `Vocaid_password`
 
 ---
 
@@ -182,18 +182,18 @@ npx prisma migrate deploy
 
 ```bash
 # Create PostgreSQL instance
-gcloud sql instances create voxly-db \
+gcloud sql instances create Vocaid-db \
   --database-version=POSTGRES_15 \
   --tier=db-f1-micro \
   --region=us-central1 \
   --root-password=YOUR_SECURE_PASSWORD
 
 # Create database
-gcloud sql databases create voxly --instance=voxly-db
+gcloud sql databases create Vocaid --instance=Vocaid-db
 
 # Create user
-gcloud sql users create voxly_user \
-  --instance=voxly-db \
+gcloud sql users create Vocaid_user \
+  --instance=Vocaid-db \
   --password=YOUR_USER_PASSWORD
 ```
 
@@ -203,7 +203,7 @@ For **Cloud Run** or **App Engine**, use the Cloud SQL Proxy:
 
 ```env
 # Production DATABASE_URL format for GCP
-DATABASE_URL="postgresql://voxly_user:PASSWORD@/voxly?host=/cloudsql/PROJECT_ID:REGION:INSTANCE_NAME"
+DATABASE_URL="postgresql://Vocaid_user:PASSWORD@/Vocaid?host=/cloudsql/PROJECT_ID:REGION:INSTANCE_NAME"
 ```
 
 For **external connections** (not recommended for production):
@@ -213,7 +213,7 @@ For **external connections** (not recommended for production):
 3. Use direct connection string:
 
 ```env
-DATABASE_URL="postgresql://voxly_user:PASSWORD@INSTANCE_PUBLIC_IP:5432/voxly"
+DATABASE_URL="postgresql://Vocaid_user:PASSWORD@INSTANCE_PUBLIC_IP:5432/Vocaid"
 ```
 
 ### Step 3: Deploy Migrations
@@ -234,7 +234,7 @@ npx prisma migrate deploy
 
 ```env
 # Database
-DATABASE_URL="postgresql://voxly:voxly_password@localhost:5432/voxly?schema=public"
+DATABASE_URL="postgresql://Vocaid:Vocaid_password@localhost:5432/Vocaid?schema=public"
 
 # Node Environment
 NODE_ENV=development
@@ -269,11 +269,11 @@ NODE_ENV=production
 
 # Server
 PORT=3001
-FRONTEND_URL=https://voxly.ai
-WEBHOOK_BASE_URL=https://api.voxly.ai
+FRONTEND_URL=https://Vocaid.ai
+WEBHOOK_BASE_URL=https://api.Vocaid.ai
 
 # Security
-CORS_ORIGIN=https://voxly.ai
+CORS_ORIGIN=https://Vocaid.ai
 
 # (... other production keys ...)
 ```

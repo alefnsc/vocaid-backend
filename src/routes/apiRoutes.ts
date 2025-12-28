@@ -445,6 +445,18 @@ router.post(
     try {
       const clerkId = (req as any).clerkUserId;
       const data = req.body;
+      const requestId = (req as any).requestId || 'N/A';
+      
+      apiLogger.info('Creating interview', {
+        requestId,
+        userId: clerkId,
+        jobTitle: data.jobTitle,
+        company: data.companyName,
+        seniority: data.seniority,
+        language: data.language,
+        hasResume: !!data.resumeData,
+        jobDescriptionLength: data.jobDescription?.length || 0
+      });
       
       // Ensure user exists in database
       await userService.findOrCreateUser(clerkId);
@@ -454,15 +466,34 @@ router.post(
         userId: clerkId
       });
       
+      apiLogger.info('Interview created successfully', {
+        requestId,
+        interviewId: interview.id,
+        status: interview.status
+      });
+      
       res.status(201).json({
         status: 'success',
         data: interview
       });
     } catch (error: any) {
-      dbLogger.error('Error creating interview', { error: error.message });
+      const requestId = (req as any).requestId || 'N/A';
+      apiLogger.error('Error creating interview', { 
+        requestId,
+        error: error.message,
+        stack: error.stack,
+        body: {
+          jobTitle: req.body?.jobTitle,
+          company: req.body?.companyName,
+          seniority: req.body?.seniority,
+          language: req.body?.language,
+          jobDescriptionLength: req.body?.jobDescription?.length || 0
+        }
+      });
       res.status(500).json({
         status: 'error',
-        message: 'Failed to create interview'
+        message: 'Failed to create interview',
+        details: process.env.NODE_ENV === 'development' ? error.message : undefined
       });
     }
   }
@@ -808,15 +839,24 @@ router.get(
         limit: parseInt(limit as string)
       });
       
-      // Format for frontend
+      // Format for frontend - include both field names for compatibility
       const formattedInterviews = result.interviews.map(i => ({
         id: i.id,
+        // Primary field names (match InterviewSummary interface)
+        jobTitle: i.jobTitle,
+        companyName: i.companyName,
+        // Legacy aliases for backward compatibility
         position: i.jobTitle,
         company: i.companyName,
         createdAt: i.createdAt,
-        duration: Math.round((i.callDuration || 0) / 1000 / 60), // Convert milliseconds to minutes
-        overallScore: i.score,
-        status: i.status.toLowerCase()
+        callDuration: i.callDuration, // Keep in milliseconds for frontend
+        duration: Math.round((i.callDuration || 0) / 1000 / 60), // Legacy: minutes
+        score: i.score,
+        overallScore: i.score, // Legacy alias
+        status: i.status,
+        seniority: i.seniority,
+        language: i.language,
+        hasFeedback: i.hasFeedback
       }));
       
       apiLogger.info('User interviews fetched', {
@@ -3316,3 +3356,4 @@ router.post('/interviews/from-resume', requireAuth, async (req: Request, res: Re
 });
 
 export default router;
+export { requireAuth };

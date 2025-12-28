@@ -411,7 +411,7 @@ class PayPalProvider implements IPaymentProvider {
         user_action: 'PAY_NOW',
         return_url: params.successUrl,
         cancel_url: params.failureUrl,
-        locale: this.mapLanguageToPayPalLocale(params.language),
+        // Note: locale removed - PayPal sandbox doesn't consistently support it
       },
     };
 
@@ -617,9 +617,22 @@ export class PaymentGateway {
    */
   async createPayment(
     clerkId: string,
-    params: Omit<CreatePaymentParams, 'userId'>
+    params: Omit<CreatePaymentParams, 'userId'>,
+    preferredProvider?: PaymentProviderType
   ): Promise<PaymentPreferenceResponse & { selectedProvider: PaymentProviderType }> {
-    const provider = await this.getProviderForUser(clerkId);
+    // Use specified provider if provided, otherwise auto-select
+    let provider;
+    if (preferredProvider) {
+      provider = this.getProvider(preferredProvider);
+      if (!provider.isAvailable()) {
+        paymentLogger.warn('Preferred provider not available, falling back to auto-selection', {
+          preferredProvider,
+        });
+        provider = await this.getProviderForUser(clerkId);
+      }
+    } else {
+      provider = await this.getProviderForUser(clerkId);
+    }
     
     const result = await provider.createPaymentPreference({
       ...params,

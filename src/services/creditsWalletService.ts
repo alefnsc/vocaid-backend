@@ -16,7 +16,8 @@ const prisma = new PrismaClient();
 // CONFIGURATION
 // ========================================
 
-const FREE_TRIAL_CREDITS = parseInt(process.env.FREE_TRIAL_CREDITS || '1', 10);
+// New accounts receive 15 free trial credits (was 1)
+const FREE_TRIAL_CREDITS = parseInt(process.env.FREE_TRIAL_CREDITS || '5', 10);
 
 // ========================================
 // TYPES

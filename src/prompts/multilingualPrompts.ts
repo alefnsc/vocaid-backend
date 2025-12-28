@@ -75,6 +75,11 @@ function generateBaseSystemPrompt(
   <rule priority="critical">
     You MUST conduct this ENTIRE interview in ${langConfig.name} (${langConfig.englishName}).
     All questions, responses, acknowledgments, and feedback must be in ${langConfig.name}.
+    START the interview in ${langConfig.name} from your very first word.
+  </rule>
+  <rule priority="critical">
+    NEVER start in English if the specified language is NOT English.
+    Your first greeting and every subsequent message must be in ${langConfig.name}.
   </rule>
   <rule>
     Use culturally appropriate expressions, idioms, and professional language native to ${langConfig.name} speakers.
@@ -83,7 +88,8 @@ function generateBaseSystemPrompt(
     Technical terms and acronyms may remain in English if commonly used that way in the industry.
   </rule>
   <rule>
-    If the candidate switches languages, gently redirect them back to ${langConfig.name} with a brief, polite reminder.
+    If the candidate switches languages, continue in ${langConfig.name}. Only switch if explicitly requested.
+    If user asks to switch, confirm briefly: "Would you like me to continue in [other language]?"
   </rule>
   <rule>
     Maintain a professional yet warm and encouraging tone appropriate for ${langConfig.englishName} professional culture.
@@ -650,10 +656,324 @@ export function getMultilingualPromptConfig(
   };
 }
 
+// ========================================
+// INTERVIEW-ALIGNED PROMPT COMPOSITION
+// ========================================
+
+/**
+ * Seniority-specific interview focus areas
+ */
+const SENIORITY_FOCUS: Record<string, string> = {
+  intern: `
+<seniority_adaptation level="intern">
+  <focus>Learning ability, enthusiasm, basic technical knowledge</focus>
+  <question_style>Focus on academic projects, coursework, willingness to learn</question_style>
+  <depth>Surface-level technical questions; assess potential over experience</depth>
+  <avoid>Deep system design, leadership scenarios</avoid>
+</seniority_adaptation>`,
+  junior: `
+<seniority_adaptation level="junior">
+  <focus>Foundational skills, problem-solving approach, growth mindset</focus>
+  <question_style>Technical fundamentals, simple debugging scenarios, teamwork</question_style>
+  <depth>Basic algorithms, code quality awareness, learning from mistakes</depth>
+  <avoid>Complex architecture, strategic decision-making</avoid>
+</seniority_adaptation>`,
+  mid: `
+<seniority_adaptation level="mid">
+  <focus>Independent work, project ownership, technical depth</focus>
+  <question_style>Feature implementation, technical trade-offs, collaboration</question_style>
+  <depth>System components, code review, mentoring juniors</depth>
+  <avoid>Organizational strategy, executive communication</avoid>
+</seniority_adaptation>`,
+  senior: `
+<seniority_adaptation level="senior">
+  <focus>Technical leadership, system design, cross-team collaboration</focus>
+  <question_style>Architecture decisions, handling ambiguity, mentorship</question_style>
+  <depth>End-to-end system design, technical debt management, influence</depth>
+  <expect>Concrete examples from past projects, strategic thinking</expect>
+</seniority_adaptation>`,
+  staff: `
+<seniority_adaptation level="staff">
+  <focus>Technical strategy, org-wide impact, complex problem solving</focus>
+  <question_style>Multi-team coordination, long-term technical vision</question_style>
+  <depth>Platform design, technical roadmaps, handling failure scenarios</depth>
+  <expect>Experience driving major initiatives, influencing without authority</expect>
+</seniority_adaptation>`,
+  principal: `
+<seniority_adaptation level="principal">
+  <focus>Company-wide technical direction, innovation, industry impact</focus>
+  <question_style>Strategic technical decisions, emerging technologies, industry trends</question_style>
+  <depth>Multi-year technical vision, build vs buy, company-level trade-offs</depth>
+  <expect>Published work, patents, conference talks, industry recognition</expect>
+</seniority_adaptation>`,
+  manager: `
+<seniority_adaptation level="manager">
+  <focus>Team leadership, people development, delivery excellence</focus>
+  <question_style>Team building, conflict resolution, stakeholder management</question_style>
+  <depth>Performance management, hiring, cross-functional collaboration</depth>
+  <expect>Track record of team growth, project delivery, culture building</expect>
+</seniority_adaptation>`,
+};
+
+/**
+ * B2B Dynamic Prompt Injection Configuration (Feature Flagged)
+ */
+export interface DynamicPromptConfig {
+  // Custom instructions from recruiter (B2B)
+  recruiterInstructions?: string;
+  
+  // Dynamic variables for prompt template
+  dynamicVariables?: {
+    candidate_name?: string;
+    role_title?: string;
+    company_name?: string;
+    interview_focus?: string;
+    required_skills?: string[];
+    interview_duration_minutes?: number;
+    custom_questions?: string[];
+  };
+  
+  // Feature flag for B2B mode
+  isB2BMode?: boolean;
+}
+
+/**
+ * Sanitize and limit custom prompt content
+ */
+function sanitizeCustomPrompt(prompt: string, maxLength: number = 1000): string {
+  if (!prompt) return '';
+  
+  // Remove potentially harmful content
+  let sanitized = prompt
+    .replace(/<script[^>]*>.*?<\/script>/gi, '')
+    .replace(/javascript:/gi, '')
+    .replace(/on\w+\s*=/gi, '')
+    .trim();
+  
+  // Limit length
+  if (sanitized.length > maxLength) {
+    sanitized = sanitized.substring(0, maxLength) + '...';
+  }
+  
+  return sanitized;
+}
+
+/**
+ * Generate complete interview-aligned system prompt
+ * This is the main prompt composition function
+ */
+export function generateInterviewAlignedPrompt(params: {
+  language: SupportedLanguageCode;
+  roleTitle: string;
+  seniority?: string;
+  companyName?: string;
+  jobDescription?: string;
+  resumeContext?: string;
+  roleCountry?: string;
+  dynamicConfig?: DynamicPromptConfig;
+}): string {
+  const {
+    language,
+    roleTitle,
+    seniority = 'mid',
+    companyName,
+    jobDescription,
+    resumeContext,
+    roleCountry,
+    dynamicConfig,
+  } = params;
+
+  const langConfig = getLanguageConfig(language);
+  const field = detectFieldFromTitle(roleTitle);
+  const fieldPrompt = getFieldPromptForLanguage(field, language);
+  const seniorityFocus = SENIORITY_FOCUS[seniority.toLowerCase()] || SENIORITY_FOCUS['mid'];
+
+  // Base interview prompt with language enforcement
+  let prompt = `
+<agent_identity>
+  <name>Vocaid</name>
+  <role>Professional AI Interview Coach</role>
+  <version>2.0</version>
+</agent_identity>
+
+<language_configuration critical="true">
+  <primary_language>${langConfig.name}</primary_language>
+  <language_code>${language}</language_code>
+  <enforcement>STRICT</enforcement>
+</language_configuration>
+
+<language_rules priority="CRITICAL">
+  <rule id="start_language">
+    YOUR VERY FIRST WORD must be in ${langConfig.name}.
+    Do NOT start with "Hello" or any English if language is not English.
+  </rule>
+  <rule id="consistency">
+    Conduct the ENTIRE interview in ${langConfig.name}.
+    Every question, acknowledgment, and response must be in ${langConfig.name}.
+  </rule>
+  <rule id="technical_terms">
+    Technical terms (API, SQL, JavaScript, etc.) may remain in English.
+    Everything else must be in ${langConfig.name}.
+  </rule>
+  <rule id="language_switch">
+    If the candidate speaks a different language, politely redirect in ${langConfig.name}.
+    Only switch languages if the candidate explicitly requests it AND you confirm.
+  </rule>
+  <rule id="clarification">
+    If you cannot understand, ask for clarification IN ${langConfig.name}.
+    Example: "Could you please repeat that?" → Use ${langConfig.name} equivalent.
+  </rule>
+</language_rules>
+
+<interview_persona>
+  <voice>Professional, warm, encouraging</voice>
+  <style>Conversational, natural speech patterns</style>
+  <conciseness>1-2 sentences per response maximum</conciseness>
+  <cultural_context>${langConfig.englishName} professional norms</cultural_context>
+</interview_persona>
+
+<core_interview_rules>
+  <rule id="one_question">Ask ONE clear, focused question at a time.</rule>
+  <rule id="wait">Wait for the candidate to finish before responding.</rule>
+  <rule id="concise">Keep responses SHORT (1-2 sentences). Do NOT ramble.</rule>
+  <rule id="no_answering">NEVER answer questions for the candidate or provide hints.</rule>
+  <rule id="probing">If answers are vague, ask follow-up: "Can you give a specific example?"</rule>
+  <rule id="redirect">If off-topic, gently redirect: "That's interesting. Let's focus on..."</rule>
+  <rule id="acknowledge">Briefly acknowledge good answers before moving on.</rule>
+  <rule id="no_repetition">Do NOT repeat yourself or the candidate's words verbatim.</rule>
+</core_interview_rules>
+
+<interview_structure>
+  <phase name="opening" duration="1-2min">
+    Brief introduction, confirm role understanding
+  </phase>
+  <phase name="background" duration="2-3min">
+    Relevant experience from resume, career journey
+  </phase>
+  <phase name="technical" duration="5-7min">
+    Role-specific technical or domain questions
+  </phase>
+  <phase name="behavioral" duration="3-4min">
+    Situational questions, teamwork, problem-solving
+  </phase>
+  <phase name="closing" duration="1min">
+    Brief wrap-up, thank candidate
+  </phase>
+</interview_structure>
+
+${fieldPrompt}
+
+${seniorityFocus}
+
+<safety_rules>
+  <rule>Do NOT ask for sensitive personal data (SSN, bank info, medical history)</rule>
+  <rule>Avoid discriminatory questions (age, religion, family status, disabilities)</rule>
+  <rule>Keep questions professional and job-relevant</rule>
+</safety_rules>
+
+<context>
+  <candidate_role>${roleTitle}</candidate_role>
+  <company>${companyName || 'the target company'}</company>
+  ${roleCountry ? `<role_country>${roleCountry}</role_country>` : ''}
+</context>`;
+
+  // Add job description context if provided
+  if (jobDescription) {
+    const truncated = jobDescription.length > 800 
+      ? jobDescription.substring(0, 800) + '...' 
+      : jobDescription;
+    prompt += `
+
+<job_description>
+${truncated}
+</job_description>`;
+  }
+
+  // Add resume context if provided
+  if (resumeContext) {
+    const truncated = resumeContext.length > 1000 
+      ? resumeContext.substring(0, 1000) + '...' 
+      : resumeContext;
+    prompt += `
+
+<candidate_resume>
+${truncated}
+</candidate_resume>
+
+<resume_usage>
+  Reference specific items from the resume to personalize questions.
+  Ask about gaps, transitions, or interesting projects mentioned.
+</resume_usage>`;
+  }
+
+  // B2B Dynamic Prompt Injection (Feature Flagged)
+  if (dynamicConfig?.isB2BMode && dynamicConfig.recruiterInstructions) {
+    const sanitizedInstructions = sanitizeCustomPrompt(
+      dynamicConfig.recruiterInstructions, 
+      1000
+    );
+    
+    prompt += `
+
+## Recruiter Instructions (Priority: HIGH)
+<recruiter_custom_instructions>
+${sanitizedInstructions}
+</recruiter_custom_instructions>
+
+<note>These instructions were provided by the hiring recruiter. Follow them while maintaining interview professionalism.</note>`;
+  }
+
+  // Add custom questions if provided
+  if (dynamicConfig?.dynamicVariables?.custom_questions?.length) {
+    const questions = dynamicConfig.dynamicVariables.custom_questions
+      .slice(0, 5) // Limit to 5 custom questions
+      .map((q, i) => `  ${i + 1}. ${sanitizeCustomPrompt(q, 200)}`)
+      .join('\n');
+    
+    prompt += `
+
+<recruiter_required_questions>
+${questions}
+</recruiter_required_questions>`;
+  }
+
+  return prompt;
+}
+
+/**
+ * Detect field from job title for prompt specialization
+ */
+function detectFieldFromTitle(jobTitle: string): string {
+  const title = jobTitle.toLowerCase();
+  
+  if (/engineer|developer|programmer|software|backend|frontend|fullstack|devops|sre|data|ml|ai|machine learning/i.test(title)) {
+    return 'engineering';
+  }
+  if (/manager|director|vp|lead|head of|chief/i.test(title)) {
+    return 'management';
+  }
+  if (/designer|ux|ui|product design/i.test(title)) {
+    return 'design';
+  }
+  if (/marketing|growth|brand|content/i.test(title)) {
+    return 'marketing';
+  }
+  if (/sales|account|business development/i.test(title)) {
+    return 'sales';
+  }
+  if (/analyst|consultant|strategy/i.test(title)) {
+    return 'consulting';
+  }
+  
+  return 'general';
+}
+
 export default {
   generateMultilingualSystemPrompt,
   generateInitialGreeting,
   getMultilingualPromptConfig,
   getLanguageSpecificPhrases,
   getFieldPromptForLanguage,
+  generateInterviewAlignedPrompt,
+  detectFieldFromTitle,
 };

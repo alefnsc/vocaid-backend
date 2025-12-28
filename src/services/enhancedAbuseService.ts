@@ -22,10 +22,10 @@ const CONFIG = {
   MAX_ACCOUNTS_PER_FINGERPRINT: parseInt(process.env.MAX_ACCOUNTS_PER_FINGERPRINT || '1', 10),
   MAX_SIGNUPS_PER_SUBNET_HOUR: parseInt(process.env.MAX_SIGNUPS_PER_SUBNET_HOUR || '3', 10),
   
-  // Credit throttling (now configurable via env vars)
-  INITIAL_CREDITS_UNVERIFIED: parseInt(process.env.FREE_TRIAL_CREDITS || '1', 10),
-  INITIAL_CREDITS_PHONE_VERIFIED: parseInt(process.env.FREE_TRIAL_CREDITS_PHONE_VERIFIED || '1', 10),
-  INITIAL_CREDITS_LINKEDIN_VERIFIED: parseInt(process.env.FREE_TRIAL_CREDITS_LINKEDIN_VERIFIED || '1', 10),
+  // Credit throttling - new accounts get 15 credits by default
+  INITIAL_CREDITS_UNVERIFIED: parseInt(process.env.FREE_TRIAL_CREDITS || '15', 10),
+  INITIAL_CREDITS_PHONE_VERIFIED: parseInt(process.env.FREE_TRIAL_CREDITS_PHONE_VERIFIED || '15', 10),
+  INITIAL_CREDITS_LINKEDIN_VERIFIED: parseInt(process.env.FREE_TRIAL_CREDITS_LINKEDIN_VERIFIED || '15', 10),
   
   // Behavioral thresholds
   MIN_BEHAVIOR_SCORE_FOR_CREDITS: 30,

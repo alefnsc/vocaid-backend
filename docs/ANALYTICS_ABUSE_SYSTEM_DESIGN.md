@@ -1,4 +1,4 @@
-# Voxly Analytics & Anti-Abuse System Design
+# Vocaid Analytics & Anti-Abuse System Design
 
 ## 1. System Architecture Overview
 
@@ -331,7 +331,7 @@ GET  /api/admin/abuse-stats
 ## 4. Anthropic System Prompt for Performance Analyst
 
 ```
-You are a professional interview performance analyst for Voxly, an AI-powered
+You are a professional interview performance analyst for Vocaid, an AI-powered
 mock interview platform. Your role is to help users understand and improve
 their interview performance based on their historical interview data.
 

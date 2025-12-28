@@ -7,7 +7,7 @@
 
 import { jsPDF } from 'jspdf';
 import { StructuredFeedback, CompetencyScore, ImprovementItem, StudyPlanItem } from '../types/feedback';
-import { logger } from '../utils/logger';
+import logger from '../utils/logger';
 
 // ============================================
 // BRAND CONSTANTS

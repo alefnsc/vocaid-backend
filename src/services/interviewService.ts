@@ -5,6 +5,7 @@
 
 import { prisma, dbLogger } from './databaseService';
 import { Prisma, InterviewStatus } from '@prisma/client';
+import { sendInterviewCompleteEmail, InterviewCompleteData } from './transactionalEmailService';
 
 // ========================================
 // INTERVIEW CRUD OPERATIONS
@@ -13,11 +14,13 @@ import { Prisma, InterviewStatus } from '@prisma/client';
 interface CreateInterviewData {
   userId: string; // Can be UUID or Clerk ID
   jobTitle: string;
+  seniority?: string; // Candidate seniority: intern, junior, mid, senior, staff, principal
   companyName: string;
   jobDescription: string;
   resumeData?: string;
   resumeFileName?: string;
   resumeMimeType?: string;
+  language?: string; // Interview language code
 }
 
 interface UpdateInterviewData {
@@ -70,11 +73,13 @@ export async function createInterview(data: CreateInterviewData) {
     data: {
       userId: resolvedUserId,
       jobTitle: data.jobTitle,
+      seniority: data.seniority || 'mid',
       companyName: data.companyName,
       jobDescription: data.jobDescription,
       resumeData: data.resumeData,
       resumeFileName: data.resumeFileName,
       resumeMimeType: data.resumeMimeType,
+      language: data.language || 'en-US',
       status: 'PENDING'
     }
   });
@@ -153,35 +158,45 @@ export async function getUserInterviews(
   // Get total count
   const total = await prisma.interview.count({ where });
 
-  // Get interviews
-  const interviews = await prisma.interview.findMany({
-    where,
-    skip,
-    take: limit,
-    orderBy: { [sortBy]: sortOrder },
-    select: {
-      id: true,
-      jobTitle: true,
-      companyName: true,
-      status: true,
-      score: true,
-      callDuration: true,
-      createdAt: true,
-      startedAt: true,
-      endedAt: true,
-      feedbackPdf: true // Include to know if feedback exists
-    }
-  });
-
-  // Transform to include hasFeedback flag instead of full PDF
-  const transformedInterviews = interviews.map(i => ({
-    ...i,
-    hasFeedback: !!i.feedbackPdf,
-    feedbackPdf: undefined // Remove actual PDF from list response
-  }));
+  // Get interviews with hasFeedback computed field
+  // OPTIMIZATION: Use raw SQL to check feedbackPdf existence without fetching the blob
+  const interviews = await prisma.$queryRaw<Array<{
+    id: string;
+    jobTitle: string;
+    companyName: string;
+    status: string;
+    score: number | null;
+    callDuration: number | null;
+    createdAt: Date;
+    startedAt: Date | null;
+    endedAt: Date | null;
+    seniority: string | null;
+    language: string | null;
+    hasFeedback: boolean;
+  }>>`
+    SELECT 
+      id,
+      job_title as "jobTitle",
+      company_name as "companyName",
+      status,
+      score,
+      call_duration as "callDuration",
+      created_at as "createdAt",
+      started_at as "startedAt",
+      ended_at as "endedAt",
+      seniority,
+      language,
+      (feedback_pdf IS NOT NULL) as "hasFeedback"
+    FROM interviews
+    WHERE user_id = (SELECT id FROM users WHERE clerk_id = ${clerkId})
+    ${status ? Prisma.sql`AND status = ${status}` : Prisma.empty}
+    ORDER BY ${Prisma.raw(`${sortBy === 'createdAt' ? 'created_at' : sortBy} ${sortOrder.toUpperCase()}`)}
+    LIMIT ${limit}
+    OFFSET ${skip}
+  `;
 
   return {
-    interviews: transformedInterviews,
+    interviews,
     pagination: {
       page,
       limit,
@@ -252,14 +267,78 @@ export async function completeInterview(
 ) {
   dbLogger.info('Completing interview', { retellCallId });
 
-  return prisma.interview.update({
+  const completedInterview = await prisma.interview.update({
     where: { retellCallId },
     data: {
       status: 'COMPLETED',
       endedAt: new Date(),
       ...results
+    },
+    include: {
+      user: {
+        select: {
+          id: true,
+          clerkId: true,
+          email: true,
+          firstName: true,
+          lastName: true,
+          preferredLanguage: true
+        }
+      }
     }
   });
+
+  // ========================================
+  // SEND INTERVIEW COMPLETE EMAIL (non-blocking, idempotent)
+  // ========================================
+  if (completedInterview.user?.email) {
+    try {
+      const emailData: InterviewCompleteData = {
+        user: {
+          id: completedInterview.user.id,
+          clerkId: completedInterview.user.clerkId,
+          email: completedInterview.user.email,
+          firstName: completedInterview.user.firstName,
+          lastName: completedInterview.user.lastName,
+          preferredLanguage: completedInterview.user.preferredLanguage
+        },
+        interviewId: completedInterview.id,
+        interviewTitle: completedInterview.jobTitle || 'Interview Practice',
+        jobRole: completedInterview.jobTitle || 'General Interview',
+        duration: results.callDuration ? Math.round(results.callDuration / 60) : 0,
+        overallScore: results.score || undefined
+      };
+
+      // Fire and forget
+      sendInterviewCompleteEmail(emailData)
+        .then(result => {
+          if (result.success && !result.skipped) {
+            dbLogger.info('Interview complete email sent', { 
+              interviewId: completedInterview.id,
+              userId: completedInterview.user?.id,
+              messageId: result.messageId 
+            });
+          } else if (result.skipped) {
+            dbLogger.info('Interview complete email already sent (idempotent)', { 
+              interviewId: completedInterview.id 
+            });
+          }
+        })
+        .catch(err => {
+          dbLogger.warn('Interview complete email failed (non-blocking)', { 
+            interviewId: completedInterview.id,
+            error: err.message 
+          });
+        });
+    } catch (emailError: any) {
+      // Non-blocking
+      dbLogger.warn('Could not prepare interview complete email', { 
+        error: emailError.message 
+      });
+    }
+  }
+
+  return completedInterview;
 }
 
 /**
@@ -657,6 +736,7 @@ export async function createInterviewFromResume(
       isActive: true
     },
     select: {
+      id: true,
       base64Data: true,
       fileName: true,
       mimeType: true
@@ -667,7 +747,13 @@ export async function createInterviewFromResume(
     throw new Error('Resume not found in repository');
   }
   
-  // Create interview
+  // Update resume lastUsedAt
+  await prisma.resumeDocument.update({
+    where: { id: resume.id },
+    data: { lastUsedAt: new Date() }
+  });
+  
+  // Create interview with resumeId reference
   const interview = await prisma.interview.create({
     data: {
       userId: user.id,
@@ -677,6 +763,7 @@ export async function createInterviewFromResume(
       resumeData: resume.base64Data,
       resumeFileName: resume.fileName,
       resumeMimeType: resume.mimeType,
+      resumeId: resume.id,
       status: 'PENDING'
     }
   });

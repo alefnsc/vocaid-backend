@@ -14,6 +14,7 @@ interface RegisterCallBody {
     first_name: string;
     last_name?: string;
     job_title: string;
+    seniority?: string; // Candidate seniority level: intern, junior, mid, senior, staff, principal
     company_name: string;
     job_description: string;
     interviewee_cv: string; // Base64 encoded resume content

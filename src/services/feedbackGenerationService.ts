@@ -30,7 +30,7 @@ import {
   COMPETENCY_ANCHORS,
   calculateWeightedScore
 } from '../types/rubrics';
-import { logger } from '../utils/logger';
+import logger from '../utils/logger';
 
 // ============================================
 // CONFIGURATION

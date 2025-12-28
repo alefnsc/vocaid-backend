@@ -15,7 +15,7 @@ ssh -i ~/.ssh/your-key.pem ec2-user@your-ec2-ip
 ## 2. Navigate to Backend Directory
 
 ```bash
-cd /path/to/voxly-backend
+cd /path/to/Vocaid-backend
 ```
 
 ## 3. Pull Latest Changes
@@ -135,22 +135,22 @@ npm run build
 
 ```bash
 # If first time
-pm2 start dist/server.js --name voxly-backend
+pm2 start dist/server.js --name Vocaid-backend
 
 # If already running
-pm2 restart voxly-backend
+pm2 restart Vocaid-backend
 
 # Check status
 pm2 status
-pm2 logs voxly-backend --lines 100
+pm2 logs Vocaid-backend --lines 100
 ```
 
 ### Using systemd:
 
 ```bash
-sudo systemctl restart voxly-backend
-sudo systemctl status voxly-backend
-journalctl -u voxly-backend -f
+sudo systemctl restart Vocaid-backend
+sudo systemctl status Vocaid-backend
+journalctl -u Vocaid-backend -f
 ```
 
 ## 10. Verify Deployment
@@ -175,7 +175,7 @@ curl -H "x-user-id: user_xxx" \
 ### Check Logs for Errors:
 
 ```bash
-pm2 logs voxly-backend --err --lines 50
+pm2 logs Vocaid-backend --err --lines 50
 ```
 
 ## 11. Verify New Features
@@ -204,16 +204,16 @@ pm2 logs voxly-backend --err --lines 50
 
 ```bash
 # Watch PM2 logs in real-time
-pm2 logs voxly-backend
+pm2 logs Vocaid-backend
 
 # Monitor CPU/Memory usage
 pm2 monit
 
 # Check process info
-pm2 info voxly-backend
+pm2 info Vocaid-backend
 
 # Restart if needed
-pm2 restart voxly-backend --update-env
+pm2 restart Vocaid-backend --update-env
 ```
 
 ## 13. Rollback (if needed)
@@ -229,7 +229,7 @@ npm install
 npm run build
 
 # Restart
-pm2 restart voxly-backend
+pm2 restart Vocaid-backend
 ```
 
 ## Troubleshooting
@@ -240,7 +240,7 @@ pm2 restart voxly-backend
 rm -rf node_modules package-lock.json
 npm install
 npm run build
-pm2 restart voxly-backend
+pm2 restart Vocaid-backend
 ```
 
 ### Issue: Database connection errors
@@ -274,7 +274,7 @@ env | grep PAYPAL
 env | grep MERCADOPAGO
 
 # Check provider availability in logs
-pm2 logs voxly-backend | grep "payment provider"
+pm2 logs Vocaid-backend | grep "payment provider"
 ```
 
 ## Post-Deployment Checklist
@@ -302,7 +302,7 @@ DATABASE_URL="postgresql://...?connection_limit=10&pool_timeout=20"
 ### Set up PM2 cluster mode for multiple cores:
 
 ```bash
-pm2 start dist/server.js -i max --name voxly-backend
+pm2 start dist/server.js -i max --name Vocaid-backend
 ```
 
 ### Configure log rotation:
@@ -325,6 +325,6 @@ pm2 set pm2-logrotate:retain 7
 
 For issues, check:
 - `MULTILINGUAL_ARCHITECTURE.md` for architecture details
-- PM2 logs: `pm2 logs voxly-backend`
+- PM2 logs: `pm2 logs Vocaid-backend`
 - Database logs: Check RDS/PostgreSQL logs
 - Retell dashboard: Check agent call history

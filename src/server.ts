@@ -1,14 +1,20 @@
+// Load environment variables FIRST - before any other imports
+import dotenv from 'dotenv';
+dotenv.config();
+
 import express, { Request, Response, NextFunction } from 'express';
 import expressWs from 'express-ws';
 import cors from 'cors';
 import bodyParser from 'body-parser';
-import dotenv from 'dotenv';
 import OpenAI from 'openai';
 import { RawData, WebSocket } from 'ws';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { body, param, validationResult } from 'express-validator';
 import crypto from 'crypto';
+
+// Config module (centralized environment configuration)
+import { config, logEnvDiagnostics } from './config/env';
 
 // Services
 import { RetellService } from './services/retellService';
@@ -17,18 +23,26 @@ import { FeedbackService } from './services/feedbackService';
 import { CustomLLMWebSocketHandler } from './services/customLLMWebSocket';
 import { spendCredits, restoreCredits } from './services/creditsWalletService';
 import { verifyMercadoPagoSignature, generateWebhookIdempotencyKey } from './services/webhookVerificationService';
+import { sendWelcomeEmail, sendPurchaseReceiptEmail, sendLowCreditsEmail, sendInterviewCompleteEmail, UserEmailData, PurchaseEmailData, LowCreditsData, InterviewCompleteData } from './services/transactionalEmailService';
+import { storeCallContext, cleanupExpiredContexts } from './services/callContextService';
 
 // Routes
 import apiRoutes from './routes/apiRoutes';
 import analyticsRoutes from './routes/analyticsRoutes';
 import creditsRoutes from './routes/creditsRoutes';
 import leadsRoutes from './routes/leadsRoutes';
+import multilingualRoutes from './routes/multilingualRoutes';
+import consentRoutes from './routes/consentRoutes';
+import dashboardRoutes from './routes/dashboardRoutes';
+
+// Middleware
+import { requireConsent } from './middleware/consentMiddleware';
 
 // Logger
 import logger, { wsLogger, retellLogger, feedbackLogger, paymentLogger, authLogger, httpLogger } from './utils/logger';
 
-// Load environment variables
-dotenv.config();
+// Log environment diagnostics at startup
+logEnvDiagnostics();
 
 // Validate required environment variables
 const requiredEnvVars = [
@@ -55,7 +69,7 @@ const missingEnvVars = requiredEnvVars.filter(varName => {
 
 if (missingEnvVars.length > 0) {
   logger.error('Missing or invalid API keys in .env file', { missingVars: missingEnvVars });
-  logger.error('Please update /voxly-back/.env with valid API keys');
+  logger.error('Please update your .env file with valid API keys');
   logger.error('OpenAI: https://platform.openai.com/api-keys');
   logger.error('Retell: https://beta.retellai.com/');
   logger.error('Mercado Pago: https://www.mercadopago.com.br/developers/panel/credentials');
@@ -71,7 +85,7 @@ optionalEnvVars.forEach(varName => {
 
 // Initialize Express app
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = config.server.port;
 
 // ===== TRUST PROXY =====
 // Enable trust proxy for proper client IP detection behind reverse proxies (nginx, load balancers, etc.)
@@ -200,63 +214,15 @@ app.use(cors({
 app.use(bodyParser.json({ limit: '1mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '1mb' }));
 
-// ===== HTTP REQUEST LOGGING MIDDLEWARE =====
-// Log all incoming requests with detailed metadata for debugging data flow issues
-app.use((req: Request, res: Response, next: NextFunction) => {
-  const startTime = Date.now();
-  const requestId = crypto.randomUUID().slice(0, 8);
-  
-  // Attach request ID for tracking through the request lifecycle
-  (req as any).requestId = requestId;
-  
-  // Extract user ID from headers for correlation
-  const userId = req.headers['x-user-id'] as string || 'anonymous';
-  const userIdShort = userId.startsWith('user_') ? userId.slice(0, 15) + '...' : userId;
-  
-  // Log incoming request
-  httpLogger.info(`→ ${req.method} ${req.path}`, {
-    requestId,
-    userId: userIdShort,
-    query: Object.keys(req.query).length > 0 ? req.query : undefined,
-    contentLength: req.headers['content-length'],
-    origin: req.headers.origin || req.headers.referer || 'direct'
-  });
-  
-  // Capture response details
-  const originalSend = res.send;
-  res.send = function(body: any) {
-    const duration = Date.now() - startTime;
-    const statusCode = res.statusCode;
-    
-    // Determine log level based on status code
-    const logLevel = statusCode >= 500 ? 'error' : statusCode >= 400 ? 'warn' : 'info';
-    
-    // Parse response body size
-    const bodySize = typeof body === 'string' ? body.length : JSON.stringify(body || {}).length;
-    
-    // Log response with appropriate level
-    httpLogger[logLevel](`← ${req.method} ${req.path} ${statusCode}`, {
-      requestId,
-      userId: userIdShort,
-      status: statusCode,
-      duration: `${duration}ms`,
-      size: `${Math.round(bodySize / 1024)}KB`
-    });
-    
-    // Log warnings for slow requests
-    if (duration > 2000) {
-      httpLogger.warn(`⚠ Slow request detected`, {
-        requestId,
-        path: req.path,
-        duration: `${duration}ms`
-      });
-    }
-    
-    return originalSend.call(this, body);
-  };
-  
-  next();
-});
+// ===== OBSERVABILITY MIDDLEWARE =====
+// Centralized request tracking with metrics, slow request detection, and duplicate detection
+import { observabilityMiddleware } from './middleware/observabilityMiddleware';
+app.use(observabilityMiddleware);
+
+// ===== CACHING MIDDLEWARE =====
+// Adds Cache-Control headers to reduce bandwidth and Azure costs
+import { cachingMiddleware } from './middleware/cachingMiddleware';
+app.use(cachingMiddleware);
 
 // Mount API routes for database operations (dashboard, interviews, payments, etc.)
 app.use('/api', apiRoutes);
@@ -274,9 +240,43 @@ app.use('/api/leads', leadsRoutes);
 import emailRoutes from './routes/emailRoutes';
 app.use('/api/email', emailRoutes);
 
+// Mount email admin routes (for managing transactional emails)
+import emailAdminRoutes from './routes/emailAdminRoutes';
+app.use('/api/admin', emailAdminRoutes);
+
 // Mount auth routes (PayPal OAuth + mock endpoints for dev)
 import authRoutes from './routes/authRoutes';
 app.use('/api/auth', authRoutes);
+
+// Mount multilingual routes (language preferences, geo-payment)
+app.use('/api/multilingual', multilingualRoutes);
+
+// Mount consent routes (consent management, no auth required for /requirements)
+app.use('/api/consent', consentRoutes);
+
+// Mount dashboard routes (unified candidate dashboard with filtering)
+app.use('/api/dashboard', dashboardRoutes);
+
+// Mount resume repository routes (resume upload, scoring, LinkedIn import)
+import resumeRoutes from './routes/resumeRoutes';
+app.use('/api/resumes', resumeRoutes);
+
+// Mount beta feedback routes (closed beta bug reports & feature requests)
+import betaFeedbackRoutes from './routes/betaFeedbackRoutes';
+app.use('/api/feedback/beta', betaFeedbackRoutes);
+
+// Mount user profile routes (B2C profile management)
+import userRoutes from './routes/userRoutes';
+app.use('/api/users', userRoutes);
+
+// Mount identity verification routes (Brazil KYC scaffold)
+import identityRoutes from './routes/identityRoutes';
+app.use('/api/identity', identityRoutes);
+
+// ===== CONSENT MIDDLEWARE =====
+// Apply consent checking to protected routes
+// Exempt paths are defined in the middleware
+app.use(requireConsent);
 
 // ===== AUTHENTICATION MIDDLEWARE =====
 
@@ -332,6 +332,28 @@ app.get('/health', (req: Request, res: Response) => {
   });
 });
 
+// Metrics endpoint (development only)
+import { getMetricsSnapshot, resetMetrics } from './middleware/observabilityMiddleware';
+app.get('/metrics', (req: Request, res: Response) => {
+  if (process.env.NODE_ENV === 'production' && !req.headers['x-admin-key']) {
+    return res.status(403).json({ status: 'error', message: 'Forbidden' });
+  }
+  
+  const snapshot = getMetricsSnapshot();
+  res.json({
+    status: 'ok',
+    ...snapshot
+  });
+});
+
+app.post('/metrics/reset', (req: Request, res: Response) => {
+  if (process.env.NODE_ENV === 'production') {
+    return res.status(403).json({ status: 'error', message: 'Forbidden' });
+  }
+  resetMetrics();
+  res.json({ status: 'ok', message: 'Metrics reset' });
+});
+
 // ===== INTERVIEW ENDPOINTS =====
 
 /**
@@ -366,6 +388,27 @@ app.post('/register-call',
     };
 
     const result = await retellService.registerCall({ metadata: sanitizedMetadata }, userId);
+    
+    // Store call context for Custom LLM WebSocket to retrieve
+    // This ensures preferred_language is available even if Retell doesn't forward it
+    if (result.call_id) {
+      storeCallContext(result.call_id, {
+        preferredLanguage: sanitizedMetadata.preferred_language || 'en-US',
+        first_name: sanitizedMetadata.first_name,
+        last_name: sanitizedMetadata.last_name,
+        job_title: sanitizedMetadata.job_title,
+        company_name: sanitizedMetadata.company_name,
+        job_description: sanitizedMetadata.job_description,
+        interviewee_cv: sanitizedMetadata.interviewee_cv,
+        resume_file_name: sanitizedMetadata.resume_file_name,
+        resume_mime_type: sanitizedMetadata.resume_mime_type,
+      });
+      retellLogger.info('Call context stored for Custom LLM', {
+        callId: result.call_id,
+        preferredLanguage: sanitizedMetadata.preferred_language || 'en-US',
+      });
+    }
+    
     res.json(result);
   } catch (error: any) {
     retellLogger.error('Error in /register-call', { error: error.message });
@@ -672,6 +715,269 @@ app.get('/webhook/mercadopago', (req: Request, res: Response) => {
     message: 'Mercado Pago webhook endpoint',
     url: `${process.env.WEBHOOK_BASE_URL}/webhook/mercadopago`
   });
+});
+
+// ========================================
+// PAYPAL PAYMENT ENDPOINTS
+// ========================================
+
+import { getPaymentGateway } from './services/paymentStrategyService';
+import { addPurchasedCredits } from './services/creditsWalletService';
+
+/**
+ * PayPal webhook handler
+ * POST /webhook/paypal
+ * Handles PayPal webhook events (PAYMENT.CAPTURE.COMPLETED, etc.)
+ */
+app.post('/webhook/paypal',
+  webhookLimiter,
+  async (req: Request, res: Response) => {
+  try {
+    const payload = req.body;
+    const headers = req.headers as Record<string, string>;
+    
+    paymentLogger.info('Received PayPal webhook', {
+      eventType: payload.event_type,
+      resourceId: payload.resource?.id,
+    });
+
+    // TODO: Add webhook signature verification for production
+    // PayPal webhook verification requires certificate download and validation
+    // For now, we verify by checking the order status via API
+    
+    const gateway = getPaymentGateway();
+    const paypalProvider = gateway.getProvider('paypal');
+    
+    const result = await paypalProvider.handleWebhook(payload, headers);
+    
+    if (result.success && result.creditsToAdd && result.userId) {
+      // Find user by Clerk ID and add credits
+      const { PrismaClient } = await import('@prisma/client');
+      const prisma = new PrismaClient();
+      
+      const user = await prisma.user.findUnique({
+        where: { clerkId: result.userId }
+      });
+      
+      if (user) {
+        await addPurchasedCredits(
+          user.id,
+          result.creditsToAdd,
+          result.paymentId,
+          'PayPal Purchase'
+        );
+        paymentLogger.info('Credits added via PayPal webhook', {
+          userId: user.id,
+          credits: result.creditsToAdd,
+          paymentId: result.paymentId,
+        });
+
+        // ========================================
+        // SEND PURCHASE RECEIPT EMAIL (non-blocking, idempotent)
+        // ========================================
+        const updatedUser = await prisma.user.findUnique({ where: { id: user.id } });
+        const newBalance = updatedUser?.credits ?? 0;
+
+        if (user.email) {
+          const purchaseData: PurchaseEmailData = {
+            user: {
+              id: user.id,
+              clerkId: user.clerkId,
+              email: user.email,
+              firstName: user.firstName,
+              lastName: user.lastName,
+              preferredLanguage: user.preferredLanguage
+            },
+            paymentId: result.paymentId,
+            provider: 'paypal',
+            packageName: `${result.creditsToAdd} Credits`,
+            creditsAmount: result.creditsToAdd,
+            amountPaid: 0, // PayPal doesn't provide this in webhook easily
+            currency: 'USD',
+            newBalance,
+            paidAt: new Date()
+          };
+
+          // Fire and forget
+          sendPurchaseReceiptEmail(purchaseData)
+            .then(emailResult => {
+              if (emailResult.success && !emailResult.skipped) {
+                paymentLogger.info('PayPal purchase receipt email sent', { 
+                  userId: user.id, 
+                  paymentId: result.paymentId, 
+                  messageId: emailResult.messageId 
+                });
+              } else if (emailResult.skipped) {
+                paymentLogger.info('PayPal purchase receipt already sent (idempotent)', { 
+                  userId: user.id, 
+                  paymentId: result.paymentId 
+                });
+              } else {
+                paymentLogger.warn('PayPal purchase receipt email failed (non-blocking)', { 
+                  userId: user.id, 
+                  paymentId: result.paymentId, 
+                  error: emailResult.error 
+                });
+              }
+            })
+            .catch(err => {
+              paymentLogger.error('PayPal purchase receipt email error (non-blocking)', { 
+                userId: user.id, 
+                paymentId: result.paymentId, 
+                error: err.message 
+              });
+            });
+        }
+      }
+    }
+    
+    res.status(200).json({ status: 'success', result });
+  } catch (error: any) {
+    paymentLogger.error('Error in /webhook/paypal', { error: error.message });
+    res.status(200).json({ status: 'error', message: error.message });
+  }
+});
+
+/**
+ * Get PayPal webhook info
+ * GET /webhook/paypal
+ */
+app.get('/webhook/paypal', (req: Request, res: Response) => {
+  res.json({
+    status: 'ok',
+    message: 'PayPal webhook endpoint',
+    url: `${process.env.WEBHOOK_BASE_URL}/webhook/paypal`
+  });
+});
+
+/**
+ * Capture PayPal order after buyer approval
+ * POST /api/payments/paypal/capture/:orderId
+ * Called by frontend after PayPal checkout approval
+ */
+app.post('/api/payments/paypal/capture/:orderId',
+  sensitiveLimiter,
+  async (req: Request, res: Response) => {
+  try {
+    const { orderId } = req.params;
+    const clerkUserId = req.headers['x-user-id'] as string;
+    
+    if (!clerkUserId) {
+      return res.status(401).json({ status: 'error', message: 'Authentication required' });
+    }
+    
+    paymentLogger.info('Capturing PayPal order', { orderId, clerkUserId });
+    
+    // Get PayPal credentials
+    const isProduction = process.env.NODE_ENV === 'production';
+    const clientId = isProduction 
+      ? process.env.PAYPAL_CLIENT_ID 
+      : process.env.PAYPAL_SANDBOX_CLIENT_ID || process.env.PAYPAL_CLIENT_ID;
+    const clientSecret = isProduction
+      ? process.env.PAYPAL_CLIENT_SECRET
+      : process.env.PAYPAL_SANDBOX_CLIENT_SECRET || process.env.PAYPAL_CLIENT_SECRET;
+    const baseUrl = isProduction
+      ? 'https://api-m.paypal.com'
+      : 'https://api-m.sandbox.paypal.com';
+    
+    if (!clientId || !clientSecret) {
+      return res.status(500).json({ status: 'error', message: 'PayPal not configured' });
+    }
+    
+    // Get access token
+    const auth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+    const tokenResponse = await fetch(`${baseUrl}/v1/oauth2/token`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Basic ${auth}`,
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: 'grant_type=client_credentials',
+    });
+    
+    if (!tokenResponse.ok) {
+      throw new Error('Failed to get PayPal access token');
+    }
+    
+    const tokenData = await tokenResponse.json() as { access_token: string };
+    
+    // Capture the order
+    const captureResponse = await fetch(`${baseUrl}/v2/checkout/orders/${orderId}/capture`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${tokenData.access_token}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    
+    if (!captureResponse.ok) {
+      const errorText = await captureResponse.text();
+      paymentLogger.error('PayPal capture failed', { orderId, error: errorText });
+      return res.status(400).json({ status: 'error', message: 'Payment capture failed' });
+    }
+    
+    interface PayPalCaptureResponse {
+      id: string;
+      status: string;
+      purchase_units?: Array<{
+        custom_id?: string;
+        payments?: {
+          captures?: Array<{ id: string; status: string }>;
+        };
+      }>;
+    }
+    
+    const captureResult = await captureResponse.json() as PayPalCaptureResponse;
+    
+    paymentLogger.info('PayPal order captured', {
+      orderId,
+      status: captureResult.status,
+    });
+    
+    // If capture successful, add credits
+    if (captureResult.status === 'COMPLETED') {
+      let customData: { userId?: string; credits?: number; packageId?: string } = {};
+      try {
+        const customId = captureResult.purchase_units?.[0]?.custom_id;
+        customData = JSON.parse(customId || '{}');
+      } catch (e) {
+        paymentLogger.warn('Failed to parse custom_id', { orderId });
+      }
+      
+      if (customData.credits && customData.userId) {
+        const { PrismaClient } = await import('@prisma/client');
+        const prisma = new PrismaClient();
+        
+        const user = await prisma.user.findUnique({
+          where: { clerkId: customData.userId }
+        });
+        
+        if (user) {
+          await addPurchasedCredits(
+            user.id,
+            customData.credits,
+            orderId,
+            `PayPal ${customData.packageId || 'Purchase'}`
+          );
+          
+          paymentLogger.info('Credits added via PayPal capture', {
+            userId: user.id,
+            credits: customData.credits,
+            orderId,
+          });
+        }
+      }
+    }
+    
+    res.json({
+      status: 'success',
+      orderId,
+      paymentStatus: captureResult.status,
+    });
+  } catch (error: any) {
+    paymentLogger.error('Error capturing PayPal order', { error: error.message });
+    res.status(500).json({ status: 'error', message: error.message });
+  }
 });
 
 /**
@@ -1083,6 +1389,44 @@ app.post('/api/users/validate',
       phoneVerificationRequired
     });
 
+    // ========================================
+    // TRIGGER WELCOME EMAIL (non-blocking, idempotent)
+    // Sends once per user (deduped by clerkId)
+    // ========================================
+    if (user.email) {
+      const userEmailData: UserEmailData = {
+        id: user.id,
+        clerkId: user.clerkId,
+        email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        preferredLanguage: user.preferredLanguage
+      };
+      
+      // Fire and forget - don't block the response
+      sendWelcomeEmail(userEmailData)
+        .then(result => {
+          if (result.success) {
+            if (result.skipped) {
+              authLogger.info('Welcome email skipped (already sent)', { userId: user.id });
+            } else {
+              authLogger.info('Welcome email sent', { userId: user.id, messageId: result.messageId });
+            }
+          } else {
+            authLogger.warn('Welcome email failed (non-blocking)', { 
+              userId: user.id, 
+              error: result.error 
+            });
+          }
+        })
+        .catch(err => {
+          authLogger.error('Welcome email error (non-blocking)', { 
+            userId: user.id, 
+            error: err.message 
+          });
+        });
+    }
+
     res.json({
       status: 'success',
       message: source === 'clerk' ? 'User created from Clerk' : 'User validated',
@@ -1173,9 +1517,10 @@ app.post('/consume-credit',
     const updatedUser = await clerkService.updateUserCredits(userId, 1, 'subtract');
 
     // Record in wallet ledger (non-blocking)
+    // CRITICAL: Use dbUser.id (UUID) not userId (Clerk ID) for wallet operations
     try {
       await spendCredits(
-        userId,
+        dbUser.id, // Use internal UUID, not Clerk ID
         1,
         'Interview credit consumed',
         callId ? 'interview' : undefined,
@@ -1184,12 +1529,61 @@ app.post('/consume-credit',
       );
     } catch (walletError: any) {
       authLogger.warn('Failed to record credit spend in wallet (non-critical)', { 
-        userId, 
+        userId,
+        dbUserId: dbUser.id,
         error: walletError.message 
       });
     }
 
     authLogger.info('Credit consumed', { userId, previousCredits: currentCredits, newCredits: updatedUser.credits });
+
+    // ========================================
+    // SEND LOW CREDITS WARNING (non-blocking, idempotent)
+    // Trigger when credits fall to 2 or below
+    // ========================================
+    const LOW_CREDITS_THRESHOLD = 2;
+    if (updatedUser.credits <= LOW_CREDITS_THRESHOLD && currentCredits > LOW_CREDITS_THRESHOLD) {
+      // Only send if user just crossed the threshold
+      try {
+        if (dbUser.email) {
+          const lowCreditsData: LowCreditsData = {
+            user: {
+              id: dbUser.id,
+              clerkId: dbUser.clerkId,
+              email: dbUser.email,
+              firstName: dbUser.firstName,
+              lastName: dbUser.lastName,
+              preferredLanguage: dbUser.preferredLanguage
+            },
+            currentCredits: updatedUser.credits,
+            threshold: LOW_CREDITS_THRESHOLD
+          };
+          
+          // Fire and forget
+          sendLowCreditsEmail(lowCreditsData)
+            .then(result => {
+              if (result.success && !result.skipped) {
+                authLogger.info('Low credits warning email sent', { 
+                  userId, 
+                  newCredits: updatedUser.credits,
+                  messageId: result.messageId 
+                });
+              } else if (result.skipped) {
+                authLogger.info('Low credits warning already sent (idempotent)', { userId });
+              }
+            })
+            .catch(err => {
+              authLogger.warn('Low credits email failed (non-blocking)', { 
+                userId, 
+                error: err.message 
+              });
+            });
+        }
+      } catch (emailError: any) {
+        // Non-blocking
+        authLogger.warn('Could not prepare low credits email', { error: emailError.message });
+      }
+    }
 
     res.json({
       status: 'success',
@@ -1268,9 +1662,10 @@ app.post('/restore-credit',
     const updatedUser = await clerkService.updateUserCredits(userId, 1, 'add');
 
     // Record in wallet ledger (non-blocking)
+    // CRITICAL: Use dbUser.id (UUID) not userId (Clerk ID) for wallet operations
     try {
       await restoreCredits(
-        userId,
+        dbUser.id, // Use internal UUID, not Clerk ID
         1,
         reason || 'Credit restored due to interview cancellation',
         callId ? 'interview' : undefined,
@@ -1278,7 +1673,8 @@ app.post('/restore-credit',
       );
     } catch (walletError: any) {
       authLogger.warn('Failed to record credit restore in wallet (non-critical)', { 
-        userId, 
+        userId,
+        dbUserId: dbUser.id,
         error: walletError.message 
       });
     }
@@ -1459,6 +1855,11 @@ wsApp.listen(PORT, () => {
   logger.info(`Webhook URL: ${process.env.WEBHOOK_BASE_URL}/webhook/mercadopago`);
   logger.info(`Log Level: ${process.env.LOG_LEVEL || 'info'}`);
   logger.info('═'.repeat(60));
+  
+  // Periodic cleanup of expired call contexts (every 30 minutes)
+  setInterval(() => {
+    cleanupExpiredContexts();
+  }, 30 * 60 * 1000);
 });
 
 // Graceful shutdown handler

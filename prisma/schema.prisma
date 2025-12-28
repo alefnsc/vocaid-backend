@@ -11,6 +11,28 @@ datasource db {
 }
 
 // ========================================
+// USER TYPE ENUM
+// Distinguishes between B2C personal users, B2B candidates, and employees
+// ========================================
+enum UserType {
+  PERSONAL  // B2C self-service users (individuals practicing interviews)
+  CANDIDATE // B2B users invited by recruiters
+  EMPLOYEE  // B2B users from employee hub
+}
+
+// ========================================
+// IDENTITY VERIFICATION STATUS
+// Tracks Brazil KYC verification status
+// ========================================
+enum IdentityVerificationStatus {
+  NOT_STARTED
+  PENDING
+  VERIFIED
+  FAILED
+  EXPIRED
+}
+
+// ========================================
 // USER MODEL
 // Synced with Clerk - stores additional user data
 // ========================================
@@ -27,12 +49,17 @@ model User {
   createdAt           DateTime  @default(now()) @map("created_at")
   updatedAt           DateTime  @updatedAt @map("updated_at")
 
+  // User Type & Country (B2C Brazil-only for now)
+  userType            UserType  @default(PERSONAL) @map("user_type")
+  countryCode         String    @default("BR") @map("country_code") @db.VarChar(2) // ISO-3166 alpha-2
+
   // Localization & Onboarding Metadata
-  preferredLanguage   String?   @map("preferred_language") @db.VarChar(10)
-  registrationRegion  String?   @map("registration_region") @db.VarChar(10)
-  registrationCountry String?   @map("registration_country") @db.VarChar(2)
-  initialIp           String?   @map("initial_ip") @db.VarChar(45)
-  onboardingComplete  Boolean   @default(false) @map("onboarding_complete")
+  preferredLanguage     String?   @map("preferred_language") @db.VarChar(10)
+  registrationRegion    String?   @map("registration_region") @db.VarChar(10)
+  registrationCountry   String?   @map("registration_country") @db.VarChar(2)
+  initialIp             String?   @map("initial_ip") @db.VarChar(45)
+  onboardingComplete    Boolean   @default(false) @map("onboarding_complete")
+  onboardingCompletedAt DateTime? @map("onboarding_completed_at") // Set when required consents are accepted
   
   // Role & Seniority (synced with Clerk publicMetadata)
   currentRole         String?   @map("current_role") @db.VarChar(50)
@@ -54,6 +81,9 @@ model User {
   resumeDocuments ResumeDocument[]
   creditsWallet   CreditsWallet?
   creditLedger    CreditLedger[]
+  transactionalEmails TransactionalEmail[]
+  userConsent     UserConsent?
+  identityVerifications IdentityVerificationSession[]
 
   @@index([clerkId])
   @@index([email])
@@ -61,6 +91,9 @@ model User {
   @@index([preferredLanguage])
   @@index([registrationRegion])
   @@index([currentRole])
+  @@index([onboardingCompletedAt])
+  @@index([userType])
+  @@index([countryCode])
   @@map("users")
 }
 
@@ -170,12 +203,36 @@ model SavedCard {
 }
 
 // ========================================
+// RESUME SOURCE ENUM
+// Distinguishes how the resume was added to repository
+// ========================================
+enum ResumeSource {
+  UPLOAD    // Manually uploaded by user
+  LINKEDIN  // Imported from LinkedIn
+  GENERATED // Generated from form input
+}
+
+// ========================================
+// RESUME SCORE PROVIDER ENUM
+// Distinguishes which service provided the score
+// ========================================
+enum ResumeScoreProvider {
+  AFFINDA                    // Affinda ATS parser/matcher
+  TEXTKERNEL                 // Textkernel parser
+  INTERNAL_KEYWORD           // Internal keyword matching
+  INTERNAL_INTERVIEW_OUTCOME // Derived from interview performance
+}
+
+// ========================================
 // RESUME DOCUMENT MODEL
 // User's resume repository with version control
 // ========================================
 model ResumeDocument {
   id              String    @id @default(uuid()) @db.Uuid
   userId          String    @map("user_id") @db.Uuid
+  
+  // Source tracking
+  source          ResumeSource @default(UPLOAD)
   
   // File data
   fileName        String    @map("file_name") @db.VarChar(255)
@@ -187,6 +244,9 @@ model ResumeDocument {
   title           String    @db.VarChar(255)
   description     String?   @db.Text
   tags            String[]  @default([])
+  
+  // LinkedIn-specific metadata (when source = LINKEDIN)
+  linkedInProfileUrl String? @map("linkedin_profile_url") @db.VarChar(500)
   
   // Parsed content (populated by parser)
   parsedText      String?   @map("parsed_text") @db.Text
@@ -204,6 +264,9 @@ model ResumeDocument {
   isActive        Boolean   @default(true) @map("is_active")
   isPrimary       Boolean   @default(false) @map("is_primary")
   
+  // Usage tracking
+  lastUsedAt      DateTime? @map("last_used_at")
+  
   // Timestamps
   createdAt       DateTime  @default(now()) @map("created_at")
   updatedAt       DateTime  @updatedAt @map("updated_at")
@@ -212,12 +275,50 @@ model ResumeDocument {
   user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
   parentVersion   ResumeDocument? @relation("ResumeVersions", fields: [parentVersionId], references: [id])
   childVersions   ResumeDocument[] @relation("ResumeVersions")
+  interviews      Interview[] @relation("ResumeInterviews")
+  scores          ResumeScore[]
   
   @@index([userId])
   @@index([isPrimary])
   @@index([isActive, isLatest])
   @@index([tags])
+  @@index([lastUsedAt])
+  @@index([source])
   @@map("resume_documents")
+}
+
+// ========================================
+// RESUME SCORE MODEL
+// Stores ATS-style scores per resume/role combination
+// ========================================
+model ResumeScore {
+  id              String    @id @default(uuid()) @db.Uuid
+  resumeId        String    @map("resume_id") @db.Uuid
+  
+  // Role matching
+  roleTitle       String    @map("role_title") @db.VarChar(255)
+  
+  // Score data
+  score           Float     @db.DoublePrecision // 0-100
+  provider        ResumeScoreProvider
+  breakdown       Json?     @db.JsonB // Provider-specific breakdown
+  
+  // Caching - don't recompute if recent
+  computedAt      DateTime  @default(now()) @map("computed_at")
+  
+  // Timestamps
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  
+  // Relations
+  resume          ResumeDocument @relation(fields: [resumeId], references: [id], onDelete: Cascade)
+  
+  @@unique([resumeId, roleTitle, provider])
+  @@index([resumeId])
+  @@index([roleTitle])
+  @@index([provider])
+  @@index([score])
+  @@map("resume_scores")
 }
 
 // ========================================
@@ -292,6 +393,53 @@ model SignupRecord {
 }
 
 // ========================================
+// USER CONSENT MODEL
+// Tracks legal consent for Terms, Privacy, and Communications
+// Audit-ready with timestamps, versions, and metadata
+// ========================================
+enum ConsentSource {
+  FORM   // Custom sign-up form
+  OAUTH  // OAuth provider (Google, Apple, Microsoft, LinkedIn)
+}
+
+model UserConsent {
+  id                    String        @id @default(uuid()) @db.Uuid
+  userId                String        @unique @map("user_id") @db.Uuid
+  
+  // Required consents (must be accepted to use the product)
+  termsAcceptedAt       DateTime      @map("terms_accepted_at")
+  privacyAcceptedAt     DateTime      @map("privacy_accepted_at")
+  
+  // Version tracking for re-consent when terms change
+  termsVersion          String        @map("terms_version") @db.VarChar(20)
+  privacyVersion        String        @map("privacy_version") @db.VarChar(20)
+  
+  // Communication preferences
+  transactionalOptIn    Boolean       @default(true) @map("transactional_opt_in")  // Essential emails (receipts, security)
+  marketingOptIn        Boolean       @default(false) @map("marketing_opt_in")     // Optional promotional emails
+  marketingOptInAt      DateTime?     @map("marketing_opt_in_at")                  // When marketing was accepted
+  marketingVersion      String?       @map("marketing_version") @db.VarChar(20)   // Version of marketing consent text
+  
+  // Audit metadata for compliance
+  ipAddress             String?       @map("ip_address") @db.VarChar(45)
+  userAgent             String?       @map("user_agent") @db.Text
+  source                ConsentSource @default(FORM)
+  
+  // Timestamps
+  createdAt             DateTime      @default(now()) @map("created_at")
+  updatedAt             DateTime      @updatedAt @map("updated_at")
+  
+  // Relations
+  user                  User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([termsAcceptedAt])
+  @@index([privacyAcceptedAt])
+  @@index([marketingOptIn])
+  @@index([source])
+  @@map("user_consents")
+}
+
+// ========================================
 // INTERVIEW MODEL
 // Stores interview sessions and their results
 // ========================================
@@ -304,6 +452,9 @@ model Interview {
   jobTitle        String           @map("job_title")
   companyName     String           @map("company_name")
   jobDescription  String           @map("job_description") @db.Text
+  
+  // Role Country (where the user is applying for the job)
+  roleCountryCode String?          @map("role_country_code") @db.VarChar(2) // ISO-3166 alpha-2
   
   // Seniority and Language for LLM configuration
   seniority       String?          @db.VarChar(30) // Intern, Junior, Mid, Senior, Staff, Principal, Manager
@@ -354,12 +505,14 @@ model Interview {
 
   // Relations
   user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  resumeDocument  ResumeDocument?  @relation("ResumeInterviews", fields: [resumeId], references: [id])
   metrics         InterviewMetric[]
   scoreHistory    InterviewScoreHistory[]
   transcriptSegments TranscriptSegment[]
   emailLogs       EmailLog[]
   feedbackJsons   FeedbackJson[]
   feedbackPdfs    FeedbackPdf[]
+  session         InterviewSession?
 
   @@index([userId])
   @@index([retellCallId])
@@ -371,6 +524,9 @@ model Interview {
   @@index([language])
   @@index([resumeId])
   @@index([emailSendStatus])
+  @@index([roleCountryCode])
+  @@index([userId, createdAt])
+  @@index([userId, endedAt])
   @@map("interviews")
 }
 
@@ -862,6 +1018,19 @@ enum EmailSendStatus {
   SKIPPED     // Email skipped (user opted out)
 }
 
+enum TransactionalEmailType {
+  WELCOME                    // Registration confirmation email
+  CREDITS_PURCHASE_RECEIPT   // Purchase confirmation with receipt
+  PASSWORD_RESET             // Password reset instructions
+  INTERVIEW_REMINDER         // Reminder about scheduled/unfinished interview
+  LOW_CREDITS_WARNING        // Warning when credits are running low
+  INTERVIEW_COMPLETE         // Interview completed summary
+}
+
+enum EmailProvider {
+  RESEND      // Resend email service
+}
+
 enum LeadType {
   DEMO_REQUEST     // B2B demo request
   EARLY_ACCESS     // Early access signup for B2B modules
@@ -918,6 +1087,57 @@ model EmailLog {
 }
 
 // ========================================
+// TRANSACTIONAL EMAIL MODEL
+// Tracks transactional emails (welcome, purchase receipts) with idempotency
+// Independent of interviews - for user-level communications
+// ========================================
+model TransactionalEmail {
+  id              String                    @id @default(uuid()) @db.Uuid
+  
+  // User reference (nullable for system emails)
+  userId          String?                   @map("user_id") @db.Uuid
+  
+  // Email details
+  toEmail         String                    @map("to_email") @db.VarChar(255)
+  emailType       TransactionalEmailType    @map("email_type")
+  
+  // Delivery tracking
+  status          EmailSendStatus           @default(PENDING)
+  provider        EmailProvider             @default(RESEND)
+  providerMessageId String?                 @map("provider_message_id") @db.VarChar(255)
+  
+  // Idempotency - CRITICAL for preventing duplicates
+  // Welcome: "welcome:<clerkUserId>"
+  // Purchase: "purchase:<provider>:<paymentIdOrOrderId>"
+  idempotencyKey  String                    @unique @map("idempotency_key") @db.VarChar(255)
+  
+  // Payload (sanitized - no sensitive data)
+  payloadJson     Json?                     @map("payload_json") @db.JsonB
+  
+  // Error tracking
+  errorJson       Json?                     @map("error_json") @db.JsonB
+  retryCount      Int                       @default(0) @map("retry_count")
+  
+  // Metadata
+  language        String?                   @db.VarChar(10)
+  
+  // Timestamps
+  sentAt          DateTime?                 @map("sent_at")
+  createdAt       DateTime                  @default(now()) @map("created_at")
+  updatedAt       DateTime                  @updatedAt @map("updated_at")
+  
+  // Relations
+  user            User?                     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  
+  @@index([userId])
+  @@index([emailType])
+  @@index([status])
+  @@index([toEmail])
+  @@index([createdAt])
+  @@map("transactional_emails")
+}
+
+// ========================================
 // LEAD MODEL
 // Captures demo requests and early access signups
 // ========================================
@@ -960,4 +1180,184 @@ model Lead {
   @@index([contacted])
   @@index([createdAt])
   @@map("leads")
+}
+
+// ========================================
+// IDENTITY VERIFICATION SESSION MODEL
+// Brazil KYC verification for Personal (B2C) users
+// Provider-agnostic design for future vendor integration
+// ========================================
+model IdentityVerificationSession {
+  id              String                      @id @default(uuid()) @db.Uuid
+  userId          String                      @map("user_id") @db.Uuid
+  
+  // Session Status
+  status          IdentityVerificationStatus  @default(NOT_STARTED)
+  
+  // Provider Information (for future vendor integration)
+  provider        String?                     @db.VarChar(50) // 'mock', 'serpro', 'datavalid', etc.
+  providerSessionId String?                   @map("provider_session_id") @db.VarChar(255)
+  
+  // Document Information
+  documentType    String?                     @map("document_type") @db.VarChar(20) // 'RG', 'CNH', 'CPF'
+  documentNumber  String?                     @map("document_number") @db.VarChar(50) // Encrypted in production
+  
+  // File Storage Paths (local in dev, S3 in production)
+  selfiePath      String?                     @map("selfie_path") @db.VarChar(500)
+  documentPath    String?                     @map("document_path") @db.VarChar(500)
+  
+  // Verification Result
+  resultJson      Json?                       @map("result_json") @db.JsonB
+  failureReason   String?                     @map("failure_reason") @db.Text
+  verifiedAt      DateTime?                   @map("verified_at")
+  
+  // Consent Tracking (LGPD compliance)
+  termsAcceptedAt   DateTime?                 @map("terms_accepted_at")
+  biometricConsentAt DateTime?                @map("biometric_consent_at")
+  consentIpAddress  String?                   @map("consent_ip_address") @db.VarChar(45)
+  
+  // Timestamps
+  createdAt       DateTime                    @default(now()) @map("created_at")
+  updatedAt       DateTime                    @updatedAt @map("updated_at")
+  expiresAt       DateTime?                   @map("expires_at")
+  
+  // Relations
+  user            User                        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([userId])
+  @@index([status])
+  @@index([provider])
+  @@index([createdAt])
+  @@map("identity_verification_sessions")
+}
+
+// ========================================
+// INTERVIEW SESSION MODEL
+// Rich metrics logging for interview calls
+// Tracks timing, token usage, costs, and quality signals
+// ========================================
+enum InterviewEndReason {
+  COMPLETED           // Normal completion
+  USER_HANGUP         // User ended call
+  TIME_LIMIT          // Maximum duration reached
+  INCOMPATIBILITY     // Resume/job mismatch detected
+  TECHNICAL_ERROR     // WebSocket or API error
+  SILENCE_TIMEOUT     // User stopped responding
+  AGENT_ERROR         // LLM or TTS error
+}
+
+model InterviewSession {
+  id              String              @id @default(uuid()) @db.Uuid
+  interviewId     String              @unique @map("interview_id") @db.Uuid
+  
+  // Call Identifiers
+  retellCallId    String?             @map("retell_call_id") @db.VarChar(100)
+  retellAgentId   String?             @map("retell_agent_id") @db.VarChar(100)
+  
+  // Language & Configuration
+  language        String              @db.VarChar(10) // Language code (e.g., 'pt-BR', 'en-US')
+  roleTitle       String              @map("role_title") @db.VarChar(200)
+  seniority       String?             @db.VarChar(30)
+  roleCountry     String?             @map("role_country") @db.VarChar(2) // ISO-3166 alpha-2
+  
+  // Timing Metrics (all in milliseconds)
+  callStartedAt       DateTime?       @map("call_started_at")
+  firstAgentUtteranceAt DateTime?     @map("first_agent_utterance_at")
+  callEndedAt         DateTime?       @map("call_ended_at")
+  
+  // Latency Metrics (milliseconds)
+  timeToFirstToken    Int?            @map("time_to_first_token") // LLM response latency
+  timeToFirstAudio    Int?            @map("time_to_first_audio") // TTS output latency
+  avgResponseLatency  Float?          @map("avg_response_latency") @db.DoublePrecision
+  
+  // Transcript Metrics
+  transcriptLength    Int?            @map("transcript_length") // Character count
+  totalTurns          Int?            @map("total_turns") // Agent + User turns
+  agentTurns          Int?            @map("agent_turns")
+  userTurns           Int?            @map("user_turns")
+  
+  // OpenAI Token Usage (accumulated across all turns)
+  promptTokens        Int?            @map("prompt_tokens")
+  completionTokens    Int?            @map("completion_tokens")
+  totalTokens         Int?            @map("total_tokens")
+  estimatedCostUsd    Float?          @map("estimated_cost_usd") @db.DoublePrecision
+  
+  // Model Information
+  llmModel            String?         @map("llm_model") @db.VarChar(100)
+  llmProvider         String?         @map("llm_provider") @db.VarChar(50) // 'openai', 'anthropic', etc.
+  
+  // Call Quality Signals
+  endReason           InterviewEndReason? @map("end_reason")
+  completionRate      Float?          @map("completion_rate") @db.DoublePrecision // 0-1 (reached closing)
+  clarificationTurns  Int?            @map("clarification_turns") // Agent asked to repeat
+  silenceCount        Int?            @map("silence_count") // Reminder triggers
+  
+  // Retell Metadata (from webhook/call details)
+  retellDurationSec   Int?            @map("retell_duration_sec")
+  retellDisconnectReason String?      @map("retell_disconnect_reason") @db.VarChar(100)
+  
+  // B2B Fields (future - behind feature flag)
+  hasCustomPrompt     Boolean         @default(false) @map("has_custom_prompt")
+  recruiterPromptLength Int?          @map("recruiter_prompt_length")
+  
+  // Timestamps
+  createdAt           DateTime        @default(now()) @map("created_at")
+  updatedAt           DateTime        @updatedAt @map("updated_at")
+  
+  // Relations
+  interview           Interview       @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  
+  @@index([interviewId])
+  @@index([retellCallId])
+  @@index([language])
+  @@index([roleTitle])
+  @@index([callStartedAt])
+  @@index([endReason])
+  @@map("interview_sessions")
+}
+
+// ========================================
+// ANALYTICS CACHE MODEL
+// Pre-computed analytics for fast dashboard loading
+// Reduces expensive aggregate queries
+// ========================================
+
+model AnalyticsCache {
+  id              String   @id @default(uuid()) @db.Uuid
+  userId          String   @map("user_id") @db.VarChar(255)
+  cacheKey        String   @map("cache_key") @db.VarChar(100) // 'dashboard', 'scores_by_role', etc.
+  cacheData       Json     @map("cache_data")
+  computedAt      DateTime @map("computed_at")
+  expiresAt       DateTime @map("expires_at")
+  version         Int      @default(1)
+  
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+  
+  @@unique([userId, cacheKey])
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([cacheKey])
+  @@map("analytics_cache")
+}
+
+// ========================================
+// GLOBAL ANALYTICS SNAPSHOT MODEL
+// Pre-computed global statistics (percentiles, benchmarks)
+// Updated via scheduled job
+// ========================================
+
+model GlobalAnalyticsSnapshot {
+  id              String   @id @default(uuid()) @db.Uuid
+  snapshotType    String   @map("snapshot_type") @db.VarChar(50) // 'percentiles', 'role_benchmarks', etc.
+  snapshotData    Json     @map("snapshot_data")
+  recordCount     Int      @map("record_count") // How many records were aggregated
+  computedAt      DateTime @map("computed_at")
+  
+  createdAt       DateTime @default(now()) @map("created_at")
+  
+  @@unique([snapshotType])
+  @@index([snapshotType])
+  @@index([computedAt])
+  @@map("global_analytics_snapshots")
 }
