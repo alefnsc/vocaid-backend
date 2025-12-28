@@ -13,6 +13,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { z, ZodError } from 'zod';
 import * as creditsWalletService from '../services/creditsWalletService';
+import { getTrialStatus, isPromoActive, getPromoRemainingDays, PROMO_END_DATE } from '../services/trialPolicyService';
 import { apiLogger } from '../utils/logger';
 import { prisma } from '../services/databaseService';
 
@@ -317,6 +318,63 @@ router.get('/check', getUserId, async (req: Request, res: Response) => {
     res.status(500).json({
       status: 'error',
       message: 'Failed to check credits'
+    });
+  }
+});
+
+/**
+ * GET /api/credits/trial-status
+ * Get trial credits status for current user
+ * Returns info about trial grant, promo period, and current balance
+ */
+router.get('/trial-status', getUserId, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId;
+    const status = await getTrialStatus(userId);
+    
+    res.json({
+      status: 'success',
+      data: {
+        trialCreditsGranted: status.trialCreditsGranted,
+        trialCreditsAmount: status.trialCreditsAmount,
+        trialCreditsGrantedAt: status.trialCreditsGrantedAt?.toISOString() || null,
+        isPromoActive: status.isPromoActive,
+        promoEndsAt: status.promoEndsAt.toISOString(),
+        promoRemainingDays: getPromoRemainingDays(),
+        currentBalance: status.currentBalance,
+        riskLevel: status.riskLevel
+      }
+    });
+  } catch (error: any) {
+    apiLogger.error('Failed to get trial status', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get trial status'
+    });
+  }
+});
+
+/**
+ * GET /api/credits/promo-info
+ * Get current promo information (public endpoint)
+ */
+router.get('/promo-info', async (req: Request, res: Response) => {
+  try {
+    res.json({
+      status: 'success',
+      data: {
+        isPromoActive: isPromoActive(),
+        promoEndsAt: PROMO_END_DATE.toISOString(),
+        promoRemainingDays: getPromoRemainingDays(),
+        promoCredits: isPromoActive() ? 5 : 1,
+        standardCredits: 1
+      }
+    });
+  } catch (error: any) {
+    apiLogger.error('Failed to get promo info', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to get promo info'
     });
   }
 });

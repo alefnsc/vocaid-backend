@@ -9,13 +9,20 @@ import { prisma, dbLogger } from './databaseService';
 import { authLogger } from '../utils/logger';
 import { checkSignupAbuse, recordSignup, SignupInfo } from './signupAbuseService';
 import { addCredits as walletAddCredits, initializeWalletWithBonus } from './creditsWalletService';
+import { 
+  grantTrialCredits, 
+  determineTrialEligibility,
+  isPromoActive,
+  getTrialCreditsAmount,
+  TrialPolicyInput 
+} from './trialPolicyService';
 
 // ========================================
 // CONFIGURATION
 // ========================================
 
-// New accounts receive 15 free trial credits (was 1)
-const FREE_TRIAL_CREDITS = parseInt(process.env.FREE_TRIAL_CREDITS || '5', 10);
+// Legacy constant for backward compatibility - use trialPolicyService for new code
+const FREE_TRIAL_CREDITS = getTrialCreditsAmount();
 
 // ========================================
 // TYPES
@@ -392,7 +399,14 @@ export async function updateUserCredits(
 
 /**
  * Handle user.created webhook event
- * Now includes abuse prevention for free credits
+ * Uses trialPolicyService for centralized, abuse-resistant trial credit granting
+ * 
+ * Flow:
+ * 1. Sync user to database
+ * 2. Determine trial eligibility (user type, email verified, promo period)
+ * 3. Run abuse prevention checks (IP, fingerprint, disposable email)
+ * 4. Grant credits idempotently via trialPolicyService
+ * 5. Update Clerk metadata
  */
 export async function handleUserCreated(userData: ClerkUserData, signupInfo?: SignupInfo) {
   authLogger.info('Processing user.created event', { userId: userData.id });
@@ -400,85 +414,87 @@ export async function handleUserCreated(userData: ClerkUserData, signupInfo?: Si
   // Sync user to database
   const user = await syncUserToDatabase(userData);
 
-  // Grant 1 free credit to new user (if not already granted)
+  // Skip if already has credits or trial was already processed
   const existingCredits = (userData.public_metadata?.credits as number) || 0;
   
-  if (existingCredits === 0 && !userData.public_metadata?.freeTrialUsed) {
-    try {
-      // Check for abuse if signup info is provided
-      let allowFreeCredit = true;
-      let isSuspicious = false;
-      let suspicionReason: string | undefined;
+  if (existingCredits > 0 || userData.public_metadata?.freeTrialUsed) {
+    authLogger.info('Skipping trial grant: already processed', { 
+      userId: userData.id, 
+      existingCredits,
+      freeTrialUsed: userData.public_metadata?.freeTrialUsed 
+    });
+    return user;
+  }
 
-      if (signupInfo && (signupInfo.ipAddress || signupInfo.deviceFingerprint)) {
-        const abuseCheck = await checkSignupAbuse(signupInfo);
-        allowFreeCredit = abuseCheck.allowFreeCredit;
-        isSuspicious = abuseCheck.isSuspicious;
-        suspicionReason = abuseCheck.suspicionReason;
+  try {
+    // Determine user type from metadata (default to PERSONAL for B2C)
+    const userType = (userData.public_metadata?.userType as string) || 'PERSONAL';
+    
+    // Check if any email is verified
+    const hasVerifiedEmail = userData.email_addresses?.some(
+      (email: any) => email.verification?.status === 'verified'
+    ) ?? false;
 
-        if (!allowFreeCredit) {
-          authLogger.warn('Free credit blocked due to abuse detection', {
-            userId: userData.id,
-            reason: suspicionReason
-          });
+    // Build trial policy input
+    const trialInput: TrialPolicyInput = {
+      userId: user.id,
+      clerkId: userData.id,
+      email: userData.email_addresses?.[0]?.email_address || '',
+      emailVerified: hasVerifiedEmail,
+      userType,
+      signupInfo: signupInfo ? {
+        ...signupInfo,
+        email: userData.email_addresses?.[0]?.email_address || ''
+      } : undefined
+    };
+
+    // Use centralized trial policy service
+    const trialResult = await grantTrialCredits(trialInput);
+
+    if (trialResult.success && trialResult.creditsGranted > 0) {
+      // Update Clerk metadata with credits info
+      await clerkClient.users.updateUser(userData.id, {
+        publicMetadata: {
+          ...userData.public_metadata,
+          credits: trialResult.creditsGranted,
+          freeTrialUsed: true,
+          isPromoGrant: isPromoActive(),
+          registrationDate: new Date().toISOString()
         }
-      }
+      });
 
-      // Record signup info (even if we don't have fingerprint yet)
-      await recordSignup(
-        user.id,
-        signupInfo || {},
-        allowFreeCredit,
-        isSuspicious,
-        suspicionReason
-      );
-
-      if (allowFreeCredit) {
-        // Update Clerk with free credit
-        await clerkClient.users.updateUser(userData.id, {
-          publicMetadata: {
-            ...userData.public_metadata,
-            credits: FREE_TRIAL_CREDITS,
-            freeTrialUsed: true,
-            registrationDate: new Date().toISOString()
-          }
-        });
-
-        // Update local database
-        await prisma.user.update({
-          where: { clerkId: userData.id },
-          data: { credits: FREE_TRIAL_CREDITS }
-        });
-
-        // Initialize wallet with signup bonus (non-blocking)
-        try {
-          await initializeWalletWithBonus(user.id, FREE_TRIAL_CREDITS);
-          authLogger.info('Wallet initialized with signup bonus', { userId: userData.id, credits: FREE_TRIAL_CREDITS });
-        } catch (walletError: any) {
-          authLogger.warn('Failed to initialize wallet (non-critical)', { userId: userData.id, error: walletError.message });
-        }
-
-        authLogger.info('Free trial credit granted', { userId: userData.id, credits: FREE_TRIAL_CREDITS });
-      } else {
-        // Mark freeTrialUsed but don't grant credits
-        await clerkClient.users.updateUser(userData.id, {
-          publicMetadata: {
-            ...userData.public_metadata,
-            credits: 0,
-            freeTrialUsed: true, // Mark as used to prevent future attempts
-            freeCreditBlocked: true,
-            registrationDate: new Date().toISOString()
-          }
-        });
-
-        authLogger.info('Free trial blocked (abuse detected)', { userId: userData.id });
-      }
-    } catch (error: any) {
-      authLogger.error('Failed to process free trial credit', { 
+      authLogger.info('Trial credits granted via policy service', { 
         userId: userData.id, 
-        error: error.message 
+        credits: trialResult.creditsGranted,
+        isPromoActive: isPromoActive(),
+        ledgerEntryId: trialResult.ledgerEntryId
+      });
+    } else if (trialResult.eligibility === 'already_granted') {
+      authLogger.info('Trial already granted (idempotency)', { userId: userData.id });
+    } else {
+      // Mark as processed but blocked
+      await clerkClient.users.updateUser(userData.id, {
+        publicMetadata: {
+          ...userData.public_metadata,
+          credits: 0,
+          freeTrialUsed: true,
+          freeCreditBlocked: true,
+          blockReason: trialResult.eligibility,
+          registrationDate: new Date().toISOString()
+        }
+      });
+
+      authLogger.info('Trial blocked by policy', { 
+        userId: userData.id,
+        eligibility: trialResult.eligibility,
+        error: trialResult.error
       });
     }
+  } catch (error: any) {
+    authLogger.error('Failed to process trial credits', { 
+      userId: userData.id, 
+      error: error.message 
+    });
   }
 
   return user;
