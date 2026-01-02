@@ -75,9 +75,10 @@ export const createInterviewSchema = z.object({
   // The AI interviewer can still conduct meaningful interviews with less context
   jobDescription: z.string().min(50).max(50000).transform(val => val.trim()),
   language: z.string().max(10).optional().default('en-US'),
-  resumeData: z.string().optional(), // Base64 encoded
-  resumeFileName: z.string().max(255).optional(),
-  resumeMimeType: z.string().max(100).optional()
+  // Resume is required for all interviews - stored in Azure Blob, referenced by ID
+  resumeId: uuidSchema,
+  // Optional: filename for display purposes (fetched from ResumeDocument if not provided)
+  resumeFileName: z.string().max(255).optional()
 });
 
 export const updateInterviewSchema = z.object({

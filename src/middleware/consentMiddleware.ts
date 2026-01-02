@@ -13,6 +13,8 @@ const middlewareLogger = logger.child({ middleware: 'consent' });
 
 // Endpoints that don't require consent (allowlist)
 const CONSENT_EXEMPT_PATHS = [
+  // GraphQL endpoint (handled by GraphQL context auth)
+  '/graphql',
   // User validation and consent endpoints
   '/api/users/validate',
   '/api/consent',

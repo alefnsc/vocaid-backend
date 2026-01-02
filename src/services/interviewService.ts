@@ -17,9 +17,8 @@ interface CreateInterviewData {
   seniority?: string; // Candidate seniority: intern, junior, mid, senior, staff, principal
   companyName: string;
   jobDescription: string;
-  resumeData?: string;
-  resumeFileName?: string;
-  resumeMimeType?: string;
+  resumeId: string; // UUID reference to ResumeDocument (resume stored in Azure Blob)
+  resumeFileName?: string; // Optional: for display purposes
   language?: string; // Interview language code
 }
 
@@ -69,6 +68,16 @@ export async function createInterview(data: CreateInterviewData) {
     resolvedUserId = user.id;
   }
 
+  // Fetch resume details for filename if not provided
+  let resumeFileName = data.resumeFileName;
+  if (!resumeFileName && data.resumeId) {
+    const resume = await prisma.resumeDocument.findUnique({
+      where: { id: data.resumeId },
+      select: { fileName: true }
+    });
+    resumeFileName = resume?.fileName;
+  }
+
   const interview = await prisma.interview.create({
     data: {
       userId: resolvedUserId,
@@ -76,9 +85,8 @@ export async function createInterview(data: CreateInterviewData) {
       seniority: data.seniority || 'mid',
       companyName: data.companyName,
       jobDescription: data.jobDescription,
-      resumeData: data.resumeData,
-      resumeFileName: data.resumeFileName,
-      resumeMimeType: data.resumeMimeType,
+      resumeId: data.resumeId, // Foreign key to ResumeDocument
+      resumeFileName: resumeFileName,
       language: data.language || 'en-US',
       status: 'PENDING'
     }

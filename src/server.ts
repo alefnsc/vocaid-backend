@@ -25,6 +25,8 @@ import { spendCredits, restoreCredits } from './services/creditsWalletService';
 import { verifyMercadoPagoSignature, generateWebhookIdempotencyKey } from './services/webhookVerificationService';
 import { sendWelcomeEmail, sendPurchaseReceiptEmail, sendLowCreditsEmail, sendInterviewCompleteEmail, UserEmailData, PurchaseEmailData, LowCreditsData, InterviewCompleteData } from './services/transactionalEmailService';
 import { storeCallContext, cleanupExpiredContexts } from './services/callContextService';
+import { downloadResume } from './services/azureBlobService';
+import { prisma } from './services/databaseService';
 
 // Routes
 import apiRoutes from './routes/apiRoutes';
@@ -37,6 +39,9 @@ import dashboardRoutes from './routes/dashboardRoutes';
 
 // Middleware
 import { requireConsent } from './middleware/consentMiddleware';
+
+// GraphQL
+import { setupGraphQL } from './graphql';
 
 // Logger
 import logger, { wsLogger, retellLogger, feedbackLogger, paymentLogger, authLogger, httpLogger } from './utils/logger';
@@ -206,7 +211,7 @@ app.use(cors({
     callback(new Error('Not allowed by CORS'));
   },
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id', 'ngrok-skip-browser-warning', 'svix-id', 'svix-timestamp', 'svix-signature']
 }));
 
@@ -258,8 +263,9 @@ app.use('/api/consent', consentRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 
 // Mount resume repository routes (resume upload, scoring, LinkedIn import)
+// Use larger body limit for base64-encoded resume files (up to 10MB)
 import resumeRoutes from './routes/resumeRoutes';
-app.use('/api/resumes', resumeRoutes);
+app.use('/api/resumes', bodyParser.json({ limit: '10mb' }), resumeRoutes);
 
 // Mount beta feedback routes (closed beta bug reports & feature requests)
 import betaFeedbackRoutes from './routes/betaFeedbackRoutes';
@@ -268,10 +274,6 @@ app.use('/api/feedback/beta', betaFeedbackRoutes);
 // Mount user profile routes (B2C profile management)
 import userRoutes from './routes/userRoutes';
 app.use('/api/users', userRoutes);
-
-// Mount identity verification routes (Brazil KYC scaffold)
-import identityRoutes from './routes/identityRoutes';
-app.use('/api/identity', identityRoutes);
 
 // ===== CONSENT MIDDLEWARE =====
 // Apply consent checking to protected routes
@@ -376,6 +378,70 @@ app.post('/register-call',
     const { metadata } = req.body;
     const userId = (req as any).authenticatedUserId;
 
+    // Validate interview_id is provided (required for resume lookup)
+    if (!metadata.interview_id) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'interview_id is required in metadata'
+      });
+    }
+
+    // Fetch resume from Azure Blob Storage via Interview -> ResumeDocument -> storageKey
+    let intervieweeCV = '';
+    let resumeFileName = '';
+    let resumeMimeType = '';
+    
+    const interview = await prisma.interview.findUnique({
+      where: { id: metadata.interview_id },
+      include: {
+        resumeDocument: {
+          select: {
+            storageKey: true,
+            fileName: true,
+            mimeType: true
+          }
+        }
+      }
+    });
+
+    if (!interview) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Interview not found'
+      });
+    }
+
+    if (!interview.resumeDocument?.storageKey) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Interview has no associated resume. Please upload a resume first.'
+      });
+    }
+
+    // Download resume from Azure Blob Storage
+    const downloadResult = await downloadResume(interview.resumeDocument.storageKey);
+    if (!downloadResult.success || !downloadResult.data) {
+      retellLogger.error('Failed to download resume from Azure Blob', {
+        storageKey: interview.resumeDocument.storageKey,
+        error: downloadResult.error
+      });
+      return res.status(503).json({
+        status: 'error',
+        message: 'Failed to retrieve resume. Please try again.'
+      });
+    }
+
+    // Convert Buffer to base64 for storage in call context
+    intervieweeCV = downloadResult.data.toString('base64');
+    resumeFileName = interview.resumeDocument.fileName;
+    resumeMimeType = interview.resumeDocument.mimeType || 'application/pdf';
+
+    retellLogger.info('Resume fetched from Azure Blob for interview', {
+      interviewId: metadata.interview_id,
+      resumeSize: downloadResult.data.length,
+      fileName: resumeFileName
+    });
+
     // Sanitize metadata strings
     const sanitizedMetadata = {
       ...metadata,
@@ -384,7 +450,6 @@ app.post('/register-call',
       company_name: sanitizeString(metadata.company_name || ''),
       job_title: sanitizeString(metadata.job_title || ''),
       job_description: sanitizeString(metadata.job_description || ''),
-      interviewee_cv: sanitizeString(metadata.interviewee_cv || ''),
     };
 
     const result = await retellService.registerCall({ metadata: sanitizedMetadata }, userId);
@@ -399,13 +464,14 @@ app.post('/register-call',
         job_title: sanitizedMetadata.job_title,
         company_name: sanitizedMetadata.company_name,
         job_description: sanitizedMetadata.job_description,
-        interviewee_cv: sanitizedMetadata.interviewee_cv,
-        resume_file_name: sanitizedMetadata.resume_file_name,
-        resume_mime_type: sanitizedMetadata.resume_mime_type,
+        interviewee_cv: intervieweeCV, // Base64 from Azure Blob
+        resume_file_name: resumeFileName,
+        resume_mime_type: resumeMimeType,
       });
       retellLogger.info('Call context stored for Custom LLM', {
         callId: result.call_id,
         preferredLanguage: sanitizedMetadata.preferred_language || 'en-US',
+        hasResume: true
       });
     }
     
@@ -847,6 +913,266 @@ app.get('/webhook/paypal', (req: Request, res: Response) => {
     status: 'ok',
     message: 'PayPal webhook endpoint',
     url: `${process.env.WEBHOOK_BASE_URL}/webhook/paypal`
+  });
+});
+
+// ========================================
+// UNIFIED PAYMENT WEBHOOK ENDPOINT
+// ========================================
+
+/**
+ * Unified payment webhook handler
+ * POST /webhook/payment
+ * Routes webhooks to the appropriate payment provider (MercadoPago or PayPal)
+ * This is the webhook URL set in payment creation
+ */
+app.post('/webhook/payment',
+  webhookLimiter,
+  async (req: Request, res: Response) => {
+  try {
+    const payload = req.body;
+    const query = req.query;
+    const headers = req.headers as Record<string, string>;
+    
+    // Detect provider based on payload/query structure
+    let provider: 'mercadopago' | 'paypal' | null = null;
+    
+    // MercadoPago detection
+    if (query.topic || query.id || payload?.type === 'payment' || payload?.action) {
+      provider = 'mercadopago';
+    }
+    // PayPal detection  
+    else if (payload?.event_type || payload?.resource_type) {
+      provider = 'paypal';
+    }
+    
+    if (!provider) {
+      paymentLogger.warn('Could not detect payment provider from webhook', {
+        hasBody: !!payload,
+        hasQuery: !!Object.keys(query).length,
+        bodyKeys: Object.keys(payload || {}),
+        queryKeys: Object.keys(query || {})
+      });
+      return res.status(400).json({ status: 'error', message: 'Could not detect payment provider' });
+    }
+    
+    paymentLogger.info('Unified webhook received', { 
+      provider,
+      queryParams: query,
+      bodyKeys: Object.keys(payload || {})
+    });
+    
+    // Route to appropriate provider webhook
+    if (provider === 'mercadopago') {
+      // MercadoPago sends data in both query params (IPN) and body (webhook)
+      // Merge both sources, with query params taking precedence for IPN
+      const webhookData = {
+        ...payload,
+        // Query params override body for IPN format
+        ...(query.topic && { topic: query.topic }),
+        ...(query.id && { id: query.id }),
+        // Handle data.id from body
+        ...(payload?.data?.id && { data: { id: payload.data.id } }),
+      };
+      
+      const dataId = webhookData?.data?.id || webhookData?.id || '';
+      const topic = webhookData?.topic || '';
+
+      paymentLogger.info('Routing to MercadoPago webhook handler', { 
+        type: webhookData?.type,
+        action: webhookData?.action,
+        dataId,
+        topic,
+        hasQueryId: !!query.id,
+        hasBodyDataId: !!payload?.data?.id,
+      });
+
+      // Handle merchant_order topic - acknowledge but don't process
+      if (topic === 'merchant_order' || webhookData?.resource?.includes('merchant_orders')) {
+        paymentLogger.info('Merchant order notification - acknowledged', { topic });
+        return res.status(200).json({ 
+          status: 'acknowledged', 
+          message: 'Merchant order notification received' 
+        });
+      }
+
+      // Skip if no payment ID found
+      if (!dataId) {
+        paymentLogger.warn('No payment ID found in MercadoPago webhook', { 
+          query, 
+          bodyKeys: Object.keys(payload || {}) 
+        });
+        return res.status(200).json({ 
+          status: 'error', 
+          message: 'No payment ID found' 
+        });
+      }
+
+      // Verify webhook signature if secret is configured
+      if (dataId && process.env.MERCADOPAGO_WEBHOOK_SECRET) {
+        const verification = verifyMercadoPagoSignature(headers, dataId);
+        if (!verification.valid) {
+          paymentLogger.warn('MercadoPago webhook signature verification failed', { 
+            error: verification.error,
+            dataId 
+          });
+          return res.status(200).json({ 
+            status: 'rejected', 
+            message: 'Signature verification failed' 
+          });
+        }
+      }
+
+      // Process payment webhook
+      const gateway = getPaymentGateway();
+      const mercadoPagoProvider = gateway.getProvider('mercadopago');
+      
+      const result = await mercadoPagoProvider.handleWebhook(webhookData, headers);
+      
+      if (result.success && result.creditsToAdd && result.userId) {
+        const { PrismaClient } = await import('@prisma/client');
+        const prisma = new PrismaClient();
+        
+        const user = await prisma.user.findUnique({
+          where: { clerkId: result.userId }
+        });
+        
+        if (user) {
+          await addPurchasedCredits(
+            user.id,
+            result.creditsToAdd,
+            result.paymentId,
+            'Mercado Pago Purchase'
+          );
+          paymentLogger.info('✅ Credits added via unified webhook (MercadoPago)', {
+            userId: user.id,
+            credits: result.creditsToAdd,
+            paymentId: result.paymentId,
+          });
+
+          // Send purchase receipt email (non-blocking)
+          const updatedUser = await prisma.user.findUnique({ where: { id: user.id } });
+          const newBalance = updatedUser?.credits ?? 0;
+
+          if (user.email) {
+            const purchaseData: PurchaseEmailData = {
+              user: {
+                id: user.id,
+                clerkId: user.clerkId,
+                email: user.email,
+                firstName: user.firstName,
+                lastName: user.lastName,
+                preferredLanguage: user.preferredLanguage
+              },
+              paymentId: result.paymentId,
+              provider: 'mercadopago',
+              packageName: `${result.creditsToAdd} Credits`,
+              creditsAmount: result.creditsToAdd,
+              amountPaid: 0,
+              currency: 'BRL',
+              newBalance,
+              paidAt: new Date()
+            };
+
+            sendPurchaseReceiptEmail(purchaseData).catch(err => {
+              paymentLogger.error('Purchase receipt email error (non-blocking)', { 
+                error: err.message 
+              });
+            });
+          }
+        }
+        
+        await prisma.$disconnect();
+      }
+      
+      return res.status(200).json({ status: 'success', result });
+      
+    } else if (provider === 'paypal') {
+      // Forward to PayPal webhook handler logic
+      paymentLogger.info('Routing to PayPal webhook handler', {
+        eventType: payload.event_type,
+      });
+
+      const gateway = getPaymentGateway();
+      const paypalProvider = gateway.getProvider('paypal');
+      
+      const result = await paypalProvider.handleWebhook(payload, headers);
+      
+      if (result.success && result.creditsToAdd && result.userId) {
+        const { PrismaClient } = await import('@prisma/client');
+        const prisma = new PrismaClient();
+        
+        const user = await prisma.user.findUnique({
+          where: { clerkId: result.userId }
+        });
+        
+        if (user) {
+          await addPurchasedCredits(
+            user.id,
+            result.creditsToAdd,
+            result.paymentId,
+            'PayPal Purchase'
+          );
+          paymentLogger.info('✅ Credits added via unified webhook (PayPal)', {
+            userId: user.id,
+            credits: result.creditsToAdd,
+            paymentId: result.paymentId,
+          });
+
+          // Send purchase receipt email (non-blocking)
+          const updatedUser = await prisma.user.findUnique({ where: { id: user.id } });
+          const newBalance = updatedUser?.credits ?? 0;
+
+          if (user.email) {
+            const purchaseData: PurchaseEmailData = {
+              user: {
+                id: user.id,
+                clerkId: user.clerkId,
+                email: user.email,
+                firstName: user.firstName,
+                lastName: user.lastName,
+                preferredLanguage: user.preferredLanguage
+              },
+              paymentId: result.paymentId,
+              provider: 'paypal',
+              packageName: `${result.creditsToAdd} Credits`,
+              creditsAmount: result.creditsToAdd,
+              amountPaid: 0,
+              currency: 'USD',
+              newBalance,
+              paidAt: new Date()
+            };
+
+            sendPurchaseReceiptEmail(purchaseData).catch(err => {
+              paymentLogger.error('Purchase receipt email error (non-blocking)', { 
+                error: err.message 
+              });
+            });
+          }
+        }
+        
+        await prisma.$disconnect();
+      }
+      
+      return res.status(200).json({ status: 'success', result });
+    }
+    
+  } catch (error: any) {
+    paymentLogger.error('Error in unified /webhook/payment', { error: error.message, stack: error.stack });
+    return res.status(200).json({ status: 'error', message: error.message });
+  }
+});
+
+/**
+ * Get unified webhook info
+ * GET /webhook/payment
+ */
+app.get('/webhook/payment', (req: Request, res: Response) => {
+  res.json({
+    status: 'ok',
+    message: 'Unified payment webhook endpoint',
+    url: `${process.env.WEBHOOK_BASE_URL}/webhook/payment`,
+    providers: ['mercadopago', 'paypal']
   });
 });
 
@@ -1761,7 +2087,14 @@ app.use((err: Error & { status?: number; statusCode?: number }, req: Request, re
 
 // ===== APPLY EXPRESS-WS TO APP =====
 
-const { app: wsApp, getWss } = expressWs(app);
+// Import http for shared server with GraphQL
+import http from 'http';
+
+// Create HTTP server for both Express, WebSocket, and GraphQL
+const httpServer = http.createServer(app);
+
+// Apply express-ws with shared HTTP server
+const { app: wsApp, getWss } = expressWs(app, httpServer);
 
 // ===== WEBSOCKET ENDPOINT FOR CUSTOM LLM =====
 // Handle multiple URL patterns for flexibility:
@@ -1837,30 +2170,44 @@ logger.info('WebSocket endpoints initialized', {
   pattern2: '/llm-websocket/:placeholder/:actual_call_id'
 });
 
-// ===== START SERVER =====
+// ===== START SERVER WITH GRAPHQL =====
 
-wsApp.listen(PORT, () => {
-  logger.info('═'.repeat(60));
-  logger.info('🎙️  Vocaid Backend Server Running');
-  logger.info('═'.repeat(60));
-  logger.info(`Port: ${PORT}`);
-  logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
-  logger.info('Endpoints:', {
-    http: `http://localhost:${PORT}`,
-    websocket: `ws://localhost:${PORT}/llm-websocket`,
-    health: `http://localhost:${PORT}/health`
-  });
-  logger.info('Services: Retell Custom LLM, Mercado Pago, OpenAI, Clerk');
-  logger.info(`Custom LLM WebSocket URL: ${retellService.getCustomLLMWebSocketUrl()}`);
-  logger.info(`Webhook URL: ${process.env.WEBHOOK_BASE_URL}/webhook/mercadopago`);
-  logger.info(`Log Level: ${process.env.LOG_LEVEL || 'info'}`);
-  logger.info('═'.repeat(60));
-  
-  // Periodic cleanup of expired call contexts (every 30 minutes)
-  setInterval(() => {
-    cleanupExpiredContexts();
-  }, 30 * 60 * 1000);
-});
+// Start server with async initialization for GraphQL
+(async () => {
+  try {
+    // Initialize GraphQL before starting the server
+    await setupGraphQL(app, httpServer);
+    logger.info('GraphQL server initialized');
+
+    // Start listening
+    httpServer.listen(PORT, () => {
+      logger.info('═'.repeat(60));
+      logger.info('🎙️  Vocaid Backend Server Running');
+      logger.info('═'.repeat(60));
+      logger.info(`Port: ${PORT}`);
+      logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
+      logger.info('Endpoints:', {
+        http: `http://localhost:${PORT}`,
+        graphql: `http://localhost:${PORT}/graphql`,
+        websocket: `ws://localhost:${PORT}/llm-websocket`,
+        health: `http://localhost:${PORT}/health`
+      });
+      logger.info('Services: Retell Custom LLM, Mercado Pago, OpenAI, Clerk, GraphQL');
+      logger.info(`Custom LLM WebSocket URL: ${retellService.getCustomLLMWebSocketUrl()}`);
+      logger.info(`Webhook URL: ${process.env.WEBHOOK_BASE_URL}/webhook/mercadopago`);
+      logger.info(`Log Level: ${process.env.LOG_LEVEL || 'info'}`);
+      logger.info('═'.repeat(60));
+      
+      // Periodic cleanup of expired call contexts (every 30 minutes)
+      setInterval(() => {
+        cleanupExpiredContexts();
+      }, 30 * 60 * 1000);
+    });
+  } catch (error) {
+    logger.error('Failed to start server', { error });
+    process.exit(1);
+  }
+})();
 
 // Graceful shutdown handler
 const gracefulShutdown = async (signal: string) => {

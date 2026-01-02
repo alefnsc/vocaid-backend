@@ -42,10 +42,30 @@ services:
     profiles:
       - tools
 
+  # Azurite - Azure Blob Storage Emulator for local development
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    container_name: Vocaid-azurite
+    restart: unless-stopped
+    ports:
+      - "10000:10000"  # Blob service
+      - "10001:10001"  # Queue service
+      - "10002:10002"  # Table service
+    volumes:
+      - azurite_data:/data
+    command: "azurite --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0 --location /data --debug /data/debug.log"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "10000"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   postgres_data:
     driver: local
   pgadmin_data:
+    driver: local
+  azurite_data:
     driver: local
 
 networks:

@@ -1,0 +1,328 @@
+# ========================================
+# VOCAID GRAPHQL SCHEMA
+# Unified API for Dashboard, Interviews, and Analytics
+# ========================================
+
+# ----------------------------------------
+# SCALARS
+# ----------------------------------------
+scalar DateTime
+scalar JSON
+
+# ----------------------------------------
+# ENUMS
+# ----------------------------------------
+enum InterviewStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum EmailSendStatus {
+  PENDING
+  SENDING
+  SENT
+  FAILED
+  SKIPPED
+}
+
+# ----------------------------------------
+# INPUT TYPES
+# ----------------------------------------
+input DashboardFilters {
+  startDate: DateTime
+  endDate: DateTime
+  roleTitle: String
+  seniority: String
+  resumeId: String
+  limit: Int
+}
+
+input InterviewFilters {
+  status: InterviewStatus
+  roleTitle: String
+  seniority: String
+  companyName: String
+}
+
+input PaginationInput {
+  page: Int
+  limit: Int
+}
+
+# ----------------------------------------
+# DASHBOARD TYPES
+# ----------------------------------------
+type DashboardKPIs {
+  totalInterviews: Int!
+  completedInterviews: Int!
+  averageScore: Float
+  scoreChange: Float
+  averageDurationMinutes: Float
+  totalSpent: Float!
+  creditsRemaining: Int!
+  interviewsThisMonth: Int!
+  passRate: Float
+}
+
+type ScoreEvolutionPoint {
+  date: String!
+  score: Float!
+  roleTitle: String!
+  seniority: String
+}
+
+type RecentInterview {
+  id: String!
+  date: String!
+  roleTitle: String!
+  companyName: String!
+  seniority: String
+  resumeTitle: String
+  resumeId: String
+  durationMinutes: Float
+  score: Float
+  status: String!
+}
+
+type ResumeUtilization {
+  id: String!
+  title: String!
+  fileName: String!
+  createdAt: String!
+  lastUsedAt: String
+  interviewCount: Int!
+  filteredInterviewCount: Int!
+  isPrimary: Boolean!
+  qualityScore: Float
+}
+
+type ResumeOption {
+  id: String!
+  title: String!
+}
+
+type FilterOptions {
+  roleTitles: [String!]!
+  seniorities: [String!]!
+  resumes: [ResumeOption!]!
+}
+
+type AppliedFilters {
+  startDate: String
+  endDate: String
+  roleTitle: String
+  seniority: String
+  resumeId: String
+}
+
+type DashboardData {
+  kpis: DashboardKPIs!
+  scoreEvolution: [ScoreEvolutionPoint!]!
+  recentInterviews: [RecentInterview!]!
+  resumes: [ResumeUtilization!]!
+  filterOptions: FilterOptions!
+  filters: AppliedFilters!
+}
+
+type UserSummary {
+  id: String!
+  email: String!
+  firstName: String
+  lastName: String
+  credits: Int!
+  preferredLanguage: String
+}
+
+# ----------------------------------------
+# INTERVIEW TYPES
+# ----------------------------------------
+type Interview {
+  id: String!
+  jobTitle: String!
+  companyName: String!
+  jobDescription: String!
+  seniority: String
+  language: String
+  status: InterviewStatus!
+  score: Float
+  callDuration: Int
+  transcript: String
+  feedbackText: String
+  startedAt: DateTime
+  endedAt: DateTime
+  createdAt: DateTime!
+  updatedAt: DateTime!
+}
+
+type InterviewListItem {
+  id: String!
+  jobTitle: String!
+  companyName: String!
+  status: InterviewStatus!
+  score: Float
+  callDuration: Int
+  createdAt: DateTime!
+  endedAt: DateTime
+}
+
+type InterviewsListResponse {
+  interviews: [InterviewListItem!]!
+  total: Int!
+  page: Int!
+  limit: Int!
+  hasMore: Boolean!
+}
+
+# ----------------------------------------
+# ANALYTICS TYPES
+# ----------------------------------------
+type TimelineDataPoint {
+  timestamp: Float!
+  confidence: Float!
+  tone: String
+  pace: String
+}
+
+type SoftSkillScore {
+  name: String!
+  score: Float!
+  maxScore: Float!
+  feedback: String
+}
+
+type SoftSkillsData {
+  skills: [SoftSkillScore!]!
+  overallCommunication: Float
+  overallTechnical: Float
+}
+
+type TranscriptSegment {
+  id: String!
+  speaker: String!
+  content: String!
+  startTime: Float!
+  endTime: Float!
+  sentimentScore: Float
+  segmentIndex: Int!
+}
+
+type AnalyticsData {
+  timelineData: [TimelineDataPoint!]
+  softSkills: SoftSkillsData
+  callDuration: Int
+  wpmAverage: Float
+  sentimentScore: Float
+}
+
+# ----------------------------------------
+# BENCHMARK TYPES
+# ----------------------------------------
+type SkillComparison {
+  user: Float!
+  average: Float!
+}
+
+type BenchmarkBreakdown {
+  communication: SkillComparison
+  problemSolving: SkillComparison
+  technicalDepth: SkillComparison
+  leadership: SkillComparison
+  adaptability: SkillComparison
+}
+
+type BenchmarkData {
+  userScore: Float!
+  globalAverage: Float!
+  percentile: Float!
+  roleTitle: String!
+  totalCandidates: Int!
+  breakdown: BenchmarkBreakdown
+}
+
+type BenchmarkResponse {
+  hasData: Boolean!
+  message: String
+  data: BenchmarkData
+}
+
+# ----------------------------------------
+# LEARNING PATH TYPES
+# ----------------------------------------
+type StudyTopic {
+  topic: String!
+  priority: String!
+  reason: String!
+  resources: [String!]
+}
+
+type WeakArea {
+  area: String!
+  score: Float!
+  suggestion: String!
+}
+
+type LearningPathData {
+  topics: [StudyTopic!]!
+  weakAreas: [WeakArea!]!
+  generatedAt: DateTime
+}
+
+# ----------------------------------------
+# INTERVIEW DETAILS RESPONSE
+# Unified response for InterviewDetails page
+# ----------------------------------------
+type InterviewDetailsResponse {
+  interview: Interview!
+  analytics: AnalyticsData
+  transcript: [TranscriptSegment!]
+  benchmark: BenchmarkResponse
+  recommendations: LearningPathData
+}
+
+# ----------------------------------------
+# QUERIES
+# ----------------------------------------
+type Query {
+  """
+  Get dashboard data for the authenticated user
+  Replaces: GET /api/dashboard/candidate
+  """
+  dashboardData(filters: DashboardFilters): DashboardData!
+
+  """
+  Get paginated list of interviews for the authenticated user
+  Replaces: GET /api/interviews
+  """
+  interviews(pagination: PaginationInput, filters: InterviewFilters): InterviewsListResponse!
+
+  """
+  Get complete interview details with analytics, transcript, benchmark, and recommendations
+  Replaces: 4 separate API calls in InterviewDetails page
+  """
+  interviewDetails(id: ID!): InterviewDetailsResponse
+
+  """
+  Get benchmark data for a specific role
+  Supports insufficient data fallback
+  Replaces: GET /api/benchmarks/:roleTitle
+  """
+  benchmarkByRole(roleTitle: String!, userScore: Float): BenchmarkResponse!
+
+  """
+  Get current user info
+  """
+  me: UserSummary
+}
+
+# ----------------------------------------
+# MUTATIONS (Future expansion)
+# ----------------------------------------
+type Mutation {
+  """
+  Refresh dashboard data (invalidate cache)
+  """
+  refreshDashboard: DashboardData!
+}

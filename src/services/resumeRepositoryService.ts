@@ -16,6 +16,7 @@
 
 import logger from '../utils/logger';
 import { PrismaClient } from '@prisma/client';
+import { uploadResume, downloadResume, deleteResume } from './azureBlobService';
 
 const prisma = new PrismaClient();
 
@@ -34,7 +35,7 @@ export interface ResumeDocument {
   fileName: string;
   mimeType: string;
   fileSize: number;
-  base64Data: string;
+  storageKey: string;  // Azure Blob Storage key
   
   // Metadata
   title: string;
@@ -97,7 +98,7 @@ export interface ResumeMetadata {
 export interface CreateResumeInput {
   fileName: string;
   mimeType: string;
-  base64Data: string;
+  base64Data: string;  // Input still receives base64, we upload to Azure and store storageKey
   title?: string;
   description?: string;
   tags?: string[];
@@ -232,14 +233,26 @@ export async function createResume(
     // Calculate file size
     const fileSize = calculateFileSize(input.base64Data);
     
-    // Create the resume document
+    // Upload to Azure Blob Storage
+    const fileBuffer = Buffer.from(input.base64Data, 'base64');
+    const uploadResult = await uploadResume(user.id, input.fileName, fileBuffer, input.mimeType);
+    
+    if (!uploadResult.success || !uploadResult.blobName) {
+      resumeLogger.error('Failed to upload resume to Azure Blob', {
+        userId,
+        error: uploadResult.error
+      });
+      return null;
+    }
+    
+    // Create the resume document with storageKey
     const resume = await prisma.resumeDocument?.create({
       data: {
         userId: user.id,
         fileName: input.fileName,
         mimeType: input.mimeType,
         fileSize,
-        base64Data: input.base64Data,
+        storageKey: uploadResult.blobName,
         title: input.title || input.fileName.replace(/\.[^/.]+$/, ''),
         description: input.description,
         tags: input.tags || [],
@@ -351,7 +364,7 @@ export async function getResumeById(
         fileName: true,
         mimeType: true,
         fileSize: true,
-        base64Data: includeData,
+        storageKey: true,
         title: true,
         description: true,
         tags: true,
@@ -402,7 +415,7 @@ export async function getPrimaryResume(
         fileName: true,
         mimeType: true,
         fileSize: true,
-        base64Data: includeData,
+        storageKey: true,
         title: true,
         description: true,
         tags: true,
@@ -516,8 +529,24 @@ export async function createResumeVersion(
       data: { isLatest: false }
     });
     
-    // Create new version
+    // Create new version - upload to Azure Blob Storage
     const fileSize = calculateFileSize(newFileData.base64Data);
+    const fileBuffer = Buffer.from(newFileData.base64Data, 'base64');
+    const uploadResult = await uploadResume(user.id, newFileData.fileName, fileBuffer, newFileData.mimeType);
+    
+    if (!uploadResult.success || !uploadResult.blobName) {
+      resumeLogger.error('Failed to upload resume version to Azure Blob', {
+        userId,
+        resumeId,
+        error: uploadResult.error
+      });
+      // Revert the isLatest change
+      await prisma.resumeDocument?.update({
+        where: { id: resumeId },
+        data: { isLatest: true }
+      });
+      return null;
+    }
     
     const newVersion = await prisma.resumeDocument?.create({
       data: {
@@ -525,7 +554,7 @@ export async function createResumeVersion(
         fileName: newFileData.fileName,
         mimeType: newFileData.mimeType,
         fileSize,
-        base64Data: newFileData.base64Data,
+        storageKey: uploadResult.blobName,
         title: (currentResume as any).title,
         description: (currentResume as any).description,
         tags: (currentResume as any).tags || [],

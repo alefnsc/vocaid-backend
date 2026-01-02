@@ -15,7 +15,7 @@ import { updateUserMetadata } from '../services/clerkService';
 import { sendFeedbackEmail, sendAutomatedFeedbackEmail, shouldSendAutomatedEmail } from '../services/emailService';
 import * as resumeRepositoryService from '../services/resumeRepositoryService';
 import * as recordingPlaybackService from '../services/recordingPlaybackService';
-import { dbLogger } from '../services/databaseService';
+import { dbLogger, prisma } from '../services/databaseService';
 import { apiLogger } from '../utils/logger';
 
 // Schemas
@@ -1354,7 +1354,91 @@ router.get(
   }
 );
 
-// Get benchmark data for role comparison
+// Get benchmark data by role title (standalone endpoint)
+// Used by InterviewDetails page for role comparison
+router.get(
+  '/benchmarks/:roleTitle',
+  requireAuth,
+  async (req: Request, res: Response) => {
+    try {
+      const { roleTitle } = req.params;
+      const { userScore } = req.query;
+      
+      if (!roleTitle) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Role title is required'
+        });
+      }
+      
+      const decodedRoleTitle = decodeURIComponent(roleTitle);
+      const score = userScore ? parseFloat(userScore as string) : 0;
+      
+      // Look up benchmark data directly by role title
+      const normalizedRole = decodedRoleTitle.toLowerCase().trim();
+      const benchmark = await prisma.rolePerformanceBenchmark.findUnique({
+        where: { roleTitle: normalizedRole },
+      });
+      
+      if (!benchmark) {
+        // Return fallback response when no benchmark exists
+        return res.json({
+          status: 'success',
+          data: {
+            hasData: false,
+            roleTitle: decodedRoleTitle,
+            message: `No benchmark data available for ${decodedRoleTitle} yet. Complete more interviews to contribute!`,
+            sampleSize: 0,
+            avgScore: null,
+            p25Score: null,
+            medianScore: null,
+            p75Score: null,
+            topScore: null,
+            yourPercentile: null,
+          }
+        });
+      }
+      
+      // Calculate user percentile if score provided
+      let yourPercentile = null;
+      if (score > 0 && benchmark.sampleSize >= 3) {
+        if (score >= benchmark.p90Score) yourPercentile = 95;
+        else if (score >= benchmark.p75Score) yourPercentile = 87.5;
+        else if (score >= benchmark.medianScore) yourPercentile = 62.5;
+        else if (score >= benchmark.p25Score) yourPercentile = 37.5;
+        else if (score >= benchmark.p10Score) yourPercentile = 17.5;
+        else yourPercentile = 5;
+      }
+      
+      res.json({
+        status: 'success',
+        data: {
+          hasData: true,
+          roleTitle: benchmark.roleTitle,
+          sampleSize: benchmark.sampleSize,
+          avgScore: benchmark.avgScore,
+          p25Score: benchmark.p25Score,
+          medianScore: benchmark.medianScore,
+          p75Score: benchmark.p75Score,
+          topScore: benchmark.maxScore,
+          yourPercentile,
+          lastUpdated: benchmark.updatedAt,
+        }
+      });
+    } catch (error: any) {
+      dbLogger.error('Error fetching benchmark by role', { 
+        error: error.message,
+        roleTitle: req.params.roleTitle 
+      });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to fetch benchmark data'
+      });
+    }
+  }
+);
+
+// Get benchmark data for role comparison (by interview)
 router.get(
   '/interviews/:interviewId/benchmark',
   requireAuth,

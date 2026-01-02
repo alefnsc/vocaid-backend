@@ -21,8 +21,8 @@ export const MARKETING_CONSENT_VERSION = '2025-12-23';
 
 // URLs for legal documents (used in frontend consent UI)
 export const LEGAL_DOCUMENT_URLS = {
-  termsOfUse: '/legal/terms',
-  privacyPolicy: '/legal/privacy',
+  termsOfUse: '/terms-of-use',
+  privacyPolicy: '/privacy-policy',
 } as const;
 
 // Consent requirements configuration

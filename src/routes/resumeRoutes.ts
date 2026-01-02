@@ -20,6 +20,7 @@ import { z } from 'zod';
 import { PrismaClient, ResumeSource } from '@prisma/client';
 import logger from '../utils/logger';
 import { scoreResume, getResumeScores } from '../services/resumeScoringService';
+import { uploadResume, downloadResume, deleteResume, isAzureBlobEnabled } from '../services/azureBlobService';
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -229,14 +230,29 @@ router.post('/upload', requireAuth, async (req: Request, res: Response) => {
       });
     }
     
-    // Create resume
+    // Upload to Azure Blob Storage
+    const fileBuffer = Buffer.from(base64Data, 'base64');
+    const uploadResult = await uploadResume(userId, fileName, fileBuffer, mimeType);
+    
+    if (!uploadResult.success || !uploadResult.blobName) {
+      resumeLogger.error('Failed to upload resume to Azure Blob Storage', {
+        userId: clerkId.slice(0, 12),
+        error: uploadResult.error
+      });
+      return res.status(500).json({
+        status: 'error',
+        message: 'Failed to upload resume to storage'
+      });
+    }
+    
+    // Create resume with storageKey (no base64Data in DB)
     const resume = await prisma.resumeDocument.create({
       data: {
         userId,
         fileName,
         mimeType,
         fileSize,
-        base64Data,
+        storageKey: uploadResult.blobName,
         source: 'UPLOAD' as ResumeSource,
         title: title || fileName.replace(/\.[^/.]+$/, ''),
         description,
@@ -381,7 +397,7 @@ router.get('/:id/download', requireAuth, async (req: Request, res: Response) => 
       select: {
         fileName: true,
         mimeType: true,
-        base64Data: true
+        storageKey: true
       }
     });
     
@@ -392,14 +408,32 @@ router.get('/:id/download', requireAuth, async (req: Request, res: Response) => 
       });
     }
     
-    // Decode base64 and send file
-    const fileBuffer = Buffer.from(resume.base64Data, 'base64');
+    if (!resume.storageKey) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Resume file not found in storage'
+      });
+    }
+    
+    // Download from Azure Blob Storage
+    const downloadResult = await downloadResume(resume.storageKey);
+    
+    if (!downloadResult.success || !downloadResult.data) {
+      resumeLogger.error('Failed to download resume from Azure Blob', {
+        storageKey: resume.storageKey,
+        error: downloadResult.error
+      });
+      return res.status(500).json({
+        status: 'error',
+        message: 'Failed to retrieve resume file'
+      });
+    }
     
     res.setHeader('Content-Type', resume.mimeType);
     res.setHeader('Content-Disposition', `attachment; filename="${resume.fileName}"`);
-    res.setHeader('Content-Length', fileBuffer.length);
+    res.setHeader('Content-Length', downloadResult.data.length);
     
-    return res.send(fileBuffer);
+    return res.send(downloadResult.data);
   } catch (error: any) {
     resumeLogger.error('Failed to download resume', { error: error.message });
     return res.status(500).json({
@@ -502,9 +536,10 @@ router.delete('/:id', requireAuth, async (req: Request, res: Response) => {
       });
     }
     
-    // Check ownership
+    // Check ownership and get storageKey for blob deletion
     const existing = await prisma.resumeDocument.findFirst({
-      where: { id, userId, isActive: true }
+      where: { id, userId, isActive: true },
+      select: { id: true, storageKey: true }
     });
     
     if (!existing) {
@@ -514,7 +549,18 @@ router.delete('/:id', requireAuth, async (req: Request, res: Response) => {
       });
     }
     
-    // Soft delete
+    // Delete from Azure Blob Storage
+    if (existing.storageKey) {
+      const deleted = await deleteResume(existing.storageKey);
+      if (!deleted) {
+        resumeLogger.warn('Failed to delete resume from Azure Blob', {
+          resumeId: id.slice(0, 8),
+          storageKey: existing.storageKey
+        });
+      }
+    }
+    
+    // Soft delete in database
     await prisma.resumeDocument.update({
       where: { id },
       data: { isActive: false }
@@ -688,17 +734,31 @@ router.post('/linkedin', requireAuth, async (req: Request, res: Response) => {
     
     // Generate JSON content from profile data
     const jsonContent = JSON.stringify(profileData, null, 2);
-    const base64Data = Buffer.from(jsonContent).toString('base64');
+    const fileBuffer = Buffer.from(jsonContent, 'utf-8');
     const fileName = `LinkedIn Import - ${new Date().toISOString().split('T')[0]}.json`;
     
-    // Create resume
+    // Upload to Azure Blob Storage
+    const uploadResult = await uploadResume(userId, fileName, fileBuffer, 'application/json');
+    
+    if (!uploadResult.success || !uploadResult.blobName) {
+      resumeLogger.error('Failed to upload LinkedIn resume to Azure Blob', {
+        userId: clerkId.slice(0, 12),
+        error: uploadResult.error
+      });
+      return res.status(500).json({
+        status: 'error',
+        message: 'Failed to upload LinkedIn resume to storage'
+      });
+    }
+    
+    // Create resume with storageKey
     const resume = await prisma.resumeDocument.create({
       data: {
         userId,
         fileName,
         mimeType: 'application/json',
         fileSize: jsonContent.length,
-        base64Data,
+        storageKey: uploadResult.blobName,
         source: 'LINKEDIN' as ResumeSource,
         title: title || `LinkedIn Profile - ${profileData.name || 'Import'}`,
         linkedInProfileUrl: profileData.profileUrl,

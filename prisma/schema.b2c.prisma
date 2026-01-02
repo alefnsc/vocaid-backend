@@ -378,10 +378,11 @@ model Interview {
   voiceId         String?          @map("voice_id") @db.VarChar(100)
   resumeScoreAtSession Int?        @map("resume_score_at_session")
   
-  // Resume: Referenced via resumeId foreign key to ResumeDocument
-  // Resume content is stored in Azure Blob, accessed via ResumeDocument.storageKey
-  resumeId        String           @map("resume_id") @db.Uuid
-  resumeFileName  String?          @map("resume_file_name") // Cached for display purposes
+  // Resume: Azure Blob Storage key instead of base64
+  resumeStorageKey String?         @map("resume_storage_key") @db.VarChar(500)
+  resumeFileName  String?          @map("resume_file_name")
+  resumeMimeType  String?          @map("resume_mime_type")
+  resumeId        String?          @map("resume_id") @db.Uuid
   
   status          InterviewStatus  @default(PENDING)
   score           Float?           @db.DoublePrecision

@@ -20,12 +20,15 @@ import { apiLogger } from '../utils/logger';
 // CONFIGURATION
 // ============================================
 
-const config = {
-  connectionString: process.env.AZURE_STORAGE_CONNECTION_STRING || '',
-  containerResumes: process.env.AZURE_STORAGE_CONTAINER_RESUMES || 'resumes',
-  containerExports: process.env.AZURE_STORAGE_CONTAINER_EXPORTS || 'exports',
-  enabled: process.env.AZURE_BLOB_STORAGE_ENABLED === 'true',
-};
+// Read config dynamically to handle late-loaded env vars
+function getConfig() {
+  return {
+    connectionString: process.env.AZURE_STORAGE_CONNECTION_STRING || '',
+    containerResumes: process.env.AZURE_STORAGE_CONTAINER_RESUMES || 'resumes',
+    containerExports: process.env.AZURE_STORAGE_CONTAINER_EXPORTS || 'exports',
+    enabled: process.env.AZURE_BLOB_STORAGE_ENABLED === 'true',
+  };
+}
 
 // ============================================
 // CLIENT INITIALIZATION
@@ -40,6 +43,8 @@ let isInitialized = false;
  * Initialize Azure Blob Storage clients
  */
 async function initializeBlobStorage(): Promise<boolean> {
+  const config = getConfig();
+  
   if (!config.enabled) {
     apiLogger.info('[azure-blob] Azure Blob Storage is disabled, using database storage');
     return false;
@@ -81,7 +86,24 @@ async function initializeBlobStorage(): Promise<boolean> {
  * Check if Azure Blob Storage is available
  */
 export function isAzureBlobEnabled(): boolean {
+  const config = getConfig();
   return config.enabled && isInitialized && resumesContainer !== null;
+}
+
+/**
+ * Ensure Azure Blob Storage is initialized before operations
+ * This handles the async initialization race condition
+ */
+async function ensureInitialized(): Promise<boolean> {
+  if (isInitialized) return true;
+  
+  const config = getConfig();
+  if (!config.enabled) {
+    apiLogger.warn('[azure-blob] Azure Blob Storage is not enabled - resume uploads will fail');
+    return false;
+  }
+  
+  return await initializeBlobStorage();
 }
 
 // ============================================
@@ -120,10 +142,13 @@ export async function uploadResume(
   content: Buffer,
   mimeType: string
 ): Promise<UploadResult> {
+  // Ensure storage is initialized (handles async startup race)
+  await ensureInitialized();
+  
   if (!isAzureBlobEnabled()) {
     return {
       success: false,
-      error: 'Azure Blob Storage is not enabled',
+      error: 'Azure Blob Storage is not enabled or failed to initialize. Check AZURE_BLOB_STORAGE_ENABLED and AZURE_STORAGE_CONNECTION_STRING environment variables.',
     };
   }
 
@@ -172,10 +197,13 @@ export async function uploadResume(
  * Download a resume file from Azure Blob Storage
  */
 export async function downloadResume(blobName: string): Promise<DownloadResult> {
+  // Ensure storage is initialized
+  await ensureInitialized();
+  
   if (!isAzureBlobEnabled()) {
     return {
       success: false,
-      error: 'Azure Blob Storage is not enabled',
+      error: 'Azure Blob Storage is not enabled or failed to initialize',
     };
   }
 
@@ -274,7 +302,9 @@ export async function generateSasUrl(
 // ============================================
 
 // Initialize on module load if enabled
-if (config.enabled && config.connectionString) {
+// Note: This may run before dotenv loads, so ensureInitialized() handles lazy init
+const initConfig = getConfig();
+if (initConfig.enabled && initConfig.connectionString) {
   initializeBlobStorage().catch((error) => {
     apiLogger.error('[azure-blob] Initialization failed', {
       error: error instanceof Error ? error.message : 'Unknown error',

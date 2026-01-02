@@ -367,8 +367,10 @@ router.post('/payment/create', requireAuth, async (req: Request, res: Response) 
     // MercadoPago requires a LATAM currency, PayPal uses USD
     let currency = getCurrencyForRegion(region);
     if (body.provider === 'mercadopago' && currency === 'USD') {
-      // Default to ARS for MercadoPago when USD would be used
-      currency = 'ARS';
+      // Default to BRL for MercadoPago when region is not LATAM
+      // BRL is the primary currency for MercadoPago
+      currency = 'BRL';
+      paymentLogger.info('Overriding currency to BRL for MercadoPago', { originalRegion: region });
     }
     
     // Get package info

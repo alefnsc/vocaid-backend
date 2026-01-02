@@ -17,10 +17,8 @@ interface RegisterCallBody {
     seniority?: string; // Candidate seniority level: intern, junior, mid, senior, staff, principal
     company_name: string;
     job_description: string;
-    interviewee_cv: string; // Base64 encoded resume content
-    resume_file_name?: string;
-    resume_mime_type?: string;
-    interview_id?: string;
+    // Resume is fetched server-side from Azure Blob via interview_id -> ResumeDocument.storageKey
+    interview_id: string; // Required: Used to fetch resume from database
     preferred_language?: string; // Language code for agent switching
   };
 }

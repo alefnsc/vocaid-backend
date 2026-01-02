@@ -99,6 +99,16 @@ const envSchema = z.object({
   ANALYTICS_CACHE_TTL_DASHBOARD: z.string().regex(/^\d+$/).transform(Number).default('300'),
   ANALYTICS_CACHE_TTL_GLOBAL: z.string().regex(/^\d+$/).transform(Number).default('3600'),
   ANALYTICS_SNAPSHOT_CRON: z.string().default('0 * * * *'),
+
+  // Supabase (new - replacing Clerk + Azure Storage)
+  SUPABASE_URL: z.string().url().optional(),
+  SUPABASE_ANON_KEY: z.string().optional(),
+  SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
+  
+  // Twilio (for Supabase Phone Auth)
+  TWILIO_ACCOUNT_SID: z.string().optional(),
+  TWILIO_AUTH_TOKEN: z.string().optional(),
+  TWILIO_MESSAGING_SERVICE_SID: z.string().optional(),
 });
 
 // ========================================
@@ -249,6 +259,20 @@ export const config = {
     cacheTtlDashboard: env.ANALYTICS_CACHE_TTL_DASHBOARD,
     cacheTtlGlobal: env.ANALYTICS_CACHE_TTL_GLOBAL,
     snapshotCron: env.ANALYTICS_SNAPSHOT_CRON,
+  },
+
+  // Supabase (new - replacing Clerk + Azure Storage)
+  supabase: {
+    url: env.SUPABASE_URL || 'https://vnbauggmguyyyqpndwgn.supabase.co',
+    anonKey: env.SUPABASE_ANON_KEY,
+    serviceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY,
+  },
+
+  // Twilio (for Supabase Phone Auth)
+  twilio: {
+    accountSid: env.TWILIO_ACCOUNT_SID,
+    authToken: env.TWILIO_AUTH_TOKEN,
+    messagingServiceSid: env.TWILIO_MESSAGING_SERVICE_SID,
   },
 } as const;
 

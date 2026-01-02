@@ -86,6 +86,12 @@ export async function getCachedAnalytics<T>(
   cacheKey: CacheKey
 ): Promise<T | null> {
   try {
+    // Safeguard: ensure prisma is initialized
+    if (!prisma) {
+      dbLogger.warn('Prisma client not initialized in getCachedAnalytics');
+      return null;
+    }
+    
     const cached = await prisma.analyticsCache.findUnique({
       where: {
         userId_cacheKey: { userId, cacheKey }
@@ -113,7 +119,11 @@ export async function getCachedAnalytics<T>(
     dbLogger.error('Failed to get cached analytics', { 
       userId, 
       cacheKey, 
-      error 
+      error: error instanceof Error ? {
+        message: error.message,
+        name: error.name,
+        stack: error.stack
+      } : String(error)
     });
     return null;
   }
@@ -128,6 +138,12 @@ export async function setCachedAnalytics<T>(
   data: T,
   options?: { ttlMs?: number }
 ): Promise<void> {
+  // Safeguard: ensure prisma is initialized
+  if (!prisma) {
+    dbLogger.warn('Prisma client not initialized in setCachedAnalytics');
+    return;
+  }
+  
   const ttlMs = options?.ttlMs ?? CACHE_TTL[cacheKey] ?? 5 * 60 * 1000;
   const now = new Date();
   const expiresAt = new Date(now.getTime() + ttlMs);
@@ -158,7 +174,11 @@ export async function setCachedAnalytics<T>(
     dbLogger.error('Failed to set cached analytics', { 
       userId, 
       cacheKey, 
-      error 
+      error: error instanceof Error ? {
+        message: error.message,
+        name: error.name,
+        stack: error.stack
+      } : String(error)
     });
     // Don't throw - caching failure shouldn't break the request
   }
@@ -179,7 +199,14 @@ export async function invalidateUserCache(userId: string): Promise<void> {
       deletedCount: result.count 
     });
   } catch (error) {
-    dbLogger.error('Failed to invalidate user cache', { userId, error });
+    dbLogger.error('Failed to invalidate user cache', { 
+      userId, 
+      error: error instanceof Error ? {
+        message: error.message,
+        name: error.name,
+        stack: error.stack
+      } : String(error)
+    });
   }
 }
 
@@ -204,7 +231,11 @@ export async function invalidateCacheKey(
       dbLogger.error('Failed to invalidate cache key', { 
         userId, 
         cacheKey, 
-        error 
+        error: error instanceof Error ? {
+          message: error.message,
+          name: error.name,
+          stack: error.stack
+        } : String(error)
       });
     }
   }
@@ -243,7 +274,14 @@ export async function getGlobalSnapshot<T>(
 
     return snapshot.snapshotData as T;
   } catch (error) {
-    dbLogger.error('Failed to get global snapshot', { snapshotType, error });
+    dbLogger.error('Failed to get global snapshot', { 
+      snapshotType, 
+      error: error instanceof Error ? {
+        message: error.message,
+        name: error.name,
+        stack: error.stack
+      } : String(error)
+    });
     return null;
   }
 }
@@ -277,7 +315,11 @@ export async function setGlobalSnapshot<T>(
   } catch (error) {
     dbLogger.error('Failed to set global snapshot', { 
       snapshotType, 
-      error 
+      error: error instanceof Error ? {
+        message: error.message,
+        name: error.name,
+        stack: error.stack
+      } : String(error)
     });
     throw error; // Propagate error for background job handling
   }
@@ -346,7 +388,13 @@ export async function cleanupExpiredCache(): Promise<number> {
 
     return result.count;
   } catch (error) {
-    dbLogger.error('Failed to cleanup expired cache', { error });
+    dbLogger.error('Failed to cleanup expired cache', { 
+      error: error instanceof Error ? {
+        message: error.message,
+        name: error.name,
+        stack: error.stack
+      } : String(error)
+    });
     return 0;
   }
 }
@@ -382,7 +430,13 @@ export async function getCacheStats(): Promise<{
       entriesByKey
     };
   } catch (error) {
-    dbLogger.error('Failed to get cache stats', { error });
+    dbLogger.error('Failed to get cache stats', { 
+      error: error instanceof Error ? {
+        message: error.message,
+        name: error.name,
+        stack: error.stack
+      } : String(error)
+    });
     return {
       totalEntries: 0,
       expiredEntries: 0,

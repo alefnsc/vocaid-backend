@@ -12,6 +12,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import * as candidateDashboardService from '../services/candidateDashboardService';
 import * as resumeRepositoryService from '../services/resumeRepositoryService';
+import { downloadResume } from '../services/azureBlobService';
 import { apiLogger } from '../utils/logger';
 
 const router = Router();
@@ -225,8 +226,8 @@ router.get('/resumes/:resumeId/download', requireAuth, async (req: Request, res:
   const { resumeId } = req.params;
 
   try {
-    // Get resume with data
-    const resume = await resumeRepositoryService.getResumeById(clerkId, resumeId, true);
+    // Get resume metadata (including storageKey)
+    const resume = await resumeRepositoryService.getResumeById(clerkId, resumeId, false);
 
     if (!resume) {
       return res.status(404).json({
@@ -236,13 +237,39 @@ router.get('/resumes/:resumeId/download', requireAuth, async (req: Request, res:
       });
     }
 
-    // Return as downloadable file
+    if (!resume.storageKey) {
+      return res.status(404).json({
+        status: 'error',
+        code: 'RESUME_FILE_NOT_FOUND',
+        message: 'Resume file not found in storage',
+      });
+    }
+
+    // Download from Azure Blob Storage
+    const downloadResult = await downloadResume(resume.storageKey);
+
+    if (!downloadResult.success || !downloadResult.data) {
+      apiLogger.error('Failed to download resume from Azure Blob', {
+        requestId,
+        resumeId,
+        storageKey: resume.storageKey,
+        error: downloadResult.error
+      });
+      return res.status(500).json({
+        status: 'error',
+        code: 'DOWNLOAD_ERROR',
+        message: 'Failed to retrieve resume file',
+        requestId,
+      });
+    }
+
+    // Return as downloadable file (convert Buffer to base64 for frontend)
     res.json({
       status: 'success',
       data: {
         fileName: resume.fileName,
         mimeType: resume.mimeType,
-        base64: resume.base64Data,
+        base64: downloadResult.data.toString('base64'),
       },
     });
   } catch (error: any) {
