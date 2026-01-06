@@ -13,17 +13,16 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { z, ZodError } from 'zod';
 import * as creditsWalletService from '../services/creditsWalletService';
-import { getTrialStatus, isPromoActive, getPromoRemainingDays, PROMO_END_DATE } from '../services/trialPolicyService';
+import { getTrialStatus, claimTrialCredits } from '../services/trialPolicyService';
 import { apiLogger } from '../utils/logger';
 import { prisma } from '../services/databaseService';
+import { requireSession } from '../middleware/sessionAuthMiddleware';
 
 const router = Router();
 
 // ========================================
 // VALIDATION SCHEMAS
 // ========================================
-
-const clerkUserIdSchema = z.string().min(1, 'User ID is required');
 
 const spendCreditsSchema = z.object({
   amount: z.number().int().positive().default(1),
@@ -81,46 +80,6 @@ function validate<T extends z.ZodSchema>(
   };
 }
 
-/**
- * Get Clerk user ID from request headers
- */
-function getClerkUserId(req: Request): string | null {
-  return (req.headers['x-user-id'] as string) || null;
-}
-
-/**
- * Get internal user ID from Clerk ID
- */
-async function getUserId(req: Request, res: Response, next: NextFunction) {
-  const clerkId = getClerkUserId(req);
-  
-  if (!clerkId) {
-    return res.status(401).json({
-      status: 'error',
-      message: 'Authentication required'
-    });
-  }
-  
-  try {
-    const user = await prisma.user.findUnique({
-      where: { clerkId },
-      select: { id: true }
-    });
-    
-    if (!user) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'User not found'
-      });
-    }
-    
-    (req as any).userId = user.id;
-    next();
-  } catch (error) {
-    next(error);
-  }
-}
-
 // ========================================
 // ROUTES
 // ========================================
@@ -129,10 +88,10 @@ async function getUserId(req: Request, res: Response, next: NextFunction) {
  * GET /api/credits/balance
  * Get current wallet balance
  */
-router.get('/balance', getUserId, async (req: Request, res: Response) => {
+router.get('/balance', requireSession, async (req: Request, res: Response) => {
   try {
-    const userId = (req as any).userId;
-    const balance = await creditsWalletService.getWalletBalance(userId);
+    const userId = req.userId!; // Non-null: requireSession ensures userId exists
+    const balance = await creditsWalletService.getWalletBalance(userId!);
     
     res.json({
       status: 'success',
@@ -151,9 +110,9 @@ router.get('/balance', getUserId, async (req: Request, res: Response) => {
  * GET /api/credits/summary
  * Get detailed wallet summary with recent transactions
  */
-router.get('/summary', getUserId, async (req: Request, res: Response) => {
+router.get('/summary', requireSession, async (req: Request, res: Response) => {
   try {
-    const userId = (req as any).userId;
+    const userId = req.userId!;
     const summary = await creditsWalletService.getCreditsSummary(userId);
     
     res.json({
@@ -175,11 +134,11 @@ router.get('/summary', getUserId, async (req: Request, res: Response) => {
  */
 router.get(
   '/history',
-  getUserId,
+  requireSession,
   validate(transactionHistorySchema, 'query'),
   async (req: Request, res: Response) => {
     try {
-      const userId = (req as any).userId;
+      const userId = req.userId!;
       const query = (req as any).validatedQuery;
       
       const history = await creditsWalletService.getTransactionHistory(userId, {
@@ -208,11 +167,11 @@ router.get(
  */
 router.post(
   '/spend',
-  getUserId,
+  requireSession,
   validate(spendCreditsSchema),
   async (req: Request, res: Response) => {
     try {
-      const userId = (req as any).userId;
+      const userId = req.userId!;
       const { amount, interviewId, description } = req.body;
       
       const result = await creditsWalletService.spendCredits(
@@ -254,11 +213,11 @@ router.post(
  */
 router.post(
   '/restore',
-  getUserId,
+  requireSession,
   validate(restoreCreditsSchema),
   async (req: Request, res: Response) => {
     try {
-      const userId = (req as any).userId;
+      const userId = req.userId!;
       const { amount, interviewId, reason } = req.body;
       
       const result = await creditsWalletService.restoreCredits(
@@ -266,7 +225,8 @@ router.post(
         amount,
         reason || 'Credit restored',
         interviewId ? 'interview' : undefined,
-        interviewId
+        interviewId,
+        interviewId ? `restore_interview_${interviewId}` : undefined
       );
       
       if (!result.success) {
@@ -297,9 +257,9 @@ router.post(
  * GET /api/credits/check
  * Check if user has sufficient credits (for pre-interview check)
  */
-router.get('/check', getUserId, async (req: Request, res: Response) => {
+router.get('/check', requireSession, async (req: Request, res: Response) => {
   try {
-    const userId = (req as any).userId;
+    const userId = req.userId!;
     const amount = parseInt(req.query.amount as string) || 1;
     
     const hasCredits = await creditsWalletService.hasCredits(userId, amount);
@@ -327,22 +287,20 @@ router.get('/check', getUserId, async (req: Request, res: Response) => {
  * Get trial credits status for current user
  * Returns info about trial grant, promo period, and current balance
  */
-router.get('/trial-status', getUserId, async (req: Request, res: Response) => {
+router.get('/trial-status', requireSession, async (req: Request, res: Response) => {
   try {
-    const userId = (req as any).userId;
+    const userId = req.userId!;
     const status = await getTrialStatus(userId);
     
     res.json({
       status: 'success',
       data: {
-        trialCreditsGranted: status.trialCreditsGranted,
+        trialCreditsClaimed: status.trialCreditsClaimed,
         trialCreditsAmount: status.trialCreditsAmount,
-        trialCreditsGrantedAt: status.trialCreditsGrantedAt?.toISOString() || null,
-        isPromoActive: status.isPromoActive,
-        promoEndsAt: status.promoEndsAt.toISOString(),
-        promoRemainingDays: getPromoRemainingDays(),
+        trialCreditsClaimedAt: status.trialCreditsClaimedAt?.toISOString() || null,
         currentBalance: status.currentBalance,
-        riskLevel: status.riskLevel
+        canClaim: status.canClaim,
+        blockedReason: status.blockedReason || null
       }
     });
   } catch (error: any) {
@@ -355,26 +313,36 @@ router.get('/trial-status', getUserId, async (req: Request, res: Response) => {
 });
 
 /**
- * GET /api/credits/promo-info
- * Get current promo information (public endpoint)
+ * POST /api/credits/claim-trial
+ * Claim trial credits (fixed 5) after phone verification
  */
-router.get('/promo-info', async (req: Request, res: Response) => {
+router.post('/claim-trial', requireSession, async (req: Request, res: Response) => {
   try {
-    res.json({
+    const userId = req.userId!;
+    const result = await claimTrialCredits(userId);
+
+    if (!result.success) {
+      return res.status(400).json({
+        status: 'error',
+        message: result.error || 'Failed to claim trial credits',
+        eligibility: result.eligibility,
+      });
+    }
+
+    return res.json({
       status: 'success',
       data: {
-        isPromoActive: isPromoActive(),
-        promoEndsAt: PROMO_END_DATE.toISOString(),
-        promoRemainingDays: getPromoRemainingDays(),
-        promoCredits: isPromoActive() ? 5 : 1,
-        standardCredits: 1
-      }
+        creditsGranted: result.creditsGranted,
+        newBalance: result.newBalance ?? null,
+        ledgerEntryId: result.ledgerEntryId ?? null,
+        eligibility: result.eligibility,
+      },
     });
   } catch (error: any) {
-    apiLogger.error('Failed to get promo info', { error: error.message });
+    apiLogger.error('Failed to claim trial credits', { error: error.message });
     res.status(500).json({
       status: 'error',
-      message: 'Failed to get promo info'
+      message: 'Failed to claim trial credits'
     });
   }
 });

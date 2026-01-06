@@ -11,7 +11,7 @@
 #
 # Prerequisites:
 #   - Backend running on http://localhost:3001
-#   - Valid Clerk auth token (or mock auth enabled)
+#   - Valid session auth (or mock auth enabled)
 #   - ADMIN_SECRET_KEY and CRON_SECRET environment variables set
 #
 # =============================================================================

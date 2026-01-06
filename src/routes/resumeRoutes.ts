@@ -1,15 +1,13 @@
 /**
  * Resume Routes
  * 
- * API endpoints for resume repository with scoring support.
+ * API endpoints for resume repository.
  * 
  * Routes:
  * - GET /api/resumes - List user's resumes
  * - POST /api/resumes/upload - Upload new resume
  * - GET /api/resumes/:id - Get resume metadata
  * - GET /api/resumes/:id/download - Download resume file
- * - POST /api/resumes/:id/score - Score resume for a role
- * - GET /api/resumes/scores - Get scores filtered by role
  * - POST /api/resumes/linkedin - Create resume from LinkedIn data
  * 
  * @module routes/resumeRoutes
@@ -19,8 +17,8 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 import { PrismaClient, ResumeSource } from '@prisma/client';
 import logger from '../utils/logger';
-import { scoreResume, getResumeScores } from '../services/resumeScoringService';
 import { uploadResume, downloadResume, deleteResume, isAzureBlobEnabled } from '../services/azureBlobService';
+import { requireSession } from '../middleware/sessionAuthMiddleware';
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -29,8 +27,6 @@ const resumeLogger = logger.child({ component: 'resume-routes' });
 // ========================================
 // VALIDATION SCHEMAS
 // ========================================
-
-const clerkUserIdSchema = z.string().regex(/^user_[a-zA-Z0-9]+$/);
 
 const uploadResumeSchema = z.object({
   fileName: z.string().min(1).max(255),
@@ -54,12 +50,6 @@ const updateResumeSchema = z.object({
   isPrimary: z.boolean().optional()
 });
 
-const scoreResumeSchema = z.object({
-  roleTitle: z.string().min(1).max(255),
-  jobDescription: z.string().max(10000).optional(),
-  forceRefresh: z.boolean().optional()
-});
-
 const linkedInResumeSchema = z.object({
   profileData: z.object({
     name: z.string().optional(),
@@ -73,45 +63,6 @@ const linkedInResumeSchema = z.object({
 });
 
 // ========================================
-// MIDDLEWARE
-// ========================================
-
-function getClerkUserId(req: Request): string | null {
-  return (req.headers['x-user-id'] as string) || req.body?.userId || null;
-}
-
-async function requireAuth(req: Request, res: Response, next: NextFunction) {
-  const clerkId = getClerkUserId(req);
-  
-  if (!clerkId) {
-    return res.status(401).json({
-      status: 'error',
-      message: 'Authentication required'
-    });
-  }
-  
-  try {
-    clerkUserIdSchema.parse(clerkId);
-    (req as any).clerkUserId = clerkId;
-    next();
-  } catch {
-    return res.status(401).json({
-      status: 'error',
-      message: 'Invalid user ID format'
-    });
-  }
-}
-
-// Helper to get internal user ID from Clerk ID
-async function getUserId(clerkId: string): Promise<string | null> {
-  const user = await prisma.user.findUnique({
-    where: { clerkId },
-    select: { id: true }
-  });
-  return user?.id || null;
-}
-
-// ========================================
 // ROUTES
 // ========================================
 
@@ -119,18 +70,10 @@ async function getUserId(clerkId: string): Promise<string | null> {
  * GET /api/resumes
  * List all resumes for the authenticated user
  */
-router.get('/', requireAuth, async (req: Request, res: Response) => {
-  const clerkId = (req as any).clerkUserId;
+router.get('/', requireSession, async (req: Request, res: Response) => {
+  const userId = req.userId!;
   
   try {
-    const userId = await getUserId(clerkId);
-    if (!userId) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'User not found'
-      });
-    }
-    
     const resumes = await prisma.resumeDocument.findMany({
       where: {
         userId,
@@ -169,7 +112,7 @@ router.get('/', requireAuth, async (req: Request, res: Response) => {
       _count: undefined
     }));
     
-    resumeLogger.info('Resumes listed', { userId: clerkId.slice(0, 12), count: data.length });
+    resumeLogger.info('Resumes listed', { userId: userId.slice(0, 12), count: data.length });
     
     return res.json({
       status: 'success',
@@ -188,8 +131,8 @@ router.get('/', requireAuth, async (req: Request, res: Response) => {
  * POST /api/resumes/upload
  * Upload a new resume
  */
-router.post('/upload', requireAuth, async (req: Request, res: Response) => {
-  const clerkId = (req as any).clerkUserId;
+router.post('/upload', requireSession, async (req: Request, res: Response) => {
+  const userId = req.userId!;
   
   try {
     const parseResult = uploadResumeSchema.safeParse(req.body);
@@ -202,14 +145,6 @@ router.post('/upload', requireAuth, async (req: Request, res: Response) => {
     }
     
     const { fileName, mimeType, base64Data, title, description, tags, isPrimary } = parseResult.data;
-    
-    const userId = await getUserId(clerkId);
-    if (!userId) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'User not found'
-      });
-    }
     
     // Calculate file size
     const fileSize = Math.ceil((base64Data.length * 3) / 4);
@@ -236,7 +171,7 @@ router.post('/upload', requireAuth, async (req: Request, res: Response) => {
     
     if (!uploadResult.success || !uploadResult.blobName) {
       resumeLogger.error('Failed to upload resume to Azure Blob Storage', {
-        userId: clerkId.slice(0, 12),
+        userId: userId.slice(0, 12),
         error: uploadResult.error
       });
       return res.status(500).json({
@@ -265,7 +200,7 @@ router.post('/upload', requireAuth, async (req: Request, res: Response) => {
     });
     
     resumeLogger.info('Resume uploaded', {
-      userId: clerkId.slice(0, 12),
+      userId: userId.slice(0, 12),
       resumeId: resume.id.slice(0, 8),
       fileName
     });
@@ -295,19 +230,11 @@ router.post('/upload', requireAuth, async (req: Request, res: Response) => {
  * GET /api/resumes/:id
  * Get resume metadata
  */
-router.get('/:id', requireAuth, async (req: Request, res: Response) => {
-  const clerkId = (req as any).clerkUserId;
+router.get('/:id', requireSession, async (req: Request, res: Response) => {
+  const userId = req.userId!;
   const { id } = req.params;
   
   try {
-    const userId = await getUserId(clerkId);
-    if (!userId) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'User not found'
-      });
-    }
-    
     const resume = await prisma.resumeDocument.findFirst({
       where: {
         id,
@@ -375,19 +302,11 @@ router.get('/:id', requireAuth, async (req: Request, res: Response) => {
  * GET /api/resumes/:id/download
  * Download resume file
  */
-router.get('/:id/download', requireAuth, async (req: Request, res: Response) => {
-  const clerkId = (req as any).clerkUserId;
+router.get('/:id/download', requireSession, async (req: Request, res: Response) => {
+  const userId = req.userId!;
   const { id } = req.params;
   
   try {
-    const userId = await getUserId(clerkId);
-    if (!userId) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'User not found'
-      });
-    }
-    
     const resume = await prisma.resumeDocument.findFirst({
       where: {
         id,
@@ -447,8 +366,8 @@ router.get('/:id/download', requireAuth, async (req: Request, res: Response) => 
  * PATCH /api/resumes/:id
  * Update resume metadata
  */
-router.patch('/:id', requireAuth, async (req: Request, res: Response) => {
-  const clerkId = (req as any).clerkUserId;
+router.patch('/:id', requireSession, async (req: Request, res: Response) => {
+  const userId = req.userId!;
   const { id } = req.params;
   
   try {
@@ -458,14 +377,6 @@ router.patch('/:id', requireAuth, async (req: Request, res: Response) => {
         status: 'error',
         message: 'Invalid request data',
         errors: parseResult.error.errors
-      });
-    }
-    
-    const userId = await getUserId(clerkId);
-    if (!userId) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'User not found'
       });
     }
     
@@ -523,19 +434,11 @@ router.patch('/:id', requireAuth, async (req: Request, res: Response) => {
  * DELETE /api/resumes/:id
  * Soft delete a resume
  */
-router.delete('/:id', requireAuth, async (req: Request, res: Response) => {
-  const clerkId = (req as any).clerkUserId;
+router.delete('/:id', requireSession, async (req: Request, res: Response) => {
+  const userId = req.userId!;
   const { id } = req.params;
   
   try {
-    const userId = await getUserId(clerkId);
-    if (!userId) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'User not found'
-      });
-    }
-    
     // Check ownership and get storageKey for blob deletion
     const existing = await prisma.resumeDocument.findFirst({
       where: { id, userId, isActive: true },
@@ -567,7 +470,7 @@ router.delete('/:id', requireAuth, async (req: Request, res: Response) => {
     });
     
     resumeLogger.info('Resume deleted', {
-      userId: clerkId.slice(0, 12),
+      userId: userId.slice(0, 12),
       resumeId: id.slice(0, 8)
     });
     
@@ -585,132 +488,11 @@ router.delete('/:id', requireAuth, async (req: Request, res: Response) => {
 });
 
 /**
- * POST /api/resumes/:id/score
- * Score a resume for a specific role
- */
-router.post('/:id/score', requireAuth, async (req: Request, res: Response) => {
-  const clerkId = (req as any).clerkUserId;
-  const { id } = req.params;
-  
-  try {
-    const parseResult = scoreResumeSchema.safeParse(req.body);
-    if (!parseResult.success) {
-      return res.status(400).json({
-        status: 'error',
-        message: 'Invalid request data',
-        errors: parseResult.error.errors
-      });
-    }
-    
-    const { roleTitle, forceRefresh } = parseResult.data;
-    
-    const userId = await getUserId(clerkId);
-    if (!userId) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'User not found'
-      });
-    }
-    
-    // Check ownership
-    const existing = await prisma.resumeDocument.findFirst({
-      where: { id, userId, isActive: true }
-    });
-    
-    if (!existing) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'Resume not found'
-      });
-    }
-    
-    // Score the resume
-    const result = await scoreResume(id, roleTitle, forceRefresh);
-    
-    if (!result) {
-      return res.status(500).json({
-        status: 'error',
-        message: 'Failed to score resume'
-      });
-    }
-    
-    return res.json({
-      status: 'success',
-      data: result
-    });
-  } catch (error: any) {
-    resumeLogger.error('Failed to score resume', { error: error.message });
-    return res.status(500).json({
-      status: 'error',
-      message: 'Failed to score resume'
-    });
-  }
-});
-
-/**
- * GET /api/resumes/scores
- * Get all scores filtered by role
- */
-router.get('/scores', requireAuth, async (req: Request, res: Response) => {
-  const clerkId = (req as any).clerkUserId;
-  const { roleTitle } = req.query;
-  
-  try {
-    const userId = await getUserId(clerkId);
-    if (!userId) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'User not found'
-      });
-    }
-    
-    // Get all user's resumes with their scores
-    const resumes = await prisma.resumeDocument.findMany({
-      where: {
-        userId,
-        isActive: true,
-        isLatest: true
-      },
-      select: {
-        id: true,
-        title: true,
-        fileName: true,
-        source: true,
-        scores: {
-          where: roleTitle ? {
-            roleTitle: { equals: roleTitle as string, mode: 'insensitive' }
-          } : undefined,
-          select: {
-            roleTitle: true,
-            score: true,
-            provider: true,
-            breakdown: true,
-            computedAt: true
-          },
-          orderBy: { score: 'desc' }
-        }
-      }
-    });
-    
-    return res.json({
-      status: 'success',
-      data: resumes
-    });
-  } catch (error: any) {
-    resumeLogger.error('Failed to get resume scores', { error: error.message });
-    return res.status(500).json({
-      status: 'error',
-      message: 'Failed to get resume scores'
-    });
-  }
-});
-
-/**
  * POST /api/resumes/linkedin
  * Create a resume entry from LinkedIn profile data
  */
-router.post('/linkedin', requireAuth, async (req: Request, res: Response) => {
-  const clerkId = (req as any).clerkUserId;
+router.post('/linkedin', requireSession, async (req: Request, res: Response) => {
+  const userId = req.userId!;
   
   try {
     const parseResult = linkedInResumeSchema.safeParse(req.body);
@@ -724,14 +506,6 @@ router.post('/linkedin', requireAuth, async (req: Request, res: Response) => {
     
     const { profileData, title } = parseResult.data;
     
-    const userId = await getUserId(clerkId);
-    if (!userId) {
-      return res.status(404).json({
-        status: 'error',
-        message: 'User not found'
-      });
-    }
-    
     // Generate JSON content from profile data
     const jsonContent = JSON.stringify(profileData, null, 2);
     const fileBuffer = Buffer.from(jsonContent, 'utf-8');
@@ -742,7 +516,7 @@ router.post('/linkedin', requireAuth, async (req: Request, res: Response) => {
     
     if (!uploadResult.success || !uploadResult.blobName) {
       resumeLogger.error('Failed to upload LinkedIn resume to Azure Blob', {
-        userId: clerkId.slice(0, 12),
+        userId: userId.slice(0, 12),
         error: uploadResult.error
       });
       return res.status(500).json({
@@ -780,7 +554,7 @@ router.post('/linkedin', requireAuth, async (req: Request, res: Response) => {
     });
     
     resumeLogger.info('LinkedIn resume created', {
-      userId: clerkId.slice(0, 12),
+      userId: userId.slice(0, 12),
       resumeId: resume.id.slice(0, 8)
     });
     

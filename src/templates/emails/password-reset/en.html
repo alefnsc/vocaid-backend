@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reset Your Password</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: 'Inter', 'Segoe UI', sans-serif; background-color: #ffffff; color: #1a1a2e;">
+  <table role="presentation" style="width: 100%; max-width: 600px; margin: 0 auto; padding: 32px 24px;">
+    <tr>
+      <td>
+        <!-- Logo -->
+        <div style="text-align: center; margin-bottom: 32px;">
+          <img src="https://vocaid.ai/logo.png" alt="Vocaid" style="height: 40px; width: auto;">
+        </div>
+
+        <!-- Header -->
+        <h1 style="font-size: 24px; font-weight: 700; color: #1a1a2e; margin: 0 0 8px; text-align: center;">
+          Reset Your Password
+        </h1>
+        <p style="font-size: 16px; color: #6b7280; margin: 0 0 32px; text-align: center;">
+          We received a request to reset your password
+        </p>
+
+        <!-- Main Card -->
+        <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 16px; padding: 32px; margin-bottom: 24px;">
+          <p style="color: #1a1a2e; font-size: 16px; line-height: 1.6; margin: 0 0 24px;">
+            Hi{{{FIRST_NAME_GREETING}}},
+          </p>
+          
+          <p style="color: #1a1a2e; font-size: 16px; line-height: 1.6; margin: 0 0 24px;">
+            Click the button below to reset your password. This link will expire in <strong>1 hour</strong>.
+          </p>
+          
+          <!-- CTA Button -->
+          <div style="text-align: center; margin-bottom: 24px;">
+            <a href="{{{RESET_URL}}}" style="display: inline-block; background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%); color: #ffffff; text-decoration: none; padding: 16px 48px; border-radius: 12px; font-weight: 600; font-size: 16px;">
+              Reset Password
+            </a>
+          </div>
+          
+          <p style="color: #6b7280; font-size: 14px; line-height: 1.6; margin: 0;">
+            If you didn't request a password reset, you can safely ignore this email. Your password will remain unchanged.
+          </p>
+        </div>
+
+        <!-- Security Notice -->
+        <div style="background-color: #fef3c7; border-radius: 12px; padding: 16px; margin-bottom: 24px;">
+          <p style="color: #d97706; font-weight: 600; margin: 0 0 8px;">🔐 Security Tip</p>
+          <p style="color: #1a1a2e; margin: 0; font-size: 14px; line-height: 1.6;">
+            Never share this link with anyone. Vocaid support will never ask for your password.
+          </p>
+        </div>
+
+        <!-- Link Fallback -->
+        <div style="margin-bottom: 32px;">
+          <p style="color: #6b7280; font-size: 12px; margin: 0 0 8px;">
+            If the button doesn't work, copy and paste this link into your browser:
+          </p>
+          <p style="color: #6366f1; font-size: 12px; word-break: break-all; margin: 0;">
+            {{{RESET_URL}}}
+          </p>
+        </div>
+
+        <!-- Divider -->
+        <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 32px 0;">
+
+        <!-- Footer -->
+        <div style="text-align: center;">
+          <p style="color: #9ca3af; font-size: 12px; margin: 0 0 8px;">
+            Questions? Contact us at support@vocaid.ai
+          </p>
+          <p style="color: #9ca3af; font-size: 12px; margin: 0;">
+            <a href="{{{PRIVACY_URL}}}" style="color: #9ca3af;">Privacy Policy</a> · 
+            <a href="{{{TERMS_URL}}}" style="color: #9ca3af;">Terms of Use</a>
+          </p>
+          <p style="color: #9ca3af; font-size: 12px; margin: 16px 0 0;">
+            © {{{CURRENT_YEAR}}} Vocaid. All rights reserved.
+          </p>
+        </div>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

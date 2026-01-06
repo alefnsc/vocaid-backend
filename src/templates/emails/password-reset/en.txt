@@ -1,0 +1,23 @@
+Reset Your Password
+
+Hi{{{FIRST_NAME_GREETING}}},
+
+We received a request to reset your password.
+
+Click the link below to reset your password. This link will expire in 1 hour.
+
+Reset Password: {{{RESET_URL}}}
+
+If you didn't request a password reset, you can safely ignore this email. Your password will remain unchanged.
+
+🔐 SECURITY TIP
+Never share this link with anyone. Vocaid support will never ask for your password.
+
+---
+
+Questions? Contact us at support@vocaid.ai
+
+Privacy Policy: {{{PRIVACY_URL}}}
+Terms of Use: {{{TERMS_URL}}}
+
+© {{{CURRENT_YEAR}}} Vocaid. All rights reserved.

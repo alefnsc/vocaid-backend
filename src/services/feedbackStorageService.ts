@@ -1,14 +1,15 @@
 /**
  * Feedback Storage Service
- * 
- * Handles persisting structured feedback JSON and PDF metadata
- * to the database for versioning and audit trails.
+ *
+ * Canonical storage:
+ * - Structured feedback JSON stays in Postgres (FeedbackDocument.contentJson)
+ * - Generated feedback PDF lives in Azure Blob (FeedbackDocument.pdfStorageKey)
  */
 
 import { PrismaClient } from '@prisma/client';
 import { StructuredFeedback } from '../types/feedback';
 import logger from '../utils/logger';
-import crypto from 'crypto';
+import { upsertFeedbackDocument } from './feedbackDocumentService';
 
 const prisma = new PrismaClient();
 
@@ -25,14 +26,12 @@ export interface StoreFeedbackJsonParams {
 
 export interface StoreFeedbackPdfParams {
   interviewId: string;
-  feedbackJsonId: string;
   pdfBuffer: Buffer;
   pageCount: number;
   locale?: string;
   includesStudyPlan?: boolean;
   includesHighlights?: boolean;
-  storageKey?: string;  // S3 key if stored externally
-  storeInline?: boolean;  // Store Base64 in database (for small PDFs)
+  storageKey: string; // Azure Blob storage key
 }
 
 export interface StoredFeedbackJson {
@@ -46,12 +45,10 @@ export interface StoredFeedbackJson {
 }
 
 export interface StoredFeedbackPdf {
-  id: string;
-  feedbackJsonId: string;
   interviewId: string;
   pageCount: number;
   fileSizeBytes: number;
-  checksum: string;
+  storageKey: string;
   createdAt: Date;
 }
 
@@ -75,33 +72,39 @@ export async function storeFeedbackJson(
   });
   
   try {
-    const record = await prisma.feedbackJson.create({
-      data: {
-        interviewId,
-        schemaVersion: feedback.schemaVersion,
-        promptVersion: feedback.promptVersion,
-        model: feedback.model,
-        contentJson: feedback as any,  // Prisma Json type
-        overallScore: feedback.overallScore,
-        generationTimeMs,
-        tokenCount,
-        warningCount: feedback.warnings?.length || 0
-      }
+    const interview = await prisma.interview.findUnique({
+      where: { id: interviewId },
+      select: { userId: true }
     });
-    
-    logger.info('Feedback JSON stored successfully', {
+
+    if (!interview?.userId) {
+      throw new Error('Interview not found');
+    }
+
+    const record = await upsertFeedbackDocument({
+      interviewId,
+      userId: interview.userId,
+      contentJson: feedback,
+      overallScore: feedback.overallScore,
+      schemaVersion: feedback.schemaVersion,
+      promptVersion: feedback.promptVersion,
+      model: feedback.model
+    });
+
+    logger.info('Feedback document stored successfully', {
       id: record.id,
       interviewId: record.interviewId
     });
-    
+
+    // Preserve signature: return a "StoredFeedbackJson"-like summary
     return {
       id: record.id,
       interviewId: record.interviewId,
-      schemaVersion: record.schemaVersion,
-      promptVersion: record.promptVersion,
-      model: record.model,
-      overallScore: record.overallScore,
-      createdAt: record.createdAt
+      schemaVersion: feedback.schemaVersion,
+      promptVersion: feedback.promptVersion,
+      model: feedback.model,
+      overallScore: feedback.overallScore,
+      createdAt: record.generatedAt
     };
   } catch (error: any) {
     logger.error('Failed to store feedback JSON', {
@@ -117,93 +120,55 @@ export async function storeFeedbackJson(
 // ============================================
 
 /**
- * Generate SHA-256 checksum for PDF deduplication
- */
-function generateChecksum(buffer: Buffer): string {
-  return crypto.createHash('sha256').update(buffer).digest('hex');
-}
-
-/**
- * Store feedback PDF metadata (and optionally content) in the database
+ * Record feedback PDF storage key (PDF bytes are stored in Azure Blob)
  */
 export async function storeFeedbackPdf(
   params: StoreFeedbackPdfParams
 ): Promise<StoredFeedbackPdf> {
   const {
     interviewId,
-    feedbackJsonId,
     pdfBuffer,
     pageCount,
     locale,
     includesStudyPlan = true,
     includesHighlights = true,
-    storageKey,
-    storeInline = false
+    storageKey
   } = params;
   
   const fileSizeBytes = pdfBuffer.length;
-  const checksum = generateChecksum(pdfBuffer);
   
   logger.info('Storing feedback PDF', {
     interviewId,
-    feedbackJsonId,
     fileSizeBytes,
     pageCount,
-    storeInline
+    hasStorageKey: !!storageKey,
+    locale,
+    includesStudyPlan,
+    includesHighlights
   });
   
   try {
-    // Check for duplicate by checksum
-    const existing = await prisma.feedbackPdf.findFirst({
-      where: { checksum }
+    const interview = await prisma.interview.findUnique({
+      where: { id: interviewId },
+      select: { userId: true }
     });
-    
-    if (existing) {
-      logger.info('Duplicate PDF detected, returning existing', {
-        existingId: existing.id,
-        checksum
-      });
-      return {
-        id: existing.id,
-        feedbackJsonId: existing.feedbackJsonId,
-        interviewId: existing.interviewId,
-        pageCount: existing.pageCount,
-        fileSizeBytes: existing.fileSizeBytes,
-        checksum: existing.checksum,
-        createdAt: existing.createdAt
-      };
+
+    if (!interview?.userId) {
+      throw new Error('Interview not found');
     }
-    
-    // Store PDF
-    const record = await prisma.feedbackPdf.create({
-      data: {
-        interviewId,
-        feedbackJsonId,
-        pageCount,
-        fileSizeBytes,
-        checksum,
-        storageKey,
-        pdfBase64: storeInline ? pdfBuffer.toString('base64') : null,
-        locale,
-        includesStudyPlan,
-        includesHighlights
-      }
+
+    await upsertFeedbackDocument({
+      interviewId,
+      userId: interview.userId,
+      pdfStorageKey: storageKey
     });
-    
-    logger.info('Feedback PDF stored successfully', {
-      id: record.id,
-      interviewId: record.interviewId,
-      checksum
-    });
-    
+
     return {
-      id: record.id,
-      feedbackJsonId: record.feedbackJsonId,
-      interviewId: record.interviewId,
-      pageCount: record.pageCount,
-      fileSizeBytes: record.fileSizeBytes,
-      checksum: record.checksum,
-      createdAt: record.createdAt
+      interviewId,
+      pageCount,
+      fileSizeBytes,
+      storageKey,
+      createdAt: new Date()
     };
   } catch (error: any) {
     logger.error('Failed to store feedback PDF', {
@@ -225,13 +190,13 @@ export async function getLatestFeedbackJson(
   interviewId: string
 ): Promise<StructuredFeedback | null> {
   try {
-    const record = await prisma.feedbackJson.findFirst({
+    const record = await prisma.feedbackDocument.findUnique({
       where: { interviewId },
-      orderBy: { createdAt: 'desc' }
+      select: { contentJson: true }
     });
-    
-    if (!record) return null;
-    
+
+    if (!record?.contentJson) return null;
+
     return record.contentJson as unknown as StructuredFeedback;
   } catch (error: any) {
     logger.error('Failed to get feedback JSON', {
@@ -249,9 +214,8 @@ export async function getFeedbackHistory(
   interviewId: string
 ): Promise<StoredFeedbackJson[]> {
   try {
-    const records = await prisma.feedbackJson.findMany({
+    const record = await prisma.feedbackDocument.findUnique({
       where: { interviewId },
-      orderBy: { createdAt: 'desc' },
       select: {
         id: true,
         interviewId: true,
@@ -262,8 +226,20 @@ export async function getFeedbackHistory(
         createdAt: true
       }
     });
-    
-    return records;
+
+    if (!record) return [];
+
+    return [
+      {
+        id: record.id,
+        interviewId: record.interviewId,
+        schemaVersion: record.schemaVersion || 'unknown',
+        promptVersion: record.promptVersion || 'unknown',
+        model: record.model || 'unknown',
+        overallScore: record.overallScore ?? 0,
+        createdAt: record.createdAt
+      }
+    ];
   } catch (error: any) {
     logger.error('Failed to get feedback history', {
       interviewId,
@@ -279,28 +255,9 @@ export async function getFeedbackHistory(
 export async function getPdfsForFeedback(
   feedbackJsonId: string
 ): Promise<StoredFeedbackPdf[]> {
-  try {
-    const records = await prisma.feedbackPdf.findMany({
-      where: { feedbackJsonId },
-      orderBy: { createdAt: 'desc' }
-    });
-    
-    return records.map(r => ({
-      id: r.id,
-      feedbackJsonId: r.feedbackJsonId,
-      interviewId: r.interviewId,
-      pageCount: r.pageCount,
-      fileSizeBytes: r.fileSizeBytes,
-      checksum: r.checksum,
-      createdAt: r.createdAt
-    }));
-  } catch (error: any) {
-    logger.error('Failed to get PDFs for feedback', {
-      feedbackJsonId,
-      error: error.message
-    });
-    return [];
-  }
+  // Legacy API kept for compatibility; FeedbackDocument now stores a single PDF key.
+  logger.debug('getPdfsForFeedback is deprecated; returning empty list', { feedbackJsonId });
+  return [];
 }
 
 // ============================================
@@ -314,33 +271,7 @@ export async function cleanupOldFeedback(
   interviewId: string,
   keepCount: number = 3
 ): Promise<number> {
-  try {
-    const allRecords = await prisma.feedbackJson.findMany({
-      where: { interviewId },
-      orderBy: { createdAt: 'desc' },
-      select: { id: true }
-    });
-    
-    if (allRecords.length <= keepCount) return 0;
-    
-    const toDelete = allRecords.slice(keepCount).map(r => r.id);
-    
-    // PDFs will be cascade deleted
-    const result = await prisma.feedbackJson.deleteMany({
-      where: { id: { in: toDelete } }
-    });
-    
-    logger.info('Cleaned up old feedback versions', {
-      interviewId,
-      deletedCount: result.count
-    });
-    
-    return result.count;
-  } catch (error: any) {
-    logger.error('Failed to cleanup old feedback', {
-      interviewId,
-      error: error.message
-    });
-    return 0;
-  }
+  // No versioning in FeedbackDocument-only world.
+  logger.debug('cleanupOldFeedback is a no-op for FeedbackDocument', { interviewId, keepCount });
+  return 0;
 }

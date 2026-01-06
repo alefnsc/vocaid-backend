@@ -1,0 +1,23 @@
+Redefinir Sua Senha
+
+Olá{{{FIRST_NAME_GREETING}}},
+
+Recebemos uma solicitação para redefinir sua senha.
+
+Clique no link abaixo para redefinir sua senha. Este link expira em 1 hora.
+
+Redefinir Senha: {{{RESET_URL}}}
+
+Se você não solicitou a redefinição de senha, pode ignorar este email com segurança. Sua senha permanecerá inalterada.
+
+🔐 DICA DE SEGURANÇA
+Nunca compartilhe este link com ninguém. O suporte da Vocaid nunca pedirá sua senha.
+
+---
+
+Dúvidas? Entre em contato em support@vocaid.ai
+
+Política de Privacidade: {{{PRIVACY_URL}}}
+Termos de Uso: {{{TERMS_URL}}}
+
+© {{{CURRENT_YEAR}}} Vocaid. Todos os direitos reservados.

@@ -5,7 +5,7 @@
  * Includes robust handling for large PDFs with memory optimization.
  * 
  * Security:
- * - Requires authentication (Clerk)
+ * - Requires authentication (session-based)
  * - Email recipient derived from authenticated user (never from request body)
  * - Session/interview ownership verified
  * - PDF validated for format and size
@@ -22,7 +22,7 @@
 import { Router, Request, Response, NextFunction, json } from 'express';
 import { z } from 'zod';
 import { PrismaClient } from '@prisma/client';
-import { requireAuth } from '@clerk/express';
+import { requireAuth } from '../middleware/sessionAuthMiddleware';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -310,12 +310,12 @@ router.post(
   requireAuth,
   async (req: Request, res: Response) => {
     const requestId = (req as any).requestId;
-    const clerkId = (req as any).clerkUserId;
+    const userId = req.userId!; // Non-null: requireSession ensures userId exists // Database user ID from session middleware
     let tempFilePath: string | null = null;
     
     emailLogger.info('Feedback email request received', { 
       requestId, 
-      clerkId: clerkId?.slice(0, 10) + '...',
+      userId: userId?.slice(0, 10) + '...',
       contentLength: req.headers['content-length']
     });
     
@@ -371,7 +371,6 @@ router.post(
           user: {
             select: {
               id: true,
-              clerkId: true,
               email: true,
               firstName: true,
               lastName: true,
@@ -386,13 +385,13 @@ router.post(
         return errorResponse(res, 'NOT_FOUND', undefined, requestId);
       }
       
-      // Verify ownership
-      if (interview.user.clerkId !== clerkId) {
+      // Verify ownership - compare database user ID
+      if (interview.user.id !== userId) {
         emailLogger.warn('Access denied', { 
           requestId, 
           interviewId,
-          owner: interview.user.clerkId?.slice(0, 10) + '...',
-          requester: clerkId?.slice(0, 10) + '...'
+          owner: interview.user.id?.slice(0, 10) + '...',
+          requester: userId?.slice(0, 10) + '...'
         });
         return errorResponse(res, 'FORBIDDEN', undefined, requestId);
       }
@@ -583,7 +582,7 @@ router.get(
   ensureJsonResponse,
   requireAuth,
   async (req: Request, res: Response) => {
-    const clerkId = (req as any).clerkUserId;
+    const userId = req.userId!; // Non-null: requireSession ensures userId exists // Database user ID from session middleware
     const requestId = (req as any).requestId;
     const { interviewId } = req.params;
     
@@ -595,11 +594,11 @@ router.get(
     const interview = await prisma.interview.findUnique({
       where: { id: interviewId },
       include: {
-        user: { select: { clerkId: true } }
+        user: { select: { id: true } }
       }
     });
     
-    if (!interview || interview.user.clerkId !== clerkId) {
+    if (!interview || interview.user.id !== userId) {
       return errorResponse(res, 'NOT_FOUND', undefined, requestId);
     }
     
@@ -623,7 +622,7 @@ router.post(
   ensureJsonResponse,
   requireAuth,
   async (req: Request, res: Response) => {
-    const clerkId = (req as any).clerkUserId;
+    const userId = (req as any).userId;
     const requestId = (req as any).requestId;
     const { interviewId } = req.params;
     
@@ -636,7 +635,7 @@ router.post(
     const result = await prisma.interview.updateMany({
       where: {
         id: interviewId,
-        user: { clerkId },
+        userId,
         emailSendStatus: 'FAILED'
       },
       data: {

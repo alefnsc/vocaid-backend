@@ -10,13 +10,14 @@
  * - Resume tagging and organization
  * - Auto-parsing for metadata extraction
  * - Resume quality scoring integration
+ * - Aligned role classification (hybrid: rules + LLM)
  * 
  * @module services/resumeRepositoryService
  */
 
 import logger from '../utils/logger';
 import { PrismaClient } from '@prisma/client';
-import { uploadResume, downloadResume, deleteResume } from './azureBlobService';
+import { uploadResume, downloadResume, deleteResume as deleteBlobResume } from './azureBlobService';
 
 const prisma = new PrismaClient();
 
@@ -206,7 +207,7 @@ export async function createResume(
   try {
     // Get user
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { id: true }
     });
     
@@ -282,7 +283,7 @@ export async function createResume(
 export async function getResumes(userId: string): Promise<ResumeListItem[]> {
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { id: true }
     });
     
@@ -304,7 +305,7 @@ export async function getResumes(userId: string): Promise<ResumeListItem[]> {
         isPrimary: true,
         tags: true,
         createdAt: true,
-        updatedAt: true
+        updatedAt: true,
       },
       orderBy: [
         { isPrimary: 'desc' },
@@ -318,7 +319,7 @@ export async function getResumes(userId: string): Promise<ResumeListItem[]> {
         const usageCount = await prisma.interview.count({
           where: { 
             userId: user.id,
-            resumeFileName: resume.fileName
+            resumeId: resume.id
           }
         });
         
@@ -346,7 +347,7 @@ export async function getResumeById(
 ): Promise<ResumeDocument | null> {
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { id: true }
     });
     
@@ -397,7 +398,7 @@ export async function getPrimaryResume(
 ): Promise<ResumeDocument | null> {
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { id: true }
     });
     
@@ -448,7 +449,7 @@ export async function updateResume(
 ): Promise<ResumeDocument | null> {
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { id: true }
     });
     
@@ -499,7 +500,7 @@ export async function createResumeVersion(
 ): Promise<ResumeDocument | null> {
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { id: true }
     });
     
@@ -596,7 +597,7 @@ export async function getResumeVersionHistory(
 ): Promise<ResumeVersion[]> {
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { id: true }
     });
     
@@ -702,7 +703,7 @@ export async function deleteResume(
 ): Promise<boolean> {
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { id: true }
     });
     
@@ -738,7 +739,7 @@ export async function setPrimaryResume(
 ): Promise<boolean> {
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { id: true }
     });
     
@@ -778,7 +779,7 @@ export async function searchResumes(
 ): Promise<ResumeListItem[]> {
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { id: true }
     });
     

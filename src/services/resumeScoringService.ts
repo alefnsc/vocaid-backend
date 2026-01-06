@@ -15,6 +15,7 @@
 
 import { PrismaClient, ResumeScoreProvider } from '@prisma/client';
 import logger from '../utils/logger';
+import { getRoleByKey, normalizeToRoleKey, getAllRoles, RoleDefinition } from './roleCatalogService';
 
 const prisma = new PrismaClient();
 const scoringLogger = logger.child({ component: 'resume-scoring' });
@@ -216,12 +217,21 @@ export class InternalKeywordScoringProvider implements ResumeScoringProvider {
   }
   
   private findMatchingRoleKeywords(roleTitle: string): string[] {
-    // Try exact match first
+    // First, try to resolve to a canonical roleKey from the role catalog
+    const roleKey = normalizeToRoleKey(roleTitle);
+    const catalogEntry = roleKey ? getRoleByKey(roleKey) : null;
+    
+    if (catalogEntry) {
+      scoringLogger.debug('Using role catalog keywords', { roleKey, keywordCount: catalogEntry.keywords.length });
+      return catalogEntry.keywords;
+    }
+    
+    // Fallback: Try exact match in legacy ROLE_KEYWORDS
     if (ROLE_KEYWORDS[roleTitle]) {
       return ROLE_KEYWORDS[roleTitle];
     }
     
-    // Try partial match
+    // Fallback: Try partial match in legacy ROLE_KEYWORDS
     for (const [role, keywords] of Object.entries(ROLE_KEYWORDS)) {
       if (roleTitle.includes(role) || role.includes(roleTitle)) {
         return keywords;
@@ -512,9 +522,7 @@ export async function scoreResume(
       where: { id: resumeId },
       select: {
         parsedMetadata: true,
-        parsedText: true,
-        base64Data: true,
-        mimeType: true
+        parsedText: true
       }
     });
     
@@ -596,6 +604,237 @@ export async function scoreResume(
     scoringLogger.error('Failed to score resume', { error: error.message });
     return null;
   }
+}
+
+/**
+ * Score a resume against a canonical roleKey from the role catalog.
+ * This is the preferred method for scoring as it uses standardized keywords.
+ * 
+ * @param resumeId - The resume document ID
+ * @param roleKey - Canonical role key from role catalog (e.g., 'software_engineer')
+ * @param forceRefresh - Force re-computation even if cached
+ * @returns ScoringResult or null if resume not found
+ */
+export async function scoreResumeByRoleKey(
+  resumeId: string,
+  roleKey: string,
+  forceRefresh: boolean = false
+): Promise<ScoringResult | null> {
+  // Validate roleKey exists in catalog
+  const catalogEntry = getRoleByKey(roleKey);
+  if (!catalogEntry) {
+    scoringLogger.warn('Invalid roleKey provided, falling back to legacy scoring', { roleKey });
+    // Fall back to using roleKey as roleTitle
+    return scoreResume(resumeId, roleKey, forceRefresh);
+  }
+  
+  // Use the canonical label as roleTitle for caching consistency
+  // This ensures scores are cached by roleKey regardless of language
+  const normalizedRoleTitle = `__roleKey:${roleKey}`;
+  
+  try {
+    // Check for cached score using roleKey-based title
+    if (!forceRefresh) {
+      const cached = await prisma.resumeScore.findFirst({
+        where: {
+          resumeId,
+          roleTitle: normalizedRoleTitle,
+          computedAt: { gt: new Date(Date.now() - SCORE_CACHE_TTL) }
+        },
+        orderBy: { computedAt: 'desc' }
+      });
+      
+      if (cached) {
+        scoringLogger.debug('Using cached roleKey score', { resumeId: resumeId.slice(0, 8), roleKey });
+        return {
+          score: cached.score,
+          provider: cached.provider as ResumeScoreProvider,
+          breakdown: cached.breakdown as unknown as ScoreBreakdown,
+          computedAt: cached.computedAt
+        };
+      }
+    }
+    
+    // Get resume data
+    const resume = await prisma.resumeDocument.findUnique({
+      where: { id: resumeId },
+      select: {
+        parsedMetadata: true,
+        parsedText: true
+      }
+    });
+    
+    if (!resume) {
+      scoringLogger.warn('Resume not found', { resumeId: resumeId.slice(0, 8) });
+      return null;
+    }
+    
+    // Parse resume if not already parsed
+    let parsedData: ParsedResumeData;
+    
+    if (resume.parsedMetadata) {
+      parsedData = resume.parsedMetadata as unknown as ParsedResumeData;
+    } else {
+      parsedData = {
+        skills: extractSkillsFromText(resume.parsedText || ''),
+        education: [],
+        experience: [],
+        certifications: [],
+        languages: []
+      };
+    }
+    
+    // Score using role catalog keywords directly
+    const provider = new InternalKeywordScoringProvider();
+    
+    // Override findMatchingRoleKeywords to use catalog entry directly
+    const result = await scoreWithCatalogEntry(parsedData, catalogEntry, provider);
+    
+    // Also try interview outcome scoring
+    const outcomeProvider = new InternalInterviewOutcomeScoringProvider();
+    const outcomeResult = await outcomeProvider.scoreFromInterviews(resumeId, catalogEntry.displayName);
+    
+    // Blend scores if we have interview data
+    let finalResult = result;
+    if (outcomeResult && outcomeResult.score !== 50) {
+      finalResult = {
+        ...result,
+        score: Math.round(result.score * 0.6 + outcomeResult.score * 0.4),
+        breakdown: {
+          ...result.breakdown,
+          overallFit: Math.round(result.breakdown.overallFit * 0.6 + outcomeResult.breakdown.overallFit * 0.4)
+        }
+      };
+    }
+    
+    // Cache the result with roleKey-based title
+    await prisma.resumeScore.upsert({
+      where: {
+        resumeId_roleTitle_provider: {
+          resumeId,
+          roleTitle: normalizedRoleTitle,
+          provider: finalResult.provider
+        }
+      },
+      update: {
+        score: finalResult.score,
+        breakdown: finalResult.breakdown as any,
+        computedAt: new Date()
+      },
+      create: {
+        resumeId,
+        roleTitle: normalizedRoleTitle,
+        score: finalResult.score,
+        provider: finalResult.provider,
+        breakdown: finalResult.breakdown as any,
+        computedAt: new Date()
+      }
+    });
+    
+    scoringLogger.info('Resume scored by roleKey', {
+      resumeId: resumeId.slice(0, 8),
+      roleKey,
+      industry: catalogEntry.industry,
+      score: finalResult.score,
+      provider: finalResult.provider
+    });
+    
+    return finalResult;
+  } catch (error: any) {
+    scoringLogger.error('Failed to score resume by roleKey', { roleKey, error: error.message });
+    return null;
+  }
+}
+
+/**
+ * Score parsed resume data using catalog entry keywords directly
+ */
+async function scoreWithCatalogEntry(
+  parsedData: ParsedResumeData,
+  catalogEntry: RoleDefinition,
+  provider: InternalKeywordScoringProvider
+): Promise<ScoringResult> {
+  const roleKeywords = catalogEntry.keywords;
+  
+  // Extract all text from resume for matching
+  const resumeText = [
+    parsedData.currentTitle || '',
+    ...parsedData.skills,
+    ...parsedData.experience.flatMap(e => [e.title, e.company, ...e.highlights]),
+    ...parsedData.education.map(e => `${e.degree || ''} ${e.field || ''} ${e.institution}`),
+    ...parsedData.certifications
+  ].join(' ').toLowerCase();
+  
+  const resumeSkills = parsedData.skills.map(s => s.toLowerCase());
+  
+  // Calculate skill match
+  const matchedSkills: string[] = [];
+  const missingSkills: string[] = [];
+  
+  for (const keyword of roleKeywords) {
+    const keywordLower = keyword.toLowerCase();
+    if (resumeText.includes(keywordLower) || resumeSkills.some(s => s.includes(keywordLower))) {
+      matchedSkills.push(keyword);
+    } else {
+      missingSkills.push(keyword);
+    }
+  }
+  
+  const skillsMatchScore = roleKeywords.length > 0 
+    ? (matchedSkills.length / roleKeywords.length) * 100 
+    : 50;
+  
+  // Calculate experience match
+  const experienceYears = parsedData.yearsOfExperience || Math.min(parsedData.experience.length * 2, 15);
+  const expected = { min: 2, max: 8 }; // Default mid-level
+  
+  let experienceScore: number;
+  if (experienceYears >= expected.min && experienceYears <= expected.max) {
+    experienceScore = 100;
+  } else if (experienceYears < expected.min) {
+    experienceScore = Math.max(30, 100 - (expected.min - experienceYears) * 15);
+  } else {
+    experienceScore = Math.max(50, 100 - (experienceYears - expected.max) * 5);
+  }
+  
+  // Calculate education match
+  const educationScore = parsedData.education.length > 0 ? 70 : 40;
+  
+  // Calculate keyword density in experience descriptions
+  const relevantExperience = parsedData.experience.filter(exp => {
+    const expText = `${exp.title} ${exp.company} ${exp.highlights.join(' ')}`.toLowerCase();
+    return roleKeywords.some(k => expText.includes(k.toLowerCase()));
+  });
+  const keywordScore = Math.min(100, (relevantExperience.length / Math.max(parsedData.experience.length, 1)) * 100);
+  
+  // Calculate overall score (weighted average)
+  const overallScore = Math.round(
+    skillsMatchScore * 0.40 +
+    experienceScore * 0.30 +
+    educationScore * 0.15 +
+    keywordScore * 0.15
+  );
+  
+  const breakdown: ScoreBreakdown = {
+    skillsMatch: Math.round(skillsMatchScore),
+    experienceMatch: Math.round(experienceScore),
+    educationMatch: Math.round(educationScore),
+    keywordMatch: Math.round(keywordScore),
+    overallFit: overallScore,
+    details: {
+      matchedSkills,
+      missingSkills,
+      experienceYears,
+      relevantExperience: relevantExperience.map(e => e.title)
+    }
+  };
+  
+  return {
+    score: overallScore,
+    provider: 'INTERNAL_KEYWORD' as ResumeScoreProvider,
+    breakdown,
+    computedAt: new Date()
+  };
 }
 
 /**

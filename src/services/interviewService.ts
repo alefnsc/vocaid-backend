@@ -5,28 +5,27 @@
 
 import { prisma, dbLogger } from './databaseService';
 import { Prisma, InterviewStatus } from '@prisma/client';
-import { sendInterviewCompleteEmail, InterviewCompleteData } from './transactionalEmailService';
+import { sendInterviewCompleteEmail } from './transactionalEmailService';
 
 // ========================================
 // INTERVIEW CRUD OPERATIONS
 // ========================================
 
 interface CreateInterviewData {
-  userId: string; // Can be UUID or Clerk ID
+  userId: string; // DB UUID
   jobTitle: string;
   seniority?: string; // Candidate seniority: intern, junior, mid, senior, staff, principal
   companyName: string;
   jobDescription: string;
   resumeId: string; // UUID reference to ResumeDocument (resume stored in Azure Blob)
-  resumeFileName?: string; // Optional: for display purposes
   language?: string; // Interview language code
+  country?: string; // Job location country code (e.g., 'US', 'BR')
 }
 
 interface UpdateInterviewData {
   retellCallId?: string;
   status?: InterviewStatus;
   score?: number;
-  feedbackPdf?: string;
   feedbackText?: string;
   callDuration?: number;
   startedAt?: Date;
@@ -51,32 +50,8 @@ export async function createInterview(data: CreateInterviewData) {
     company: data.companyName 
   });
 
-  // Resolve user ID (might be Clerk ID or UUID)
-  let resolvedUserId = data.userId;
-  
-  if (data.userId.startsWith('user_')) {
-    // It's a Clerk ID, need to find or create user
-    const user = await prisma.user.findUnique({
-      where: { clerkId: data.userId },
-      select: { id: true }
-    });
-    
-    if (!user) {
-      throw new Error(`User not found for Clerk ID: ${data.userId}`);
-    }
-    
-    resolvedUserId = user.id;
-  }
-
-  // Fetch resume details for filename if not provided
-  let resumeFileName = data.resumeFileName;
-  if (!resumeFileName && data.resumeId) {
-    const resume = await prisma.resumeDocument.findUnique({
-      where: { id: data.resumeId },
-      select: { fileName: true }
-    });
-    resumeFileName = resume?.fileName;
-  }
+  // User ID is the DB UUID (session auth)
+  const resolvedUserId = data.userId;
 
   const interview = await prisma.interview.create({
     data: {
@@ -86,8 +61,8 @@ export async function createInterview(data: CreateInterviewData) {
       companyName: data.companyName,
       jobDescription: data.jobDescription,
       resumeId: data.resumeId, // Foreign key to ResumeDocument
-      resumeFileName: resumeFileName,
       language: data.language || 'en-US',
+      roleCountryCode: data.country || null,
       status: 'PENDING'
     }
   });
@@ -106,7 +81,7 @@ export async function getInterviewById(id: string) {
       user: {
         select: {
           id: true,
-          clerkId: true,
+          
           firstName: true,
           lastName: true,
           email: true
@@ -127,7 +102,7 @@ export async function getInterviewByRetellCallId(retellCallId: string) {
       user: {
         select: {
           id: true,
-          clerkId: true,
+          
           firstName: true,
           lastName: true
         }
@@ -141,7 +116,7 @@ export async function getInterviewByRetellCallId(retellCallId: string) {
  * Get user's interviews with pagination
  */
 export async function getUserInterviews(
-  clerkId: string,
+  userId: string,
   options: InterviewQueryOptions = {}
 ) {
   const {
@@ -156,7 +131,7 @@ export async function getUserInterviews(
 
   // Build where clause
   const where: Prisma.InterviewWhereInput = {
-    user: { clerkId }
+    user: { id: userId }
   };
 
   if (status) {
@@ -167,7 +142,7 @@ export async function getUserInterviews(
   const total = await prisma.interview.count({ where });
 
   // Get interviews with hasFeedback computed field
-  // OPTIMIZATION: Use raw SQL to check feedbackPdf existence without fetching the blob
+  // OPTIMIZATION: Use raw SQL to check feedback existence without fetching the blob
   const interviews = await prisma.$queryRaw<Array<{
     id: string;
     jobTitle: string;
@@ -194,9 +169,9 @@ export async function getUserInterviews(
       ended_at as "endedAt",
       seniority,
       language,
-      (feedback_pdf IS NOT NULL) as "hasFeedback"
+      (feedback_document_id IS NOT NULL) as "hasFeedback"
     FROM interviews
-    WHERE user_id = (SELECT id FROM users WHERE clerk_id = ${clerkId})
+    WHERE user_id = ${userId}
     ${status ? Prisma.sql`AND status = ${status}` : Prisma.empty}
     ORDER BY ${Prisma.raw(`${sortBy === 'createdAt' ? 'created_at' : sortBy} ${sortOrder.toUpperCase()}`)}
     LIMIT ${limit}
@@ -267,26 +242,55 @@ export async function startInterview(id: string, retellCallId: string) {
 export async function completeInterview(
   retellCallId: string,
   results: {
-    score?: number;
-    feedbackPdf?: string;
+    score?: number | null;
     feedbackText?: string;
     callDuration?: number;
   }
 ) {
   dbLogger.info('Completing interview', { retellCallId });
 
+  // Import feedback parser for metrics extraction
+  const { parseFeedbackSummary, convertToInterviewMetrics } = await import('../utils/feedbackParser');
+
+  // Parse feedback to extract score if not provided (prioritize feedbackText when score is null)
+  let finalScore: number | null | undefined = results.score;
+  let parsedFeedback = null;
+
+  if (results.feedbackText) {
+    try {
+      parsedFeedback = parseFeedbackSummary(results.feedbackText);
+      
+      // Prioritize: set score from feedbackText when score is null or undefined
+      if (parsedFeedback.overallScore !== null && (finalScore === null || finalScore === undefined)) {
+        finalScore = parsedFeedback.overallScore;
+        dbLogger.info('Extracted score from feedbackText (score was null)', { 
+          retellCallId, 
+          extractedScore: finalScore,
+          categoryScores: parsedFeedback.categoryScores 
+        });
+      }
+    } catch (parseError: any) {
+      dbLogger.warn('Failed to parse feedback text', { 
+        retellCallId, 
+        error: parseError.message 
+      });
+    }
+  }
+
   const completedInterview = await prisma.interview.update({
     where: { retellCallId },
     data: {
       status: 'COMPLETED',
       endedAt: new Date(),
-      ...results
+      score: finalScore ?? undefined,
+      feedbackText: results.feedbackText,
+      callDuration: results.callDuration
     },
     include: {
       user: {
         select: {
           id: true,
-          clerkId: true,
+          
           email: true,
           firstName: true,
           lastName: true,
@@ -297,53 +301,83 @@ export async function completeInterview(
   });
 
   // ========================================
+  // SAVE INTERVIEW METRICS (non-blocking)
+  // ========================================
+  if (parsedFeedback && parsedFeedback.categoryScores && Object.keys(parsedFeedback.categoryScores).length > 0) {
+    try {
+      const metrics = convertToInterviewMetrics(parsedFeedback, completedInterview.id);
+      
+      if (metrics.length > 0) {
+        await addInterviewMetrics(completedInterview.id, metrics);
+        dbLogger.info('Interview metrics saved', { 
+          interviewId: completedInterview.id,
+          metricsCount: metrics.length 
+        });
+      }
+    } catch (metricsError: any) {
+      // Non-blocking - interview is still complete even if metrics fail
+      dbLogger.warn('Failed to save interview metrics', { 
+        interviewId: completedInterview.id,
+        error: metricsError.message 
+      });
+    }
+  }
+
+  // ========================================
+  // PERSIST TRANSCRIPT SEGMENTS (non-blocking)
+  // ========================================
+  try {
+    const { RetellService } = await import('./retellService');
+    const retellService = new RetellService(process.env.RETELL_API_KEY || '');
+    const { createTranscriptSegments } = await import('./analyticsService');
+    
+    const callDetails = await retellService.getCall(retellCallId);
+    
+    if (callDetails) {
+      const callDurationMs = results.callDuration || 
+        ((callDetails as any).end_timestamp && (callDetails as any).start_timestamp 
+          ? (callDetails as any).end_timestamp - (callDetails as any).start_timestamp 
+          : 0);
+      
+      await createTranscriptSegments(completedInterview.id, callDetails, callDurationMs);
+      dbLogger.info('Transcript segments persisted', { 
+        interviewId: completedInterview.id 
+      });
+    }
+  } catch (transcriptError: any) {
+    // Non-blocking - interview is still complete even if transcript fails
+    dbLogger.warn('Failed to persist transcript segments', { 
+      interviewId: completedInterview.id,
+      error: transcriptError.message 
+    });
+  }
+
+  // ========================================
   // SEND INTERVIEW COMPLETE EMAIL (non-blocking, idempotent)
   // ========================================
   if (completedInterview.user?.email) {
-    try {
-      const emailData: InterviewCompleteData = {
-        user: {
-          id: completedInterview.user.id,
-          clerkId: completedInterview.user.clerkId,
-          email: completedInterview.user.email,
-          firstName: completedInterview.user.firstName,
-          lastName: completedInterview.user.lastName,
-          preferredLanguage: completedInterview.user.preferredLanguage
-        },
-        interviewId: completedInterview.id,
-        interviewTitle: completedInterview.jobTitle || 'Interview Practice',
-        jobRole: completedInterview.jobTitle || 'General Interview',
-        duration: results.callDuration ? Math.round(results.callDuration / 60) : 0,
-        overallScore: results.score || undefined
-      };
-
-      // Fire and forget
-      sendInterviewCompleteEmail(emailData)
-        .then(result => {
-          if (result.success && !result.skipped) {
-            dbLogger.info('Interview complete email sent', { 
-              interviewId: completedInterview.id,
-              userId: completedInterview.user?.id,
-              messageId: result.messageId 
-            });
-          } else if (result.skipped) {
-            dbLogger.info('Interview complete email already sent (idempotent)', { 
-              interviewId: completedInterview.id 
-            });
-          }
-        })
-        .catch(err => {
-          dbLogger.warn('Interview complete email failed (non-blocking)', { 
+    // Fire and forget
+    sendInterviewCompleteEmail(completedInterview.id)
+      .then(result => {
+        if (result.success && !result.skipped) {
+          dbLogger.info('Interview complete email sent', {
             interviewId: completedInterview.id,
-            error: err.message 
+            userId: completedInterview.user?.id,
+            messageId: result.messageId,
           });
+        } else if (result.skipped) {
+          dbLogger.info('Interview complete email skipped', {
+            interviewId: completedInterview.id,
+            reason: result.reason,
+          });
+        }
+      })
+      .catch(err => {
+        dbLogger.warn('Interview complete email failed (non-blocking)', {
+          interviewId: completedInterview.id,
+          error: err.message,
         });
-    } catch (emailError: any) {
-      // Non-blocking
-      dbLogger.warn('Could not prepare interview complete email', { 
-        error: emailError.message 
       });
-    }
   }
 
   return completedInterview;
@@ -397,9 +431,9 @@ export async function addInterviewMetrics(
 /**
  * Get interview statistics for dashboard
  */
-export async function getInterviewStats(clerkId: string) {
+export async function getInterviewStats(userId: string) {
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
 
@@ -460,20 +494,29 @@ export async function getInterviewStats(clerkId: string) {
 /**
  * Get interview details for PDF download
  */
-export async function getInterviewForDownload(id: string, clerkId: string) {
+export async function getInterviewForDownload(id: string, userId: string) {
   const interview = await prisma.interview.findFirst({
     where: {
       id,
-      user: { clerkId }
+      user: { id: userId }
     },
     select: {
       id: true,
       jobTitle: true,
       companyName: true,
-      feedbackPdf: true,
-      resumeData: true,
-      resumeFileName: true,
-      resumeMimeType: true
+      resumeId: true,
+      resumeDocument: {
+        select: {
+          storageKey: true,
+          fileName: true,
+          mimeType: true
+        }
+      },
+      feedbackDocument: {
+        select: {
+          pdfStorageKey: true
+        }
+      }
     }
   });
 
@@ -496,25 +539,24 @@ interface CloneInterviewOptions {
  */
 export async function cloneInterview(
   originalInterviewId: string,
-  clerkId: string,
+  userId: string,
   options: CloneInterviewOptions = {}
 ) {
-  dbLogger.info('Cloning interview', { originalInterviewId, clerkId });
+  dbLogger.info('Cloning interview', { originalInterviewId, userId });
   
   // Get original interview
   const original = await prisma.interview.findFirst({
     where: {
       id: originalInterviewId,
-      user: { clerkId }
+      user: { id: userId }
     },
     select: {
       userId: true,
       jobTitle: true,
+      seniority: true,
       companyName: true,
       jobDescription: true,
-      resumeData: true,
-      resumeFileName: true,
-      resumeMimeType: true
+      resumeId: true
     }
   });
   
@@ -522,15 +564,13 @@ export async function cloneInterview(
     throw new Error('Original interview not found');
   }
   
-  // Determine resume data to use
-  let resumeData = original.resumeData;
-  let resumeFileName = original.resumeFileName;
-  let resumeMimeType = original.resumeMimeType;
+  // Determine resume to use
+  let resumeId = original.resumeId;
   
   if (options.resumeId) {
     // Use resume from repository
     const user = await prisma.user.findUnique({
-      where: { clerkId },
+      where: { id: userId },
       select: { id: true }
     });
     
@@ -542,22 +582,18 @@ export async function cloneInterview(
           isActive: true
         },
         select: {
-          base64Data: true,
-          fileName: true,
-          mimeType: true
+          id: true
         }
       });
       
       if (resume) {
-        resumeData = resume.base64Data;
-        resumeFileName = resume.fileName;
-        resumeMimeType = resume.mimeType;
+        resumeId = resume.id;
       }
     }
   } else if (options.useLatestResume) {
     // Use latest (primary) resume from repository
     const user = await prisma.user.findUnique({
-      where: { clerkId },
+      where: { id: userId },
       select: { id: true }
     });
     
@@ -569,16 +605,12 @@ export async function cloneInterview(
           isActive: true
         },
         select: {
-          base64Data: true,
-          fileName: true,
-          mimeType: true
+          id: true
         }
       });
       
       if (primaryResume) {
-        resumeData = primaryResume.base64Data;
-        resumeFileName = primaryResume.fileName;
-        resumeMimeType = primaryResume.mimeType;
+        resumeId = primaryResume.id;
       }
     }
   }
@@ -588,11 +620,10 @@ export async function cloneInterview(
     data: {
       userId: original.userId,
       jobTitle: original.jobTitle,
+      seniority: original.seniority,
       companyName: original.companyName,
       jobDescription: options.updateJobDescription || original.jobDescription,
-      resumeData,
-      resumeFileName,
-      resumeMimeType,
+      resumeId,
       status: 'PENDING'
     }
   });
@@ -609,11 +640,11 @@ export async function cloneInterview(
  * Get suggested retake candidates (interviews that could benefit from practice)
  */
 export async function getSuggestedRetakes(
-  clerkId: string,
+  userId: string,
   limit: number = 5
 ) {
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
   
@@ -647,14 +678,14 @@ export async function getSuggestedRetakes(
  * Get interview history for a specific role/company combination
  */
 export async function getInterviewHistory(
-  clerkId: string,
+  userId: string,
   options: {
     jobTitle?: string;
     companyName?: string;
   }
 ) {
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
   
@@ -714,7 +745,7 @@ export async function getInterviewHistory(
  * Create interview from resume repository
  */
 export async function createInterviewFromResume(
-  clerkId: string,
+  userId: string,
   resumeId: string,
   jobDetails: {
     jobTitle: string;
@@ -723,12 +754,12 @@ export async function createInterviewFromResume(
   }
 ) {
   dbLogger.info('Creating interview from resume repository', { 
-    clerkId, 
+    userId, 
     resumeId 
   });
   
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
   
@@ -744,10 +775,7 @@ export async function createInterviewFromResume(
       isActive: true
     },
     select: {
-      id: true,
-      base64Data: true,
-      fileName: true,
-      mimeType: true
+      id: true
     }
   });
   
@@ -768,9 +796,6 @@ export async function createInterviewFromResume(
       jobTitle: jobDetails.jobTitle,
       companyName: jobDetails.companyName,
       jobDescription: jobDetails.jobDescription,
-      resumeData: resume.base64Data,
-      resumeFileName: resume.fileName,
-      resumeMimeType: resume.mimeType,
       resumeId: resume.id,
       status: 'PENDING'
     }

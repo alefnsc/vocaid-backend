@@ -1,54 +1,39 @@
 /**
  * User Service
- * Handles user-related database operations with Clerk synchronization
+ * Handles user-related database operations
  */
 
 import { prisma, dbLogger } from './databaseService';
 import { Prisma } from '@prisma/client';
-import { clerkClient } from '@clerk/express';
 
 // ========================================
 // USER CRUD OPERATIONS
 // ========================================
 
 /**
- * Find or create user by Clerk ID
- * This is the primary method for ensuring user exists in local DB
+ * Find user by ID (DB UUID)
  */
-export async function findOrCreateUser(clerkId: string) {
-  dbLogger.info('Finding or creating user', { clerkId });
+export async function findUserById(userId: string) {
+  dbLogger.info('Finding user by ID', { userId });
 
-  // First, try to find existing user
-  let user = await prisma.user.findUnique({
-    where: { clerkId }
+  const user = await prisma.user.findUnique({
+    where: { id: userId }
   });
 
   if (user) {
-    dbLogger.info('User found in database', { userId: user.id, clerkId });
+    dbLogger.info('User found in database', { userId: user.id });
     return user;
   }
 
-  // User doesn't exist, fetch from Clerk and create
-  try {
-    const clerkUser = await clerkClient.users.getUser(clerkId);
-    
-    user = await prisma.user.create({
-      data: {
-        clerkId: clerkUser.id,
-        email: clerkUser.emailAddresses[0]?.emailAddress || '',
-        firstName: clerkUser.firstName,
-        lastName: clerkUser.lastName,
-        imageUrl: clerkUser.imageUrl,
-        credits: (clerkUser.publicMetadata?.credits as number) || 0
-      }
-    });
+  dbLogger.warn('User not found', { userId });
+  return null;
+}
 
-    dbLogger.info('User created from Clerk data', { userId: user.id, clerkId });
-    return user;
-  } catch (error: any) {
-    dbLogger.error('Failed to create user from Clerk', { clerkId, error: error.message });
-    throw new Error(`Failed to sync user from Clerk: ${error.message}`);
-  }
+/**
+ * Alias for findUserById (backward compatibility)
+ */
+export async function findOrCreateUser(userId: string) {
+  return findUserById(userId);
 }
 
 /**
@@ -69,33 +54,16 @@ export async function getUserById(id: string) {
 }
 
 /**
- * Get user by Clerk ID
- */
-export async function getUserByClerkId(clerkId: string) {
-  return prisma.user.findUnique({
-    where: { clerkId },
-    include: {
-      _count: {
-        select: {
-          interviews: true,
-          payments: true
-        }
-      }
-    }
-  });
-}
-
-/**
  * Update user profile
  */
 export async function updateUser(
-  clerkId: string, 
+  userId: string, 
   data: Prisma.UserUpdateInput
 ) {
-  dbLogger.info('Updating user', { clerkId, updates: Object.keys(data) });
+  dbLogger.info('Updating user', { userId, updates: Object.keys(data) });
 
   return prisma.user.update({
-    where: { clerkId },
+    where: { id: userId },
     data
   });
 }
@@ -104,11 +72,11 @@ export async function updateUser(
  * Update user credits
  */
 export async function updateUserCredits(
-  clerkId: string, 
+  userId: string, 
   credits: number, 
   operation: 'add' | 'subtract' | 'set'
 ) {
-  dbLogger.info('Updating user credits', { clerkId, credits, operation });
+  dbLogger.info('Updating user credits', { userId, credits, operation });
 
   const updateData: Prisma.UserUpdateInput = {};
 
@@ -125,12 +93,12 @@ export async function updateUserCredits(
   }
 
   const user = await prisma.user.update({
-    where: { clerkId },
+    where: { id: userId },
     data: updateData
   });
 
   dbLogger.info('User credits updated', { 
-    clerkId, 
+    userId, 
     newCredits: user.credits, 
     operation 
   });
@@ -139,55 +107,22 @@ export async function updateUserCredits(
 }
 
 /**
- * Sync user data from Clerk webhook
- */
-export async function syncUserFromClerk(
-  clerkId: string,
-  data: {
-    email?: string;
-    firstName?: string | null;
-    lastName?: string | null;
-    imageUrl?: string | null;
-  }
-) {
-  dbLogger.info('Syncing user from Clerk webhook', { clerkId });
-
-  return prisma.user.upsert({
-    where: { clerkId },
-    create: {
-      clerkId,
-      email: data.email || '',
-      firstName: data.firstName,
-      lastName: data.lastName,
-      imageUrl: data.imageUrl,
-      credits: 1 // Give 1 free credit on signup
-    },
-    update: {
-      email: data.email,
-      firstName: data.firstName,
-      lastName: data.lastName,
-      imageUrl: data.imageUrl
-    }
-  });
-}
-
-/**
  * Delete user (cascade deletes interviews and payments)
  */
-export async function deleteUser(clerkId: string) {
-  dbLogger.warn('Deleting user', { clerkId });
+export async function deleteUser(userId: string) {
+  dbLogger.warn('Deleting user', { userId });
 
   return prisma.user.delete({
-    where: { clerkId }
+    where: { id: userId }
   });
 }
 
 /**
  * Get user dashboard statistics
  */
-export async function getUserDashboardStats(clerkId: string) {
+export async function getUserDashboardStats(userId: string) {
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     include: {
       interviews: {
         where: { status: 'COMPLETED' },

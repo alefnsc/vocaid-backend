@@ -61,6 +61,7 @@ type DashboardKPIs {
   averageScore: Float
   scoreChange: Float
   averageDurationMinutes: Float
+  totalDurationMs: Float
   totalSpent: Float!
   creditsRemaining: Int!
   interviewsThisMonth: Int!
@@ -83,8 +84,11 @@ type RecentInterview {
   resumeTitle: String
   resumeId: String
   durationMinutes: Float
+  callDuration: Int
   score: Float
   status: String!
+  language: String
+  country: String
 }
 
 type ResumeUtilization {
@@ -118,10 +122,17 @@ type AppliedFilters {
   resumeId: String
 }
 
+type WeeklyActivityBucket {
+  day: String!
+  count: Int!
+  durationMs: Int!
+}
+
 type DashboardData {
   kpis: DashboardKPIs!
   scoreEvolution: [ScoreEvolutionPoint!]!
   recentInterviews: [RecentInterview!]!
+  weeklyActivity: [WeeklyActivityBucket!]!
   resumes: [ResumeUtilization!]!
   filterOptions: FilterOptions!
   filters: AppliedFilters!

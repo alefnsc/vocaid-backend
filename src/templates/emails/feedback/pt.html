@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Seus Resultados da Entrevista</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: 'Inter', 'Segoe UI', sans-serif; background-color: #ffffff; color: #1a1a2e;">
+  <table role="presentation" style="width: 100%; max-width: 600px; margin: 0 auto; padding: 32px 24px;">
+    <tr>
+      <td>
+        <!-- Logo -->
+        <div style="text-align: center; margin-bottom: 32px;">
+          <img src="https://vocaid.ai/logo.png" alt="Vocaid" style="height: 40px; width: auto;">
+        </div>
+
+        <!-- Header -->
+        <h1 style="font-size: 24px; font-weight: 700; color: #1a1a2e; margin: 0 0 8px;">
+          Ótimo trabalho, {{{CANDIDATE_FIRST_NAME}}}! 🎯
+        </h1>
+        <p style="font-size: 16px; color: #6b7280; margin: 0 0 32px;">
+          Seus resultados da prática de entrevista estão prontos
+        </p>
+
+        <!-- Interview Summary Card -->
+        <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 16px; padding: 24px; margin-bottom: 24px;">
+          <div style="margin-bottom: 16px;">
+            <p style="color: #6b7280; font-size: 12px; text-transform: uppercase; margin: 0 0 4px;">Cargo</p>
+            <p style="color: #1a1a2e; font-size: 18px; font-weight: 600; margin: 0;">{{{ROLE_TITLE}}}</p>
+          </div>
+          <div style="margin-bottom: 16px;">
+            <p style="color: #6b7280; font-size: 12px; text-transform: uppercase; margin: 0 0 4px;">Empresa</p>
+            <p style="color: #1a1a2e; font-size: 16px; margin: 0;">{{{TARGET_COMPANY}}}</p>
+          </div>
+          <div style="display: flex; gap: 24px;">
+            <div>
+              <p style="color: #6b7280; font-size: 12px; text-transform: uppercase; margin: 0 0 4px;">Duração</p>
+              <p style="color: #1a1a2e; font-size: 16px; margin: 0;">{{{DURATION_MIN}}} min</p>
+            </div>
+            <div>
+              <p style="color: #6b7280; font-size: 12px; text-transform: uppercase; margin: 0 0 4px;">Perguntas</p>
+              <p style="color: #1a1a2e; font-size: 16px; margin: 0;">{{{QUESTIONS_ANSWERED}}}</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Score Card -->
+        <div style="background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%); border-radius: 16px; padding: 32px; margin-bottom: 24px; text-align: center;">
+          <p style="color: rgba(255,255,255,0.9); font-size: 14px; margin: 0 0 8px;">Pontuação Geral</p>
+          <p style="color: #ffffff; font-size: 64px; font-weight: 700; margin: 0 0 8px;">{{{OVERALL_SCORE}}}</p>
+          <p style="color: rgba(255,255,255,0.8); font-size: 14px; margin: 0;">de 100</p>
+        </div>
+
+        <!-- Breakdown -->
+        <h2 style="font-size: 18px; font-weight: 600; color: #1a1a2e; margin: 0 0 16px;">Detalhamento da Pontuação</h2>
+        
+        <div style="margin-bottom: 24px;">
+          <div style="display: flex; justify-content: space-between; margin-bottom: 12px;">
+            <span style="color: #1a1a2e;">Comunicação</span>
+            <span style="font-weight: 600; color: #6366f1;">{{{COMMUNICATION_SCORE}}}/100</span>
+          </div>
+          <div style="display: flex; justify-content: space-between; margin-bottom: 12px;">
+            <span style="color: #1a1a2e;">Conhecimento Técnico</span>
+            <span style="font-weight: 600; color: #6366f1;">{{{TECHNICAL_SCORE}}}/100</span>
+          </div>
+          <div style="display: flex; justify-content: space-between; margin-bottom: 12px;">
+            <span style="color: #1a1a2e;">Resolução de Problemas</span>
+            <span style="font-weight: 600; color: #6366f1;">{{{PROBLEM_SOLVING_SCORE}}}/100</span>
+          </div>
+          <div style="display: flex; justify-content: space-between;">
+            <span style="color: #1a1a2e;">Profissionalismo</span>
+            <span style="font-weight: 600; color: #6366f1;">{{{PROFESSIONALISM_SCORE}}}/100</span>
+          </div>
+        </div>
+
+        <!-- Key Strengths -->
+        <div style="background-color: #ecfdf5; border-radius: 12px; padding: 16px; margin-bottom: 16px;">
+          <p style="color: #059669; font-weight: 600; margin: 0 0 8px;">💪 Pontos Fortes</p>
+          <p style="color: #1a1a2e; margin: 0; line-height: 1.6;">{{{KEY_STRENGTHS}}}</p>
+        </div>
+
+        <!-- Areas to Improve -->
+        <div style="background-color: #fef3c7; border-radius: 12px; padding: 16px; margin-bottom: 24px;">
+          <p style="color: #d97706; font-weight: 600; margin: 0 0 8px;">🎯 Áreas para Melhorar</p>
+          <p style="color: #1a1a2e; margin: 0; line-height: 1.6;">{{{AREAS_TO_IMPROVE}}}</p>
+        </div>
+
+        <!-- CTA Button -->
+        <div style="text-align: center; margin-bottom: 32px;">
+          <a href="{{{FEEDBACK_URL}}}" style="display: inline-block; background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%); color: #ffffff; text-decoration: none; padding: 16px 48px; border-radius: 12px; font-weight: 600; font-size: 16px;">
+            Ver Feedback Completo →
+          </a>
+        </div>
+
+        <!-- Tip -->
+        <div style="background-color: #f0f9ff; border-radius: 12px; padding: 16px; margin-bottom: 32px;">
+          <p style="color: #0284c7; font-weight: 600; margin: 0 0 8px;">💡 Dica</p>
+          <p style="color: #1a1a2e; margin: 0; line-height: 1.6;">
+            A prática leva à perfeição! Agende sua próxima entrevista simulada para continuar melhorando suas habilidades.
+          </p>
+        </div>
+
+        <!-- Divider -->
+        <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 32px 0;">
+
+        <!-- Footer -->
+        <div style="text-align: center;">
+          <p style="color: #9ca3af; font-size: 12px; margin: 0 0 8px;">
+            Dúvidas? Responda este email ou entre em contato em support@vocaid.ai
+          </p>
+          <p style="color: #9ca3af; font-size: 12px; margin: 0;">
+            <a href="{{{PRIVACY_URL}}}" style="color: #9ca3af;">Política de Privacidade</a> · 
+            <a href="{{{TERMS_URL}}}" style="color: #9ca3af;">Termos de Uso</a>
+          </p>
+          <p style="color: #9ca3af; font-size: 12px; margin: 16px 0 0;">
+            © {{{CURRENT_YEAR}}} Vocaid. Todos os direitos reservados.
+          </p>
+        </div>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

@@ -125,6 +125,74 @@ export interface DownloadResult {
 }
 
 /**
+ * Upload a feedback PDF to Azure Blob Storage (exports container)
+ */
+export async function uploadFeedbackPdf(
+  userId: string,
+  fileName: string,
+  content: Buffer,
+  mimeType: string = 'application/pdf'
+): Promise<UploadResult> {
+  // Ensure storage is initialized (handles async startup race)
+  await ensureInitialized();
+
+  if (!isAzureBlobEnabled()) {
+    return {
+      success: false,
+      error:
+        'Azure Blob Storage is not enabled or failed to initialize. Check AZURE_BLOB_STORAGE_ENABLED and AZURE_STORAGE_CONNECTION_STRING environment variables.',
+    };
+  }
+
+  try {
+    const blobName = generateBlobName(userId, fileName);
+    const container = exportsContainer || resumesContainer;
+
+    if (!container) {
+      return { success: false, error: 'No container available for feedback PDF upload' };
+    }
+
+    const blockBlobClient = container.getBlockBlobClient(blobName);
+
+    await blockBlobClient.uploadData(content, {
+      blobHTTPHeaders: {
+        blobContentType: mimeType,
+        blobContentDisposition: `attachment; filename="${fileName}"`,
+      },
+      metadata: {
+        userId,
+        originalFileName: fileName,
+        uploadedAt: new Date().toISOString(),
+        kind: 'feedback_pdf',
+      },
+    });
+
+    apiLogger.info('[azure-blob] Feedback PDF uploaded successfully', {
+      userId: userId.slice(0, 15),
+      blobName,
+      size: content.length,
+    });
+
+    return {
+      success: true,
+      blobUrl: blockBlobClient.url,
+      blobName,
+    };
+  } catch (error) {
+    apiLogger.error('[azure-blob] Failed to upload feedback PDF', {
+      userId: userId.slice(0, 15),
+      fileName,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Upload failed',
+    };
+  }
+}
+
+/**
  * Generate a unique blob name for a file
  */
 function generateBlobName(userId: string, fileName: string): string {
@@ -267,6 +335,66 @@ export async function deleteResume(blobName: string): Promise<boolean> {
 }
 
 /**
+ * Download a feedback PDF from Azure Blob Storage (from exports container)
+ * Falls back to resumes container if exports container not available
+ */
+export async function downloadFeedbackPdf(blobName: string): Promise<DownloadResult> {
+  // Ensure storage is initialized
+  await ensureInitialized();
+  
+  if (!isAzureBlobEnabled()) {
+    return {
+      success: false,
+      error: 'Azure Blob Storage is not enabled or failed to initialize',
+    };
+  }
+
+  try {
+    // Try exports container first, fallback to resumes container
+    const container = exportsContainer || resumesContainer;
+    if (!container) {
+      return {
+        success: false,
+        error: 'No container available for feedback PDF download',
+      };
+    }
+
+    const blockBlobClient = container.getBlockBlobClient(blobName);
+    const downloadResponse = await blockBlobClient.download();
+
+    if (!downloadResponse.readableStreamBody) {
+      return {
+        success: false,
+        error: 'No content in blob',
+      };
+    }
+
+    // Convert stream to buffer
+    const chunks: Buffer[] = [];
+    for await (const chunk of downloadResponse.readableStreamBody) {
+      chunks.push(Buffer.from(chunk));
+    }
+    const data = Buffer.concat(chunks);
+
+    return {
+      success: true,
+      data,
+      contentType: downloadResponse.contentType || 'application/pdf',
+    };
+  } catch (error) {
+    apiLogger.error('[azure-blob] Failed to download feedback PDF', {
+      blobName,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Download failed',
+    };
+  }
+}
+
+/**
  * Generate a SAS URL for temporary access to a blob
  */
 export async function generateSasUrl(
@@ -315,7 +443,9 @@ if (initConfig.enabled && initConfig.connectionString) {
 export default {
   isAzureBlobEnabled,
   uploadResume,
+  uploadFeedbackPdf,
   downloadResume,
+  downloadFeedbackPdf,
   deleteResume,
   generateSasUrl,
   initializeBlobStorage,

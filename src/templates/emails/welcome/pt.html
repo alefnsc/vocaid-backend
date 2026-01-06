@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bem-vindo ao Vocaid</title>
+</head>
+<body style="margin: 0; padding: 0; font-family: 'Inter', 'Segoe UI', sans-serif; background-color: #ffffff; color: #1a1a2e;">
+  <table role="presentation" style="width: 100%; max-width: 600px; margin: 0 auto; padding: 32px 24px;">
+    <tr>
+      <td>
+        <!-- Logo -->
+        <div style="text-align: center; margin-bottom: 32px;">
+          <img src="https://vocaid.ai/logo.png" alt="Vocaid" style="height: 40px; width: auto;">
+        </div>
+
+        <!-- Header -->
+        <h1 style="font-size: 28px; font-weight: 700; color: #1a1a2e; margin: 0 0 8px;">
+          Bem-vindo ao Vocaid, {{{CANDIDATE_FIRST_NAME}}}! 🎉
+        </h1>
+        <p style="font-size: 16px; color: #6b7280; margin: 0 0 32px;">
+          Você está pronto para transformar sua preparação para entrevistas com IA
+        </p>
+
+        <!-- Credits Card -->
+        <div style="background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%); border-radius: 16px; padding: 24px; margin-bottom: 32px;">
+          <p style="color: rgba(255,255,255,0.9); font-size: 14px; margin: 0 0 8px;">Seus Créditos Grátis</p>
+          <p style="color: #ffffff; font-size: 48px; font-weight: 700; margin: 0 0 8px;">{{{free_credits}}}</p>
+          <p style="color: rgba(255,255,255,0.8); font-size: 14px; margin: 0;">créditos para começar a praticar</p>
+        </div>
+
+        <!-- Features -->
+        <h2 style="font-size: 20px; font-weight: 600; color: #1a1a2e; margin: 0 0 16px;">
+          O que você pode fazer com o Vocaid:
+        </h2>
+        
+        <div style="margin-bottom: 24px;">
+          <div style="display: flex; align-items: flex-start; margin-bottom: 16px;">
+            <span style="color: #6366f1; margin-right: 12px; font-size: 20px;">🎯</span>
+            <div>
+              <p style="font-weight: 600; color: #1a1a2e; margin: 0 0 4px;">Pratique Cenários Reais de Entrevista</p>
+              <p style="color: #6b7280; font-size: 14px; margin: 0;">Entrevistas simuladas com IA adaptadas ao seu cargo alvo</p>
+            </div>
+          </div>
+          
+          <div style="display: flex; align-items: flex-start; margin-bottom: 16px;">
+            <span style="color: #6366f1; margin-right: 12px; font-size: 20px;">📊</span>
+            <div>
+              <p style="font-weight: 600; color: #1a1a2e; margin: 0 0 4px;">Receba Feedback Detalhado</p>
+              <p style="color: #6b7280; font-size: 14px; margin: 0;">Análise completa das suas respostas com dicas de melhoria</p>
+            </div>
+          </div>
+          
+          <div style="display: flex; align-items: flex-start;">
+            <span style="color: #6366f1; margin-right: 12px; font-size: 20px;">📈</span>
+            <div>
+              <p style="font-weight: 600; color: #1a1a2e; margin: 0 0 4px;">Acompanhe Seu Progresso</p>
+              <p style="color: #6b7280; font-size: 14px; margin: 0;">Veja como você melhora ao longo do tempo com análises detalhadas</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- CTA Button -->
+        <div style="text-align: center; margin-bottom: 32px;">
+          <a href="{{{DASHBOARD_URL}}}" style="display: inline-block; background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%); color: #ffffff; text-decoration: none; padding: 16px 48px; border-radius: 12px; font-weight: 600; font-size: 16px;">
+            Comece Sua Primeira Entrevista →
+          </a>
+        </div>
+
+        <!-- Divider -->
+        <hr style="border: none; border-top: 1px solid #e5e7eb; margin: 32px 0;">
+
+        <!-- Footer -->
+        <div style="text-align: center;">
+          <p style="color: #9ca3af; font-size: 12px; margin: 0 0 8px;">
+            Dúvidas? Responda este email ou entre em contato em support@vocaid.ai
+          </p>
+          <p style="color: #9ca3af; font-size: 12px; margin: 0;">
+            <a href="{{{PRIVACY_URL}}}" style="color: #9ca3af;">Política de Privacidade</a> · 
+            <a href="{{{TERMS_URL}}}" style="color: #9ca3af;">Termos de Uso</a>
+          </p>
+          <p style="color: #9ca3af; font-size: 12px; margin: 16px 0 0;">
+            © {{{CURRENT_YEAR}}} Vocaid. Todos os direitos reservados.
+          </p>
+        </div>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>

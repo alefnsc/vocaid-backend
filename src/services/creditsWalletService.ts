@@ -311,14 +311,16 @@ export async function restoreCredits(
   amount: number,
   description: string,
   referenceType?: string,
-  referenceId?: string
+  referenceId?: string,
+  idempotencyKey?: string
 ): Promise<TransactionResult> {
   return addCredits(userId, {
     type: 'RESTORE',
     amount,
     description,
     referenceType,
-    referenceId
+    referenceId,
+    idempotencyKey
   });
 }
 

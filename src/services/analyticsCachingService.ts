@@ -12,11 +12,7 @@
  * @module services/analyticsCachingService
  */
 
-import { prisma, dbLogger } from './databaseService';
-import { Prisma } from '@prisma/client';
-
-// Type alias for Prisma JSON input
-type InputJsonValue = Prisma.InputJsonValue;
+import { dbLogger } from './databaseService';
 
 // ============================================
 // CONSTANTS
@@ -73,6 +69,18 @@ interface CacheOptions {
   ttlMs?: number;
 }
 
+type UserCacheKey = `${string}:${CacheKey}`;
+
+const userCache = new Map<UserCacheKey, CacheEntry>();
+
+interface GlobalSnapshotEntry<T = unknown> {
+  data: T;
+  recordCount: number;
+  computedAt: Date;
+}
+
+const globalSnapshots = new Map<SnapshotType, GlobalSnapshotEntry>();
+
 // ============================================
 // USER CACHE OPERATIONS
 // ============================================
@@ -86,18 +94,8 @@ export async function getCachedAnalytics<T>(
   cacheKey: CacheKey
 ): Promise<T | null> {
   try {
-    // Safeguard: ensure prisma is initialized
-    if (!prisma) {
-      dbLogger.warn('Prisma client not initialized in getCachedAnalytics');
-      return null;
-    }
-    
-    const cached = await prisma.analyticsCache.findUnique({
-      where: {
-        userId_cacheKey: { userId, cacheKey }
-      }
-    });
-
+    const key: UserCacheKey = `${userId}:${cacheKey}`;
+    const cached = userCache.get(key);
     if (!cached) {
       dbLogger.debug('Analytics cache miss', { userId, cacheKey });
       return null;
@@ -110,11 +108,12 @@ export async function getCachedAnalytics<T>(
         cacheKey, 
         expiredAt: cached.expiresAt 
       });
+      userCache.delete(key);
       return null;
     }
 
     dbLogger.debug('Analytics cache hit', { userId, cacheKey });
-    return cached.cacheData as T;
+    return cached.data as T;
   } catch (error) {
     dbLogger.error('Failed to get cached analytics', { 
       userId, 
@@ -138,35 +137,18 @@ export async function setCachedAnalytics<T>(
   data: T,
   options?: { ttlMs?: number }
 ): Promise<void> {
-  // Safeguard: ensure prisma is initialized
-  if (!prisma) {
-    dbLogger.warn('Prisma client not initialized in setCachedAnalytics');
-    return;
-  }
-  
   const ttlMs = options?.ttlMs ?? CACHE_TTL[cacheKey] ?? 5 * 60 * 1000;
   const now = new Date();
   const expiresAt = new Date(now.getTime() + ttlMs);
 
   try {
-    await prisma.analyticsCache.upsert({
-      where: {
-        userId_cacheKey: { userId, cacheKey }
-      },
-      create: {
-        userId,
-        cacheKey,
-        cacheData: data as InputJsonValue,
-        computedAt: now,
-        expiresAt,
-        version: 1
-      },
-      update: {
-        cacheData: data as InputJsonValue,
-        computedAt: now,
-        expiresAt,
-        version: { increment: 1 }
-      }
+    const key: UserCacheKey = `${userId}:${cacheKey}`;
+    const existing = userCache.get(key);
+    userCache.set(key, {
+      data,
+      computedAt: now,
+      expiresAt,
+      version: (existing?.version ?? 0) + 1,
     });
 
     dbLogger.debug('Analytics cache set', { userId, cacheKey, expiresAt });
@@ -190,13 +172,17 @@ export async function setCachedAnalytics<T>(
  */
 export async function invalidateUserCache(userId: string): Promise<void> {
   try {
-    const result = await prisma.analyticsCache.deleteMany({
-      where: { userId }
-    });
+    let deletedCount = 0;
+    for (const key of userCache.keys()) {
+      if (key.startsWith(`${userId}:`)) {
+        userCache.delete(key);
+        deletedCount++;
+      }
+    }
 
     dbLogger.info('User analytics cache invalidated', { 
       userId, 
-      deletedCount: result.count 
+      deletedCount
     });
   } catch (error) {
     dbLogger.error('Failed to invalidate user cache', { 
@@ -218,26 +204,20 @@ export async function invalidateCacheKey(
   cacheKey: CacheKey
 ): Promise<void> {
   try {
-    await prisma.analyticsCache.delete({
-      where: {
-        userId_cacheKey: { userId, cacheKey }
-      }
-    });
+    const key: UserCacheKey = `${userId}:${cacheKey}`;
+    userCache.delete(key);
 
     dbLogger.debug('Cache key invalidated', { userId, cacheKey });
   } catch (error) {
-    // Ignore if cache entry doesn't exist
-    if ((error as any)?.code !== 'P2025') {
-      dbLogger.error('Failed to invalidate cache key', { 
-        userId, 
-        cacheKey, 
-        error: error instanceof Error ? {
-          message: error.message,
-          name: error.name,
-          stack: error.stack
-        } : String(error)
-      });
-    }
+    dbLogger.error('Failed to invalidate cache key', { 
+      userId, 
+      cacheKey, 
+      error: error instanceof Error ? {
+        message: error.message,
+        name: error.name,
+        stack: error.stack
+      } : String(error)
+    });
   }
 }
 
@@ -253,9 +233,7 @@ export async function getGlobalSnapshot<T>(
   snapshotType: SnapshotType
 ): Promise<T | null> {
   try {
-    const snapshot = await prisma.globalAnalyticsSnapshot.findUnique({
-      where: { snapshotType }
-    });
+    const snapshot = globalSnapshots.get(snapshotType);
 
     if (!snapshot) {
       dbLogger.debug('Global snapshot miss', { snapshotType });
@@ -272,7 +250,7 @@ export async function getGlobalSnapshot<T>(
       // Return stale data but log warning
     }
 
-    return snapshot.snapshotData as T;
+    return snapshot.data as T;
   } catch (error) {
     dbLogger.error('Failed to get global snapshot', { 
       snapshotType, 
@@ -296,19 +274,10 @@ export async function setGlobalSnapshot<T>(
   recordCount: number
 ): Promise<void> {
   try {
-    await prisma.globalAnalyticsSnapshot.upsert({
-      where: { snapshotType },
-      create: {
-        snapshotType,
-        snapshotData: data as InputJsonValue,
-        recordCount,
-        computedAt: new Date()
-      },
-      update: {
-        snapshotData: data as InputJsonValue,
-        recordCount,
-        computedAt: new Date()
-      }
+    globalSnapshots.set(snapshotType, {
+      data,
+      recordCount,
+      computedAt: new Date(),
     });
 
     dbLogger.info('Global snapshot updated', { snapshotType, recordCount });
@@ -376,17 +345,20 @@ export async function getOrComputeAnalytics<T>(
  */
 export async function cleanupExpiredCache(): Promise<number> {
   try {
-    const result = await prisma.analyticsCache.deleteMany({
-      where: {
-        expiresAt: { lt: new Date() }
+    const now = new Date();
+    let deletedCount = 0;
+    for (const [key, entry] of userCache.entries()) {
+      if (entry.expiresAt < now) {
+        userCache.delete(key);
+        deletedCount++;
       }
-    });
+    }
 
     dbLogger.info('Expired cache entries cleaned up', { 
-      deletedCount: result.count 
+      deletedCount
     });
 
-    return result.count;
+    return deletedCount;
   } catch (error) {
     dbLogger.error('Failed to cleanup expired cache', { 
       error: error instanceof Error ? {
@@ -408,25 +380,22 @@ export async function getCacheStats(): Promise<{
   entriesByKey: Record<string, number>;
 }> {
   try {
-    const [total, expired, byKey] = await Promise.all([
-      prisma.analyticsCache.count(),
-      prisma.analyticsCache.count({
-        where: { expiresAt: { lt: new Date() } }
-      }),
-      prisma.analyticsCache.groupBy({
-        by: ['cacheKey'],
-        _count: true
-      })
-    ]);
-
+    const now = new Date();
     const entriesByKey: Record<string, number> = {};
-    byKey.forEach(item => {
-      entriesByKey[item.cacheKey] = item._count;
-    });
+    let expiredEntries = 0;
+
+    for (const entry of userCache.values()) {
+      if (entry.expiresAt < now) expiredEntries++;
+    }
+
+    for (const key of userCache.keys()) {
+      const cacheKey = key.split(':').slice(1).join(':');
+      entriesByKey[cacheKey] = (entriesByKey[cacheKey] ?? 0) + 1;
+    }
 
     return {
-      totalEntries: total,
-      expiredEntries: expired,
+      totalEntries: userCache.size,
+      expiredEntries,
       entriesByKey
     };
   } catch (error) {

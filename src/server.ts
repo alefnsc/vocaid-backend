@@ -1,11 +1,11 @@
-// Load environment variables FIRST - before any other imports
-import dotenv from 'dotenv';
-dotenv.config();
+// Load environment variables before other modules evaluate (ESM-safe)
+import 'dotenv/config';
 
 import express, { Request, Response, NextFunction } from 'express';
 import expressWs from 'express-ws';
 import cors from 'cors';
 import bodyParser from 'body-parser';
+import cookieParser from 'cookie-parser';
 import OpenAI from 'openai';
 import { RawData, WebSocket } from 'ws';
 import helmet from 'helmet';
@@ -18,6 +18,8 @@ import { config, logEnvDiagnostics } from './config/env';
 
 // Services
 import { RetellService } from './services/retellService';
+import { getMultilingualRetellService } from './services/multilingualRetellService';
+import { isValidLanguageCode } from './types/multilingual';
 import { MercadoPagoService, getMercadoPagoCredentials } from './services/mercadoPagoService';
 import { FeedbackService } from './services/feedbackService';
 import { CustomLLMWebSocketHandler } from './services/customLLMWebSocket';
@@ -29,13 +31,14 @@ import { downloadResume } from './services/azureBlobService';
 import { prisma } from './services/databaseService';
 
 // Routes
-import apiRoutes from './routes/apiRoutes';
 import analyticsRoutes from './routes/analyticsRoutes';
 import creditsRoutes from './routes/creditsRoutes';
 import leadsRoutes from './routes/leadsRoutes';
 import multilingualRoutes from './routes/multilingualRoutes';
 import consentRoutes from './routes/consentRoutes';
 import dashboardRoutes from './routes/dashboardRoutes';
+import phoneRoutes from './routes/phoneRoutes';
+import interviewRoutes from './routes/interviewRoutes';
 
 // Middleware
 import { requireConsent } from './middleware/consentMiddleware';
@@ -54,7 +57,6 @@ const requiredEnvVars = [
   'OPENAI_API_KEY',
   'RETELL_API_KEY',
   'RETELL_AGENT_ID',
-  'CLERK_SECRET_KEY'
 ];
 
 // MercadoPago credentials are validated based on NODE_ENV
@@ -78,7 +80,6 @@ if (missingEnvVars.length > 0) {
   logger.error('OpenAI: https://platform.openai.com/api-keys');
   logger.error('Retell: https://beta.retellai.com/');
   logger.error('Mercado Pago: https://www.mercadopago.com.br/developers/panel/credentials');
-  logger.error('Clerk: https://dashboard.clerk.com/');
 }
 
 // Log optional env vars status
@@ -98,6 +99,58 @@ const PORT = config.server.port;
 app.set('trust proxy', 1);
 
 // ===== SECURITY MIDDLEWARE =====
+
+// ===== CORS CONFIGURATION =====
+
+const isLocalhostOrigin = (origin: string): boolean => {
+  try {
+    const url = new URL(origin);
+    return url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '::1';
+  } catch {
+    return false;
+  }
+};
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (server-to-server, health checks)
+    if (!origin) {
+      return callback(null, true);
+    }
+
+    // Always allow local development origins regardless of NODE_ENV
+    if (isLocalhostOrigin(origin)) {
+      return callback(null, true);
+    }
+    
+    // Allow localhost, ngrok, and configured frontend URL
+    const allowedOrigins = [
+      'http://localhost:3000',
+      'http://localhost:3001',
+      process.env.FRONTEND_URL
+    ].filter(Boolean);
+    
+    // Allow any ngrok URL (for development/testing)
+    if (origin.includes('ngrok') || origin.includes('ngrok-free.app')) {
+      return callback(null, true);
+    }
+    
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    
+    // In development, allow all origins
+    if (process.env.NODE_ENV === 'development') {
+      return callback(null, true);
+    }
+    
+    logger.warn('CORS blocked request from origin', { origin });
+    callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning', 'svix-id', 'svix-timestamp', 'svix-signature']
+}));
 
 // Helmet - HTTP Security Headers
 app.use(helmet({
@@ -170,54 +223,12 @@ const sanitizeString = (str: string): string => {
     .slice(0, 10000); // Limit length
 };
 
-// Validate userId format (Clerk user IDs)
-const isValidUserId = (userId: string): boolean => {
-  // Clerk user IDs follow pattern: user_xxxxx
-  return /^user_[a-zA-Z0-9]+$/.test(userId);
-};
-
-// ===== CORS CONFIGURATION =====
-
-app.use(cors({
-  origin: function (origin, callback) {
-    // Block requests with no origin in production (except webhooks)
-    if (!origin) {
-      // Allow for webhooks and health checks
-      return callback(null, true);
-    }
-    
-    // Allow localhost, ngrok, and configured frontend URL
-    const allowedOrigins = [
-      'http://localhost:3000',
-      'http://localhost:3001',
-      process.env.FRONTEND_URL
-    ].filter(Boolean);
-    
-    // Allow any ngrok URL (for development/testing)
-    if (origin.includes('ngrok') || origin.includes('ngrok-free.app')) {
-      return callback(null, true);
-    }
-    
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    
-    // In development, allow all origins
-    if (process.env.NODE_ENV === 'development') {
-      return callback(null, true);
-    }
-    
-    logger.warn('CORS blocked request from origin', { origin });
-    callback(new Error('Not allowed by CORS'));
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-user-id', 'ngrok-skip-browser-warning', 'svix-id', 'svix-timestamp', 'svix-signature']
-}));
-
 // Body parsers with size limits to prevent large payload attacks
 app.use(bodyParser.json({ limit: '1mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '1mb' }));
+
+// Cookie parser for session management
+app.use(cookieParser());
 
 // ===== OBSERVABILITY MIDDLEWARE =====
 // Centralized request tracking with metrics, slow request detection, and duplicate detection
@@ -229,9 +240,6 @@ app.use(observabilityMiddleware);
 import { cachingMiddleware } from './middleware/cachingMiddleware';
 app.use(cachingMiddleware);
 
-// Mount API routes for database operations (dashboard, interviews, payments, etc.)
-app.use('/api', apiRoutes);
-
 // Mount analytics, performance chat, and abuse detection routes
 app.use('/api', analyticsRoutes);
 
@@ -240,10 +248,6 @@ app.use('/api/credits', creditsRoutes);
 
 // Mount leads routes (public - no auth required)
 app.use('/api/leads', leadsRoutes);
-
-// Mount email routes (with increased body size limit for PDF attachments)
-import emailRoutes from './routes/emailRoutes';
-app.use('/api/email', emailRoutes);
 
 // Mount email admin routes (for managing transactional emails)
 import emailAdminRoutes from './routes/emailAdminRoutes';
@@ -262,6 +266,11 @@ app.use('/api/consent', consentRoutes);
 // Mount dashboard routes (unified candidate dashboard with filtering)
 app.use('/api/dashboard', dashboardRoutes);
 
+// Mount phone verification routes (OTP + onboarding skip)
+app.use('/api/phone', phoneRoutes);
+
+app.use('/api/interviews', interviewRoutes);
+
 // Mount resume repository routes (resume upload, scoring, LinkedIn import)
 // Use larger body limit for base64-encoded resume files (up to 10MB)
 import resumeRoutes from './routes/resumeRoutes';
@@ -275,37 +284,18 @@ app.use('/api/feedback/beta', betaFeedbackRoutes);
 import userRoutes from './routes/userRoutes';
 app.use('/api/users', userRoutes);
 
+// Mount LinkedIn profile routes (profile storage, scoring, consent)
+import linkedinProfileRoutes from './routes/linkedinProfileRoutes';
+app.use('/api/linkedin-profile', linkedinProfileRoutes);
+
 // ===== CONSENT MIDDLEWARE =====
 // Apply consent checking to protected routes
 // Exempt paths are defined in the middleware
 app.use(requireConsent);
 
-// ===== AUTHENTICATION MIDDLEWARE =====
-
-// Verify user ID from header matches Clerk format and is present
-const verifyUserAuth = async (req: Request, res: Response, next: NextFunction) => {
-  const userId = req.headers['x-user-id'] as string || req.body?.userId;
-  
-  if (!userId) {
-    authLogger.warn('Missing user ID in request', { path: req.path });
-    return res.status(401).json({
-      status: 'error',
-      message: 'Authentication required'
-    });
-  }
-  
-  if (!isValidUserId(userId)) {
-    authLogger.warn('Invalid user ID format', { userId, path: req.path });
-    return res.status(401).json({
-      status: 'error',
-      message: 'Invalid authentication'
-    });
-  }
-  
-  // Attach userId to request for downstream use
-  (req as any).authenticatedUserId = userId;
-  next();
-};
+// ===== SESSION AUTHENTICATION MIDDLEWARE =====
+// Import session-based authentication middleware
+import { requireSession, optionalSession } from './middleware/sessionAuthMiddleware';
 
 // ===== INITIALIZE SERVICES =====
 
@@ -364,7 +354,7 @@ app.post('/metrics/reset', (req: Request, res: Response) => {
  * Protected: Requires valid user authentication
  */
 app.post('/register-call',
-  verifyUserAuth,
+  requireSession,
   [
     body('metadata').isObject().withMessage('Metadata must be an object'),
     body('metadata.first_name').optional().isString().trim().escape(),
@@ -376,7 +366,7 @@ app.post('/register-call',
   async (req: Request, res: Response) => {
   try {
     const { metadata } = req.body;
-    const userId = (req as any).authenticatedUserId;
+    const userId = req.userId!; // Non-null: requireSession ensures userId exists
 
     // Validate interview_id is provided (required for resume lookup)
     if (!metadata.interview_id) {
@@ -442,9 +432,14 @@ app.post('/register-call',
       fileName: resumeFileName
     });
 
+    // Resolve preferred language from request or interview record
+    const preferredLanguageRaw = sanitizeString(metadata.preferred_language || '') || interview.language || 'en-US';
+    const preferredLanguage = isValidLanguageCode(preferredLanguageRaw) ? preferredLanguageRaw : 'en-US';
+
     // Sanitize metadata strings
     const sanitizedMetadata = {
       ...metadata,
+      preferred_language: preferredLanguage,
       first_name: sanitizeString(metadata.first_name || ''),
       last_name: sanitizeString(metadata.last_name || ''),
       company_name: sanitizeString(metadata.company_name || ''),
@@ -452,13 +447,30 @@ app.post('/register-call',
       job_description: sanitizeString(metadata.job_description || ''),
     };
 
-    const result = await retellService.registerCall({ metadata: sanitizedMetadata }, userId);
+    // Register call with multilingual-aware agent selection
+    const multilingualRetell = getMultilingualRetellService();
+    const result = await multilingualRetell.registerMultilingualCall({
+      userId,
+      language: preferredLanguage as any,
+      metadata: {
+        first_name: sanitizedMetadata.first_name,
+        last_name: sanitizedMetadata.last_name,
+        job_title: sanitizedMetadata.job_title,
+        company_name: sanitizedMetadata.company_name,
+        job_description: sanitizedMetadata.job_description,
+        interviewee_cv: intervieweeCV,
+        resume_file_name: resumeFileName,
+        resume_mime_type: resumeMimeType,
+        interview_id: sanitizedMetadata.interview_id,
+        preferred_language: preferredLanguage as any,
+      },
+    });
     
     // Store call context for Custom LLM WebSocket to retrieve
     // This ensures preferred_language is available even if Retell doesn't forward it
     if (result.call_id) {
       storeCallContext(result.call_id, {
-        preferredLanguage: sanitizedMetadata.preferred_language || 'en-US',
+        preferredLanguage: preferredLanguage,
         first_name: sanitizedMetadata.first_name,
         last_name: sanitizedMetadata.last_name,
         job_title: sanitizedMetadata.job_title,
@@ -470,7 +482,7 @@ app.post('/register-call',
       });
       retellLogger.info('Call context stored for Custom LLM', {
         callId: result.call_id,
-        preferredLanguage: sanitizedMetadata.preferred_language || 'en-US',
+        preferredLanguage: preferredLanguage,
         hasResume: true
       });
     }
@@ -528,6 +540,65 @@ app.get('/get-feedback-for-interview/:callId', async (req: Request, res: Respons
     const useStructured = req.query.structured === 'true' || process.env.USE_STRUCTURED_FEEDBACK === 'true';
     const seniority = (req.query.seniority as string) || 'mid';
     const language = (req.query.language as string) || 'en';
+
+    // Prefer pre-generated feedback stored during the post-call pipeline.
+    // This avoids slow Retell transcript fetching + on-demand LLM generation on page load.
+    const interview = await prisma.interview.findUnique({
+      where: { retellCallId: callId },
+      select: {
+        id: true,
+        feedbackDocument: {
+          select: {
+            contentJson: true,
+          },
+        },
+      },
+    });
+
+    if (interview?.feedbackDocument?.contentJson) {
+      const structured = interview.feedbackDocument.contentJson as any;
+
+      // Minimal legacy mapping for backwards compatibility.
+      const legacy = {
+        overall_rating: Math.max(1, Math.min(5, Math.round(((structured?.overallScore ?? 0) as number) / 20))),
+        strengths: Array.isArray(structured?.strengths)
+          ? structured.strengths.map((s: any) => s?.title).filter(Boolean)
+          : [],
+        areas_for_improvement: Array.isArray(structured?.improvements)
+          ? structured.improvements.map((i: any) => i?.title).filter(Boolean)
+          : [],
+        recommendations: Array.isArray(structured?.studyPlan)
+          ? structured.studyPlan.map((p: any) => p?.title).filter(Boolean)
+          : [],
+        detailed_feedback: structured?.executiveSummary || '',
+      };
+
+      return res.json({
+        status: 'success',
+        call_id: callId,
+        feedback: legacy,
+        structured_feedback: structured,
+        call_status: null,
+        version: '2.0',
+      });
+    }
+
+    // If we have an interview record but feedback isn't stored yet, kick off post-call processing
+    // and return a fast "not ready" response.
+    if (interview?.id) {
+      postCallProcessingService.processInterview(interview.id).catch((error: any) => {
+        feedbackLogger.error('Failed to trigger post-call processing from feedback endpoint', {
+          interviewId: interview.id,
+          callId,
+          error: error.message,
+        });
+      });
+
+      return res.status(404).json({
+        status: 'error',
+        message: 'Interview feedback not available yet',
+      });
+    }
 
     // Get call details from Retell
     const call: any = await retellService.getCall(callId);
@@ -618,7 +689,7 @@ app.get('/get-feedback-for-interview/:callId', async (req: Request, res: Respons
  */
 app.post('/create-payment-preference',
   sensitiveLimiter, // Stricter rate limit for payment endpoints
-  verifyUserAuth,
+  requireSession,
   [
     body('packageId').isIn(['starter', 'intermediate', 'professional']).withMessage('Invalid package ID'),
     body('userId').isString().matches(/^user_[a-zA-Z0-9]+$/).withMessage('Invalid user ID format'),
@@ -628,7 +699,7 @@ app.post('/create-payment-preference',
   async (req: Request, res: Response) => {
   try {
     const { packageId, userId, userEmail } = req.body;
-    const authenticatedUserId = (req as any).authenticatedUserId;
+    const authenticatedUserId = req.userId;
     
     // CRITICAL: Verify the request is for the authenticated user (prevent credit theft)
     if (userId !== authenticatedUserId) {
@@ -789,6 +860,8 @@ app.get('/webhook/mercadopago', (req: Request, res: Response) => {
 
 import { getPaymentGateway } from './services/paymentStrategyService';
 import { addPurchasedCredits } from './services/creditsWalletService';
+import postCallProcessingService from './services/postCallProcessingService';
+import { Retell } from 'retell-sdk';
 
 /**
  * PayPal webhook handler
@@ -817,12 +890,12 @@ app.post('/webhook/paypal',
     const result = await paypalProvider.handleWebhook(payload, headers);
     
     if (result.success && result.creditsToAdd && result.userId) {
-      // Find user by Clerk ID and add credits
+      // Find user by internal UUID and add credits
       const { PrismaClient } = await import('@prisma/client');
       const prisma = new PrismaClient();
       
       const user = await prisma.user.findUnique({
-        where: { clerkId: result.userId }
+        where: { id: result.userId }
       });
       
       if (user) {
@@ -844,11 +917,26 @@ app.post('/webhook/paypal',
         const updatedUser = await prisma.user.findUnique({ where: { id: user.id } });
         const newBalance = updatedUser?.credits ?? 0;
 
+        // Fetch payment details for accurate receipt fields
+        let amountPaid = 0;
+        let currency = 'USD';
+        let paidAt = new Date();
+        try {
+          const status = await paypalProvider.getPaymentStatus(result.paymentId);
+          if (typeof status.amount === 'number' && !Number.isNaN(status.amount)) amountPaid = status.amount;
+          if (status.currency) currency = status.currency;
+          if (status.paidAt) paidAt = status.paidAt;
+        } catch (e: any) {
+          paymentLogger.warn('Failed to fetch PayPal payment status for receipt', {
+            paymentId: result.paymentId,
+            error: e?.message,
+          });
+        }
+
         if (user.email) {
           const purchaseData: PurchaseEmailData = {
             user: {
               id: user.id,
-              clerkId: user.clerkId,
               email: user.email,
               firstName: user.firstName,
               lastName: user.lastName,
@@ -856,12 +944,11 @@ app.post('/webhook/paypal',
             },
             paymentId: result.paymentId,
             provider: 'paypal',
-            packageName: `${result.creditsToAdd} Credits`,
             creditsAmount: result.creditsToAdd,
-            amountPaid: 0, // PayPal doesn't provide this in webhook easily
-            currency: 'USD',
+            amountPaid,
+            currency,
             newBalance,
-            paidAt: new Date()
+            paidAt
           };
 
           // Fire and forget
@@ -903,6 +990,103 @@ app.post('/webhook/paypal',
     res.status(200).json({ status: 'error', message: error.message });
   }
 });
+
+// ========================================
+// RETELL WEBHOOK ENDPOINTS
+// ========================================
+
+type RetellWebhookPayload = {
+  event?: string;
+  call?: any;
+};
+
+const handleRetellWebhook = async (req: Request, res: Response) => {
+  try {
+    const payload = req.body as RetellWebhookPayload;
+    const signature = (req.headers['x-retell-signature'] as string) || '';
+    const apiKey = process.env.RETELL_API_KEY || '';
+
+    // Verify signature (required in production)
+    if (apiKey && signature) {
+      const valid = Retell.verify(JSON.stringify(req.body), apiKey, signature);
+      if (!valid) {
+        retellLogger.warn('Invalid Retell webhook signature');
+        return res.status(401).json({ status: 'rejected', message: 'Invalid signature' });
+      }
+    } else if (process.env.NODE_ENV === 'production') {
+      retellLogger.warn('Missing Retell webhook verification inputs');
+      return res.status(401).json({ status: 'rejected', message: 'Missing signature verification' });
+    }
+
+    const event = payload?.event;
+    const call = payload?.call;
+
+    const interviewId =
+      call?.metadata?.interview_id ||
+      call?.metadata?.interviewId ||
+      call?.metadata?.InterviewId ||
+      call?.metadata?.interviewID ||
+      null;
+
+    // Always ack quickly (Retell webhook timeout is short)
+    res.status(204).send();
+
+    if (!interviewId) {
+      retellLogger.warn('Retell webhook missing interview_id metadata', {
+        event,
+        callId: call?.call_id,
+      });
+      return;
+    }
+
+    // Best-effort: ensure interview has retellCallId linked
+    if (call?.call_id) {
+      prisma.interview
+        .updateMany({
+          where: { id: interviewId, retellCallId: null },
+          data: { retellCallId: call.call_id },
+        })
+        .catch((e: any) => {
+          retellLogger.warn('Failed to link retellCallId to interview', {
+            interviewId,
+            callId: call.call_id,
+            error: e?.message,
+          });
+        });
+    }
+
+    // Trigger processing on analysis-ready event (per Retell docs)
+    if (event === 'call_analyzed') {
+      postCallProcessingService
+        .processInterview(interviewId, { callData: call })
+        .catch((error: any) => {
+          retellLogger.error('Post-call processing failed from webhook', {
+            interviewId,
+            callId: call?.call_id,
+            error: error.message,
+          });
+        });
+    }
+  } catch (error: any) {
+    retellLogger.error('Error handling Retell webhook', { error: error.message });
+    // Acknowledge anyway to avoid retries storms
+    if (!res.headersSent) {
+      res.status(204).send();
+    }
+  }
+};
+
+/**
+ * Retell webhook handler
+ * POST /webhook/retell
+ */
+app.post('/webhook/retell', webhookLimiter, handleRetellWebhook);
+
+/**
+ * Retell webhook handler (alias)
+ * POST /api/webhooks/retell
+ */
+app.post('/api/webhooks/retell', webhookLimiter, handleRetellWebhook);
 
 /**
  * Get PayPal webhook info
@@ -1034,7 +1218,7 @@ app.post('/webhook/payment',
         const prisma = new PrismaClient();
         
         const user = await prisma.user.findUnique({
-          where: { clerkId: result.userId }
+          where: { id: result.userId }
         });
         
         if (user) {
@@ -1054,11 +1238,26 @@ app.post('/webhook/payment',
           const updatedUser = await prisma.user.findUnique({ where: { id: user.id } });
           const newBalance = updatedUser?.credits ?? 0;
 
+          // Fetch payment details for accurate receipt fields
+          let amountPaid = 0;
+          let currency = 'BRL';
+          let paidAt = new Date();
+          try {
+            const status = await mercadoPagoProvider.getPaymentStatus(result.paymentId);
+            if (typeof status.amount === 'number' && !Number.isNaN(status.amount)) amountPaid = status.amount;
+            if (status.currency) currency = status.currency;
+            if (status.paidAt) paidAt = status.paidAt;
+          } catch (e: any) {
+            paymentLogger.warn('Failed to fetch MercadoPago payment status for receipt', {
+              paymentId: result.paymentId,
+              error: e?.message,
+            });
+          }
+
           if (user.email) {
             const purchaseData: PurchaseEmailData = {
               user: {
                 id: user.id,
-                clerkId: user.clerkId,
                 email: user.email,
                 firstName: user.firstName,
                 lastName: user.lastName,
@@ -1066,12 +1265,11 @@ app.post('/webhook/payment',
               },
               paymentId: result.paymentId,
               provider: 'mercadopago',
-              packageName: `${result.creditsToAdd} Credits`,
               creditsAmount: result.creditsToAdd,
-              amountPaid: 0,
-              currency: 'BRL',
+              amountPaid,
+              currency,
               newBalance,
-              paidAt: new Date()
+              paidAt
             };
 
             sendPurchaseReceiptEmail(purchaseData).catch(err => {
@@ -1103,7 +1301,7 @@ app.post('/webhook/payment',
         const prisma = new PrismaClient();
         
         const user = await prisma.user.findUnique({
-          where: { clerkId: result.userId }
+          where: { id: result.userId }
         });
         
         if (user) {
@@ -1123,11 +1321,26 @@ app.post('/webhook/payment',
           const updatedUser = await prisma.user.findUnique({ where: { id: user.id } });
           const newBalance = updatedUser?.credits ?? 0;
 
+          // Fetch payment details for accurate receipt fields
+          let amountPaid = 0;
+          let currency = 'USD';
+          let paidAt = new Date();
+          try {
+            const status = await paypalProvider.getPaymentStatus(result.paymentId);
+            if (typeof status.amount === 'number' && !Number.isNaN(status.amount)) amountPaid = status.amount;
+            if (status.currency) currency = status.currency;
+            if (status.paidAt) paidAt = status.paidAt;
+          } catch (e: any) {
+            paymentLogger.warn('Failed to fetch PayPal payment status for receipt', {
+              paymentId: result.paymentId,
+              error: e?.message,
+            });
+          }
+
           if (user.email) {
             const purchaseData: PurchaseEmailData = {
               user: {
                 id: user.id,
-                clerkId: user.clerkId,
                 email: user.email,
                 firstName: user.firstName,
                 lastName: user.lastName,
@@ -1135,12 +1348,11 @@ app.post('/webhook/payment',
               },
               paymentId: result.paymentId,
               provider: 'paypal',
-              packageName: `${result.creditsToAdd} Credits`,
               creditsAmount: result.creditsToAdd,
-              amountPaid: 0,
-              currency: 'USD',
+              amountPaid,
+              currency,
               newBalance,
-              paidAt: new Date()
+              paidAt
             };
 
             sendPurchaseReceiptEmail(purchaseData).catch(err => {
@@ -1176,23 +1388,64 @@ app.get('/webhook/payment', (req: Request, res: Response) => {
   });
 });
 
+// ========================================
+// PAYMENT REDIRECT BRIDGE (for HTTPS providers)
+// ========================================
+
+/**
+ * Payment redirect bridge
+ * 
+ * Some providers (especially MercadoPago) require HTTPS public return URLs.
+ * In development we can point return URLs to the public backend (ngrok)
+ * and then redirect back to the local frontend.
+ */
+function buildFrontendRedirectUrl(pathname: string, query: Request['query']): string {
+  const frontendBase = process.env.FRONTEND_URL || 'http://localhost:3000';
+  const url = new URL(`${frontendBase}${pathname}`);
+
+  for (const [key, value] of Object.entries(query || {})) {
+    if (value === undefined) continue;
+    if (Array.isArray(value)) {
+      value.forEach(v => url.searchParams.append(key, String(v)));
+    } else {
+      url.searchParams.set(key, String(value));
+    }
+  }
+
+  return url.toString();
+}
+
+app.get('/payment/redirect/success', (req: Request, res: Response) => {
+  res.redirect(302, buildFrontendRedirectUrl('/payment/success', req.query));
+});
+
+app.get('/payment/redirect/failure', (req: Request, res: Response) => {
+  res.redirect(302, buildFrontendRedirectUrl('/payment/failure', req.query));
+});
+
+app.get('/payment/redirect/pending', (req: Request, res: Response) => {
+  res.redirect(302, buildFrontendRedirectUrl('/payment/pending', req.query));
+});
+
 /**
  * Capture PayPal order after buyer approval
  * POST /api/payments/paypal/capture/:orderId
  * Called by frontend after PayPal checkout approval
+ * Requires session authentication
  */
 app.post('/api/payments/paypal/capture/:orderId',
   sensitiveLimiter,
+  requireSession,
   async (req: Request, res: Response) => {
   try {
     const { orderId } = req.params;
-    const clerkUserId = req.headers['x-user-id'] as string;
+    const userId = req.userId;
     
-    if (!clerkUserId) {
+    if (!userId) {
       return res.status(401).json({ status: 'error', message: 'Authentication required' });
     }
     
-    paymentLogger.info('Capturing PayPal order', { orderId, clerkUserId });
+    paymentLogger.info('Capturing PayPal order', { orderId, userId });
     
     // Get PayPal credentials
     const isProduction = process.env.NODE_ENV === 'production';
@@ -1264,33 +1517,144 @@ app.post('/api/payments/paypal/capture/:orderId',
     if (captureResult.status === 'COMPLETED') {
       let customData: { userId?: string; credits?: number; packageId?: string } = {};
       try {
-        const customId = captureResult.purchase_units?.[0]?.custom_id;
-        customData = JSON.parse(customId || '{}');
+        const customIdFromCapture = captureResult.purchase_units?.[0]?.custom_id;
+        if (customIdFromCapture) {
+          customData = JSON.parse(customIdFromCapture);
+        }
       } catch (e) {
         paymentLogger.warn('Failed to parse custom_id', { orderId });
       }
+
+      // Fallback: capture response may omit custom_id; fetch order details
+      if ((!customData.userId || !customData.credits) && tokenData.access_token) {
+        try {
+          const orderDetailsResponse = await fetch(`${baseUrl}/v2/checkout/orders/${orderId}`, {
+            headers: {
+              'Authorization': `Bearer ${tokenData.access_token}`,
+            },
+          });
+
+          if (orderDetailsResponse.ok) {
+            const orderDetails = await orderDetailsResponse.json() as any;
+            const customIdFromOrder = orderDetails?.purchase_units?.[0]?.custom_id;
+            if (customIdFromOrder) {
+              customData = {
+                ...customData,
+                ...(JSON.parse(customIdFromOrder) || {}),
+              };
+            }
+          }
+        } catch (e: any) {
+          paymentLogger.warn('Failed to fetch PayPal order details for custom_id', {
+            orderId,
+            error: e?.message,
+          });
+        }
+      }
       
+      if (customData.userId && customData.userId !== userId) {
+        return res.status(403).json({
+          status: 'error',
+          message: 'Payment does not belong to the current user',
+        });
+      }
+
       if (customData.credits && customData.userId) {
         const { PrismaClient } = await import('@prisma/client');
         const prisma = new PrismaClient();
         
         const user = await prisma.user.findUnique({
-          where: { clerkId: customData.userId }
+          where: { id: customData.userId }
         });
         
         if (user) {
-          await addPurchasedCredits(
+          const creditTx = await addPurchasedCredits(
             user.id,
             customData.credits,
             orderId,
             `PayPal ${customData.packageId || 'Purchase'}`
           );
-          
+
+          if (!creditTx.success) {
+            paymentLogger.error('Failed to add credits via PayPal capture', {
+              userId: user.id,
+              orderId,
+              credits: customData.credits,
+              error: creditTx.error,
+            });
+
+            return res.status(500).json({
+              status: 'error',
+              orderId,
+              paymentStatus: captureResult.status,
+              message: 'Payment captured but credit allocation failed',
+            });
+          }
+
           paymentLogger.info('Credits added via PayPal capture', {
             userId: user.id,
             credits: customData.credits,
             orderId,
           });
+
+          // ========================================
+          // SEND PURCHASE RECEIPT EMAIL (non-blocking, idempotent)
+          // Use PayPal orderId as the stable identifier for receipts.
+          // ========================================
+          try {
+            const updatedUser = await prisma.user.findUnique({ where: { id: user.id } });
+            const newBalance = updatedUser?.credits ?? 0;
+
+            const gateway = getPaymentGateway();
+            const paypalProvider = gateway.getProvider('paypal');
+
+            // Fetch payment details for accurate receipt fields
+            let amountPaid = 0;
+            let currency = 'USD';
+            let paidAt = new Date();
+            try {
+              const status = await paypalProvider.getPaymentStatus(orderId);
+              if (typeof status.amount === 'number' && !Number.isNaN(status.amount)) amountPaid = status.amount;
+              if (status.currency) currency = status.currency;
+              if (status.paidAt) paidAt = status.paidAt;
+            } catch (e: any) {
+              paymentLogger.warn('Failed to fetch PayPal payment status for receipt (capture)', {
+                orderId,
+                error: e?.message,
+              });
+            }
+
+            if (user.email) {
+              const purchaseData: PurchaseEmailData = {
+                user: {
+                  id: user.id,
+                  email: user.email,
+                  firstName: user.firstName,
+                  lastName: user.lastName,
+                  preferredLanguage: user.preferredLanguage,
+                },
+                paymentId: orderId,
+                provider: 'paypal',
+                creditsAmount: customData.credits,
+                amountPaid,
+                currency,
+                newBalance,
+                paidAt,
+              };
+
+              sendPurchaseReceiptEmail(purchaseData).catch((err) => {
+                paymentLogger.error('Purchase receipt email error (non-blocking) (capture)', {
+                  orderId,
+                  error: err.message,
+                });
+              });
+            }
+          } catch (emailError: any) {
+            paymentLogger.warn('Could not prepare receipt email (non-blocking) (capture)', {
+              orderId,
+              error: emailError.message,
+            });
+          }
         }
       }
     }
@@ -1373,7 +1737,7 @@ app.post('/payment/verify/:paymentId', async (req: Request, res: Response) => {
  */
 app.get('/payment/history/:userId',
   sensitiveLimiter,
-  verifyUserAuth,
+  requireSession,
   [
     param('userId').matches(/^user_[a-zA-Z0-9]+$/).withMessage('Invalid user ID format'),
   ],
@@ -1381,7 +1745,7 @@ app.get('/payment/history/:userId',
   async (req: Request, res: Response) => {
   try {
     const { userId } = req.params;
-    const authenticatedUserId = (req as any).authenticatedUserId;
+    const authenticatedUserId = req.userId;
     
     // SECURITY: User can only view their own payment history
     if (userId !== authenticatedUserId) {
@@ -1422,228 +1786,51 @@ app.get('/payment/history/:userId',
   }
 });
 
-// ===== CLERK WEBHOOKS & USER SYNC =====
-
-import { clerkClient } from '@clerk/express';
-import { Webhook } from 'svix';
-import * as clerkService from './services/clerkService';
-
-/**
- * Clerk webhook handler for user events
- * POST /webhook/clerk
- * 
- * Handles:
- * - user.created: Creates user in database, grants 1 free credit
- * - user.updated: Syncs updated user data to database
- * - user.deleted: Removes user and related data from database
- * 
- * Security: Verifies Svix signature when CLERK_WEBHOOK_SECRET is set
- * 
- * Required Clerk Webhook Events (configure in Clerk Dashboard):
- * - user.created
- * - user.updated
- * - user.deleted
- */
-app.post('/webhook/clerk',
-  webhookLimiter,
-  async (req: Request, res: Response) => {
-  try {
-    const webhookSecret = process.env.CLERK_WEBHOOK_SECRET;
-    
-    // Verify webhook signature if secret is configured
-    if (webhookSecret) {
-      const svixId = req.headers['svix-id'] as string;
-      const svixTimestamp = req.headers['svix-timestamp'] as string;
-      const svixSignature = req.headers['svix-signature'] as string;
-      
-      if (!svixId || !svixTimestamp || !svixSignature) {
-        authLogger.warn('Missing Svix headers in Clerk webhook');
-        return res.status(400).json({ status: 'error', message: 'Missing webhook headers' });
-      }
-      
-      // Prevent replay attacks - check if we've seen this webhook ID
-      if (clerkService.isWebhookProcessed(svixId)) {
-        authLogger.warn('Duplicate webhook ID detected (potential replay attack)', { svixId });
-        return res.status(200).json({ status: 'ignored', message: 'Duplicate webhook' });
-      }
-      
-      // Verify signature
-      const isValid = clerkService.verifyWebhookSignature(
-        JSON.stringify(req.body),
-        {
-          'svix-id': svixId,
-          'svix-timestamp': svixTimestamp,
-          'svix-signature': svixSignature,
-        },
-        webhookSecret
-      );
-      
-      if (!isValid) {
-        authLogger.error('Clerk webhook signature verification failed');
-        return res.status(401).json({ status: 'error', message: 'Invalid webhook signature' });
-      }
-      
-      // Mark webhook as processed
-      clerkService.markWebhookProcessed(svixId);
-      authLogger.info('Clerk webhook signature verified');
-    } else {
-      authLogger.warn('CLERK_WEBHOOK_SECRET not set - webhook signature not verified');
-    }
-    
-    const { type, data } = req.body;
-    const userId = data?.id || data?.user_id; // user_id for session events, id for user events
-
-    authLogger.info('Received Clerk webhook', { type, userId });
-
-    // Validate user ID format for user/session events
-    const eventUserId = type.startsWith('session.') ? data?.user_id : data?.id;
-    if ((type.startsWith('user.') || type.startsWith('session.')) && eventUserId && !isValidUserId(eventUserId)) {
-      authLogger.warn('Invalid user ID in webhook', { userId: eventUserId, type });
-      return res.status(200).json({ status: 'ignored', message: 'Invalid user ID' });
-    }
-
-    // Process the webhook event using clerkService
-    try {
-      const result = await clerkService.processWebhookEvent({ type, data, object: 'event' });
-      
-      // Extract ID from result based on event type
-      let resultId = null;
-      if (result) {
-        if ('id' in result) {
-          resultId = result.id;
-        } else if ('user' in result && result.user) {
-          resultId = result.user.id;
-        } else if ('session' in result && result.session) {
-          resultId = result.session.id;
-        }
-      }
-      
-      res.status(200).json({
-        status: 'success',
-        message: `Webhook ${type} processed successfully`,
-        userId: eventUserId,
-        result: resultId ? { id: resultId } : null
-      });
-    } catch (processError: any) {
-      authLogger.error('Failed to process webhook event', { 
-        type, 
-        userId, 
-        error: processError.message 
-      });
-      // Still return 200 to acknowledge receipt
-      res.status(200).json({
-        status: 'error',
-        message: `Failed to process ${type}`,
-        error: processError.message
-      });
-    }
-  } catch (error: any) {
-    authLogger.error('Error processing Clerk webhook', { error: error.message });
-    // Still return 200 to acknowledge receipt
-    res.status(200).json({
-      status: 'error',
-      message: error.message
-    });
-  }
-});
-
-/**
- * Get Clerk webhook info
- * GET /webhook/clerk
- */
-app.get('/webhook/clerk', (req: Request, res: Response) => {
-  res.json({
-    status: 'ok',
-    message: 'Clerk webhook endpoint',
-    url: `${process.env.WEBHOOK_BASE_URL}/webhook/clerk`,
-    supportedEvents: clerkService.SUPPORTED_WEBHOOK_EVENTS,
-    description: 'Subscribe to these events in Clerk Dashboard > Webhooks'
-  });
-});
-
-// ===== USER SYNC ENDPOINTS =====
-
-/**
- * Sync user data on login
- * POST /api/users/sync
- * 
- * Called by frontend when user logs in.
- * Ensures user exists in local database, creates from Clerk if not found.
- * 
- * Protected: Requires valid user authentication
- */
-app.post('/api/users/sync',
-  verifyUserAuth,
-  async (req: Request, res: Response) => {
-  try {
-    const userId = (req as any).authenticatedUserId;
-    
-    authLogger.info('User sync requested', { userId });
-
-    // Find or create user in database
-    const { user, source } = await clerkService.findOrCreateUserByClerkId(userId);
-
-    authLogger.info('User sync completed', { 
-      userId, 
-      dbUserId: user.id, 
-      source,
-      credits: user.credits 
-    });
-
-    res.json({
-      status: 'success',
-      message: source === 'clerk' ? 'User created from Clerk' : 'User found in database',
-      user: {
-        id: user.id,
-        clerkId: user.clerkId,
-        email: user.email,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        imageUrl: user.imageUrl,
-        credits: user.credits,
-        createdAt: user.createdAt
-      }
-    });
-  } catch (error: any) {
-    authLogger.error('User sync failed', { error: error.message });
-    res.status(500).json({
-      status: 'error',
-      message: 'Failed to sync user',
-      error: error.message
-    });
-  }
-});
+// ===== USER ENDPOINTS =====
 
 /**
  * Get current user data
  * GET /api/users/me
  * 
  * Returns the authenticated user's data from local database.
- * If user doesn't exist, attempts to create from Clerk.
  * 
- * Protected: Requires valid user authentication
+ * Protected: Requires valid session
  */
 app.get('/api/users/me',
-  verifyUserAuth,
+  requireSession,
   async (req: Request, res: Response) => {
   try {
-    const userId = (req as any).authenticatedUserId;
-    
-    // First try to get from database
-    let user = await clerkService.getUserFromDatabase(userId);
-    
-    // If not found, create from Clerk
-    if (!user) {
-      authLogger.info('User not in database, creating from Clerk', { userId });
-      const result = await clerkService.findOrCreateUserByClerkId(userId);
-      user = result.user as any;
-    }
+    // Session-based auth responses must never be cached (stale credits after purchases)
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
 
-    // At this point user is guaranteed to exist
+    const userId = req.userId;
+    
+    // Get user from database directly
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: {
+        _count: {
+          select: {
+            interviews: true,
+            payments: true
+          }
+        }
+      }
+    });
+
     if (!user) {
       return res.status(404).json({
         status: 'error',
-        message: 'User not found and could not be created'
+        message: 'User not found'
+      });
+    }
+
+    if (!user.isActive) {
+      return res.status(403).json({
+        status: 'error',
+        message: 'User account is deactivated'
       });
     }
 
@@ -1651,7 +1838,6 @@ app.get('/api/users/me',
       status: 'success',
       user: {
         id: user.id,
-        clerkId: user.clerkId,
         email: user.email,
         firstName: user.firstName,
         lastName: user.lastName,
@@ -1659,7 +1845,7 @@ app.get('/api/users/me',
         credits: user.credits,
         createdAt: user.createdAt,
         updatedAt: user.updatedAt,
-        _count: (user as any)._count
+        _count: user._count
       }
     });
   } catch (error: any) {
@@ -1677,52 +1863,60 @@ app.get('/api/users/me',
  * POST /api/users/validate
  * 
  * Called by frontend on interview page load and critical actions.
- * Validates Clerk session and ensures user exists in database.
- * Creates user from Clerk if not found.
- * Includes abuse detection for free credit grants.
+ * Validates session and ensures user exists in database.
  * 
- * Protected: Requires valid user authentication
+ * Protected: Requires valid session
  */
 app.post('/api/users/validate',
-  verifyUserAuth,
+  requireSession,
   async (req: Request, res: Response) => {
   try {
-    const userId = (req as any).authenticatedUserId;
+    const userId = req.userId;
     
     authLogger.info('User validation requested', { userId });
 
-    // Capture signup info for abuse detection
-    const signupInfo = {
-      // Get IP from various headers (nginx, cloudflare, ngrok, etc.)
-      ipAddress: (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
-                 (req.headers['x-real-ip'] as string) ||
-                 req.socket.remoteAddress,
-      // Device fingerprint from frontend (optional, sent in body)
-      deviceFingerprint: req.body?.deviceFingerprint,
-      userAgent: req.headers['user-agent']
-    };
+    // Look up user directly from database
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      include: {
+        _count: {
+          select: {
+            interviews: true,
+            payments: true
+          }
+        }
+      }
+    });
 
-    // Validate and sync user with abuse detection
-    const { user, source, freeTrialGranted, freeCreditBlocked, phoneVerificationRequired } = await clerkService.validateAndSyncUser(userId, signupInfo);
+    if (!user) {
+      authLogger.warn('User not found in database', { userId });
+      return res.status(404).json({
+        status: 'error',
+        message: 'User not found'
+      });
+    }
+
+    if (!user.isActive) {
+      authLogger.warn('User is inactive', { userId });
+      return res.status(403).json({
+        status: 'error',
+        message: 'User account is deactivated'
+      });
+    }
 
     authLogger.info('User validation completed', { 
       userId, 
       dbUserId: user.id, 
-      source,
-      credits: user.credits,
-      freeTrialGranted,
-      freeCreditBlocked,
-      phoneVerificationRequired
+      credits: user.credits
     });
 
     // ========================================
     // TRIGGER WELCOME EMAIL (non-blocking, idempotent)
-    // Sends once per user (deduped by clerkId)
+    // Sends once per user (deduped by userId)
     // ========================================
     if (user.email) {
       const userEmailData: UserEmailData = {
         id: user.id,
-        clerkId: user.clerkId,
         email: user.email,
         firstName: user.firstName,
         lastName: user.lastName,
@@ -1755,10 +1949,9 @@ app.post('/api/users/validate',
 
     res.json({
       status: 'success',
-      message: source === 'clerk' ? 'User created from Clerk' : 'User validated',
+      message: 'User validated',
       user: {
         id: user.id,
-        clerkId: user.clerkId,
         email: user.email,
         firstName: user.firstName,
         lastName: user.lastName,
@@ -1766,9 +1959,9 @@ app.post('/api/users/validate',
         credits: user.credits,
         createdAt: user.createdAt
       },
-      freeTrialGranted,
-      freeCreditBlocked,
-      phoneVerificationRequired
+      freeTrialGranted: false,
+      freeCreditBlocked: false,
+      phoneVerificationRequired: user.credits === 0 && !user.phoneVerified
     });
   } catch (error: any) {
     authLogger.error('User validation failed', { error: error.message });
@@ -1780,46 +1973,166 @@ app.post('/api/users/validate',
   }
 });
 
+/**
+ * Update user profile
+ * PUT /api/users/profile
+ * 
+ * Updates user profile fields (firstName, lastName, role, etc.)
+ * Protected: Requires valid user authentication
+ */
+app.put('/api/users/profile',
+  requireSession,
+  async (req: Request, res: Response) => {
+  try {
+    const userId = req.userId;
+    const { firstName, lastName, role } = req.body;
+
+    authLogger.info('Profile update requested', { userId, firstName, lastName, role });
+
+    // Validate that user exists
+    const existingUser = await prisma.user.findUnique({
+      where: { id: userId }
+    });
+
+    if (!existingUser) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'User not found'
+      });
+    }
+
+    // Build update data
+    const updateData: any = {};
+    if (firstName !== undefined) updateData.firstName = firstName;
+    if (lastName !== undefined) updateData.lastName = lastName;
+    
+    // Update role in database if provided
+    // Note: role is stored as currentRole in the User table
+    if (role !== undefined) {
+      // Map frontend role names to backend role enum if needed
+      const roleMap: Record<string, string> = {
+        'Candidate': 'B2C_FREE',
+        'Recruiter': 'B2B_RECRUITER',
+        'Admin': 'ADMIN'
+      };
+      updateData.currentRole = roleMap[role] || existingUser.currentRole;
+    }
+
+    // Update user
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: updateData
+    });
+
+    authLogger.info('Profile updated successfully', { userId });
+
+    res.json({
+      status: 'success',
+      message: 'Profile updated successfully',
+      user: {
+        id: updatedUser.id,
+        email: updatedUser.email,
+        firstName: updatedUser.firstName,
+        lastName: updatedUser.lastName,
+        imageUrl: updatedUser.imageUrl,
+        credits: updatedUser.credits,
+        currentRole: updatedUser.currentRole
+      }
+    });
+  } catch (error: any) {
+    authLogger.error('Profile update failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to update profile',
+      error: error.message
+    });
+  }
+});
+
+/**
+ * Delete user account (soft delete)
+ * DELETE /api/users/delete
+ * 
+ * Soft-deletes the user account by setting isActive=false and deletedAt.
+ * Protected: Requires valid user authentication
+ */
+app.delete('/api/users/delete',
+  requireSession,
+  async (req: Request, res: Response) => {
+  try {
+    const userId = req.userId;
+
+    authLogger.info('Account deletion requested', { userId });
+
+    // Validate that user exists
+    const existingUser = await prisma.user.findUnique({
+      where: { id: userId }
+    });
+
+    if (!existingUser) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'User not found'
+      });
+    }
+
+    // Soft delete - set isActive=false and deletedAt
+    await prisma.user.update({
+      where: { id: userId },
+      data: {
+        isActive: false,
+        deletedAt: new Date()
+      }
+    });
+
+    // Invalidate any active sessions for this user
+    await prisma.session.deleteMany({
+      where: { userId }
+    });
+
+    authLogger.info('Account deleted successfully', { userId });
+
+    res.json({
+      status: 'success',
+      message: 'Account deleted successfully'
+    });
+  } catch (error: any) {
+    authLogger.error('Account deletion failed', { error: error.message });
+    res.status(500).json({
+      status: 'error',
+      message: 'Failed to delete account',
+      error: error.message
+    });
+  }
+});
+
 // ===== CREDITS MANAGEMENT =====
 
 /**
  * Consume credit when interview starts
  * POST /consume-credit
  * CRITICAL: This endpoint handles financial transactions
- * Protected: Requires valid user authentication + rate limited
+ * Protected: Requires valid session + rate limited
  * Uses PostgreSQL as source of truth for credits
  */
 app.post('/consume-credit',
   sensitiveLimiter,
-  verifyUserAuth,
+  requireSession,
   [
-    body('userId').matches(/^user_[a-zA-Z0-9]+$/).withMessage('Invalid user ID format'),
     body('callId').optional().isString().trim(),
   ],
   handleValidationErrors,
   async (req: Request, res: Response) => {
   try {
-    const { userId, callId } = req.body;
-    const authenticatedUserId = (req as any).authenticatedUserId;
-
-    // CRITICAL SECURITY: Verify the request is for the authenticated user
-    // Prevents users from consuming other users' credits
-    if (userId !== authenticatedUserId) {
-      authLogger.warn('Credit consumption user ID mismatch - potential attack', { 
-        requestedUserId: userId, 
-        authenticatedUserId,
-        callId 
-      });
-      return res.status(403).json({
-        status: 'error',
-        message: 'Unauthorized: Cannot consume credits for another user'
-      });
-    }
+    const { callId } = req.body;
+    const userId = req.userId!; // Non-null: requireSession ensures userId exists
 
     authLogger.info('Credit consumption requested', { userId, callId });
 
     // Get current user credits from PostgreSQL (source of truth)
-    const dbUser = await clerkService.getUserFromDatabase(userId);
+    const dbUser = await prisma.user.findUnique({
+      where: { id: userId }
+    });
     
     if (!dbUser) {
       authLogger.warn('User not found in database', { userId });
@@ -1840,13 +2153,15 @@ app.post('/consume-credit',
     }
 
     // Update credits in PostgreSQL (source of truth)
-    const updatedUser = await clerkService.updateUserCredits(userId, 1, 'subtract');
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: { credits: { decrement: 1 } }
+    });
 
     // Record in wallet ledger (non-blocking)
-    // CRITICAL: Use dbUser.id (UUID) not userId (Clerk ID) for wallet operations
     try {
       await spendCredits(
-        dbUser.id, // Use internal UUID, not Clerk ID
+        userId,
         1,
         'Interview credit consumed',
         callId ? 'interview' : undefined,
@@ -1856,7 +2171,6 @@ app.post('/consume-credit',
     } catch (walletError: any) {
       authLogger.warn('Failed to record credit spend in wallet (non-critical)', { 
         userId,
-        dbUserId: dbUser.id,
         error: walletError.message 
       });
     }
@@ -1875,7 +2189,6 @@ app.post('/consume-credit',
           const lowCreditsData: LowCreditsData = {
             user: {
               id: dbUser.id,
-              clerkId: dbUser.clerkId,
               email: dbUser.email,
               firstName: dbUser.firstName,
               lastName: dbUser.lastName,
@@ -1929,40 +2242,68 @@ app.post('/consume-credit',
 /**
  * Restore credits when interview is cancelled due to incompatibility
  * POST /restore-credit
- * Protected: Requires valid user authentication + rate limited
+ * Protected: Requires valid session + rate limited
  * Uses PostgreSQL as source of truth for credits
  */
 app.post('/restore-credit',
   sensitiveLimiter,
-  verifyUserAuth,
+  requireSession,
   [
-    body('userId').matches(/^user_[a-zA-Z0-9]+$/).withMessage('Invalid user ID format'),
     body('reason').optional().isString().trim().isLength({ max: 200 }),
     body('callId').optional().isString().trim(),
   ],
   handleValidationErrors,
   async (req: Request, res: Response) => {
   try {
-    const { userId, reason, callId } = req.body;
-    const authenticatedUserId = (req as any).authenticatedUserId;
+    const { reason, callId } = req.body;
+    const userId = req.userId;
 
-    // SECURITY: Verify the request is for the authenticated user
-    if (userId !== authenticatedUserId) {
-      authLogger.warn('Credit restoration user ID mismatch - potential attack', { 
-        requestedUserId: userId, 
-        authenticatedUserId,
-        callId 
-      });
-      return res.status(403).json({
+    if (!userId) {
+      authLogger.warn('Credit restoration - no user ID in session');
+      return res.status(401).json({
         status: 'error',
-        message: 'Unauthorized: Cannot restore credits for another user'
+        message: 'Unauthorized: No authenticated user'
       });
     }
 
     authLogger.info('Credit restoration requested', { userId, reason, callId });
 
+    const restoreIdempotencyKey = callId ? `restore_call_${callId}` : null;
+    if (restoreIdempotencyKey) {
+      const existingRestore = await prisma.creditLedger.findUnique({
+        where: { idempotencyKey: restoreIdempotencyKey },
+        select: { id: true }
+      });
+
+      if (existingRestore) {
+        authLogger.info('Credit restoration skipped (idempotent)', {
+          userId,
+          callId,
+          idempotencyKey: restoreIdempotencyKey
+        });
+
+        // Best-effort: report current credits
+        const dbUser = await prisma.user.findUnique({
+          where: { id: userId },
+          select: { credits: true }
+        });
+
+        const currentCredits = dbUser?.credits ?? 0;
+
+        return res.json({
+          status: 'success',
+          message: 'Credit already restored',
+          previousCredits: currentCredits,
+          newCredits: currentCredits
+        });
+      }
+    }
+
     // Get current user credits from PostgreSQL (source of truth)
-    const dbUser = await clerkService.getUserFromDatabase(userId);
+    const dbUser = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { id: true, email: true, credits: true }
+    });
     
     if (!dbUser) {
       authLogger.warn('User not found in database', { userId });
@@ -1985,22 +2326,25 @@ app.post('/restore-credit',
     }
 
     // Update credits in PostgreSQL (source of truth)
-    const updatedUser = await clerkService.updateUserCredits(userId, 1, 'add');
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: { credits: { increment: 1 } },
+      select: { credits: true }
+    });
 
     // Record in wallet ledger (non-blocking)
-    // CRITICAL: Use dbUser.id (UUID) not userId (Clerk ID) for wallet operations
     try {
       await restoreCredits(
-        dbUser.id, // Use internal UUID, not Clerk ID
+        userId,
         1,
         reason || 'Credit restored due to interview cancellation',
         callId ? 'interview' : undefined,
-        callId
+        callId,
+        restoreIdempotencyKey || undefined
       );
     } catch (walletError: any) {
       authLogger.warn('Failed to record credit restore in wallet (non-critical)', { 
         userId,
-        dbUserId: dbUser.id,
         error: walletError.message 
       });
     }
@@ -2192,7 +2536,7 @@ logger.info('WebSocket endpoints initialized', {
         websocket: `ws://localhost:${PORT}/llm-websocket`,
         health: `http://localhost:${PORT}/health`
       });
-      logger.info('Services: Retell Custom LLM, Mercado Pago, OpenAI, Clerk, GraphQL');
+      logger.info('Services: Retell Custom LLM, Mercado Pago, OpenAI, Google OAuth, GraphQL');
       logger.info(`Custom LLM WebSocket URL: ${retellService.getCustomLLMWebSocketUrl()}`);
       logger.info(`Webhook URL: ${process.env.WEBHOOK_BASE_URL}/webhook/mercadopago`);
       logger.info(`Log Level: ${process.env.LOG_LEVEL || 'info'}`);

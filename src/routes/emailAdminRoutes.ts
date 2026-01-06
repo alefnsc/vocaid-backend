@@ -7,7 +7,6 @@
  * - GET /api/admin/emails/preview/:type - Preview email templates
  * - POST /api/admin/emails/retry - Retry failed emails
  * - POST /api/admin/emails/test - Send test email
- * - POST /api/admin/emails/cron/reminders - Cron job for reminders
  * 
  * All routes require ADMIN_SECRET_KEY header authentication or CRON_SECRET for cron endpoints.
  * 
@@ -268,7 +267,7 @@ router.get('/emails/preview/:type', (req: Request, res: Response) => {
     const { type } = req.params;
     const { lang = 'en', format = 'json', ...sampleData } = req.query;
 
-    const validTypes: PreviewableEmailType[] = ['welcome', 'purchase', 'low-credits', 'interview-reminder', 'interview-complete'];
+    const validTypes: PreviewableEmailType[] = ['welcome', 'purchase', 'low-credits', 'interview-complete'];
     
     if (!validTypes.includes(type as PreviewableEmailType)) {
       return res.status(400).json(
@@ -371,7 +370,7 @@ router.post('/emails/test', async (req: Request, res: Response) => {
 
     // This would send an actual test email
     // For now, we just return the preview
-    const validTypes: PreviewableEmailType[] = ['welcome', 'purchase', 'low-credits', 'interview-reminder', 'interview-complete'];
+    const validTypes: PreviewableEmailType[] = ['welcome', 'purchase', 'low-credits', 'interview-complete'];
     
     if (!validTypes.includes(type)) {
       return res.status(400).json(
@@ -395,150 +394,6 @@ router.post('/emails/test', async (req: Request, res: Response) => {
     emailAdminLogger.error('Error sending test email', { error: error.message, requestId });
     res.status(500).json(
       errorResponse('TEST_ERROR', 'Failed to send test email', requestId, { message: error.message })
-    );
-  }
-});
-
-/**
- * POST /api/admin/emails/cron/reminders
- * Cron endpoint to send interview reminders
- * 
- * This endpoint should be called by an external scheduler (e.g., Vercel Cron, AWS EventBridge)
- * Requires X-Cron-Secret header for authentication.
- * 
- * Sends reminders to users who:
- * - Have credits available
- * - Haven't practiced in the last N days (configurable)
- * - Haven't received a reminder in the last 7 days
- * 
- * Body params:
- * - daysSinceLastPractice: Days since last interview (default 7)
- * - maxReminders: Maximum reminders to send per run (default 100)
- */
-router.post('/emails/cron/reminders', requireCronAuth, async (req: Request, res: Response) => {
-  const requestId = (req as any).requestId || uuidv4();
-  
-  try {
-    const { daysSinceLastPractice = 7, maxReminders = 100 } = req.body;
-
-    emailAdminLogger.info('Starting interview reminder cron job', { 
-      daysSinceLastPractice, 
-      maxReminders,
-      requestId
-    });
-
-    // Import prisma and email service here to avoid circular dependencies
-    const { prisma } = await import('../services/databaseService');
-    const { sendInterviewReminderEmail } = await import('../services/transactionalEmailService');
-    type InterviewReminderDataType = import('../services/transactionalEmailService').InterviewReminderData;
-
-    const cutoffDate = new Date();
-    cutoffDate.setDate(cutoffDate.getDate() - daysSinceLastPractice);
-
-    // Find users who:
-    // 1. Have credits > 0
-    // 2. Have at least one completed interview
-    // 3. Haven't had an interview since cutoffDate
-    // 4. Haven't received a reminder email in the last 7 days
-    const sevenDaysAgo = new Date();
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-
-    const usersToRemind = await prisma.user.findMany({
-      where: {
-        credits: { gt: 0 },
-        email: { not: '' },
-        interviews: {
-          some: {
-            status: 'COMPLETED'
-          }
-        },
-        // No recent interviews
-        NOT: {
-          interviews: {
-            some: {
-              createdAt: { gte: cutoffDate }
-            }
-          }
-        },
-        // No recent reminder emails
-        transactionalEmails: {
-          none: {
-            emailType: 'INTERVIEW_REMINDER',
-            createdAt: { gte: sevenDaysAgo }
-          }
-        }
-      },
-      include: {
-        interviews: {
-          where: { status: 'COMPLETED' },
-          orderBy: { createdAt: 'desc' },
-          take: 1,
-          select: {
-            id: true,
-            jobTitle: true,
-            createdAt: true
-          }
-        }
-      },
-      take: maxReminders
-    });
-
-    emailAdminLogger.info('Found users to remind', { count: usersToRemind.length });
-
-    const results = {
-      total: usersToRemind.length,
-      sent: 0,
-      skipped: 0,
-      failed: 0,
-      details: [] as Array<{ userId: string; status: string; error?: string }>
-    };
-
-    for (const user of usersToRemind) {
-      if (!user.email) continue;
-
-      const lastInterview = user.interviews[0];
-      
-      try {
-        const reminderData: InterviewReminderDataType = {
-          user: {
-            id: user.id,
-            clerkId: user.clerkId,
-            email: user.email,
-            firstName: user.firstName,
-            lastName: user.lastName,
-            preferredLanguage: user.preferredLanguage
-          },
-          lastInterviewDate: lastInterview?.createdAt,
-          lastInterviewTitle: lastInterview?.jobTitle || undefined
-        };
-
-        const result = await sendInterviewReminderEmail(reminderData);
-
-        if (result.success && !result.skipped) {
-          results.sent++;
-          results.details.push({ userId: user.id, status: 'sent' });
-        } else if (result.skipped) {
-          results.skipped++;
-          results.details.push({ userId: user.id, status: 'skipped' });
-        } else {
-          results.failed++;
-          results.details.push({ userId: user.id, status: 'failed', error: result.error });
-        }
-      } catch (error: any) {
-        results.failed++;
-        results.details.push({ userId: user.id, status: 'error', error: error.message });
-      }
-    }
-
-    emailAdminLogger.info('Interview reminder cron job completed', results);
-
-    res.json(successResponse(results, requestId));
-
-  } catch (error: any) {
-    const requestId = (req as any).requestId || uuidv4();
-    emailAdminLogger.error('Error in reminder cron job', { error: error.message, requestId });
-    res.status(500).json(
-      errorResponse('CRON_ERROR', 'Failed to run reminder cron job', requestId, { message: error.message })
     );
   }
 });

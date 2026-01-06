@@ -38,6 +38,7 @@ export interface DashboardKPIs {
   averageScore: number | null;
   scoreChange: number | null; // Percentage change from previous period
   averageDurationMinutes: number | null;
+  totalDurationMs: number | null; // Sum of all callDuration values in milliseconds
   totalSpent: number;
   creditsRemaining: number;
   interviewsThisMonth: number;
@@ -60,8 +61,11 @@ export interface RecentInterview {
   resumeTitle: string | null;
   resumeId: string | null;
   durationMinutes: number | null;
+  callDuration: number | null; // Raw duration in milliseconds
   score: number | null;
   status: string;
+  language: string | null;
+  country: string | null;
 }
 
 export interface ResumeUtilization {
@@ -82,10 +86,17 @@ export interface FilterOptions {
   resumes: Array<{ id: string; title: string }>;
 }
 
+export interface WeeklyActivityBucket {
+  day: string; // e.g., 'Mon', 'Tue', etc.
+  count: number;
+  durationMs: number;
+}
+
 export interface CandidateDashboardResponse {
   kpis: DashboardKPIs;
   scoreEvolution: ScoreEvolutionPoint[];
   recentInterviews: RecentInterview[];
+  weeklyActivity: WeeklyActivityBucket[];
   resumes: ResumeUtilization[];
   filterOptions: FilterOptions;
   filters: {
@@ -157,12 +168,12 @@ function getPreviousPeriodRange(
  * Get complete candidate dashboard data with filters
  */
 export async function getCandidateDashboard(
-  clerkId: string,
+  userId: string,
   filters: DashboardFilters = {},
   limit = 10
 ): Promise<CandidateDashboardResponse | null> {
   dashboardLogger.info('Fetching candidate dashboard', {
-    clerkId: clerkId.slice(0, 15),
+    userId: userId?.slice(0, 15),
     filters: {
       hasStartDate: !!filters.startDate,
       hasEndDate: !!filters.endDate,
@@ -174,7 +185,7 @@ export async function getCandidateDashboard(
 
   // Get user first
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: {
       id: true,
       credits: true,
@@ -182,12 +193,12 @@ export async function getCandidateDashboard(
   });
 
   if (!user) {
-    dashboardLogger.warn('User not found for dashboard', { clerkId: clerkId.slice(0, 15) });
+    dashboardLogger.warn('User not found for dashboard', { userId: userId?.slice(0, 15) });
     return null;
   }
 
   dashboardLogger.debug('User found for dashboard', {
-    clerkId: clerkId.slice(0, 15),
+    userId: userId?.slice(0, 15),
     internalUserId: user.id,
     credits: user.credits,
   });
@@ -215,16 +226,18 @@ export async function getCandidateDashboard(
         companyName: true,
         seniority: true,
         resumeId: true,
-        resumeFileName: true,
         score: true,
         callDuration: true,
         endedAt: true,
         createdAt: true,
         status: true,
+        language: true,
+        roleCountryCode: true,
         resumeDocument: {
           select: {
             id: true,
             title: true,
+            fileName: true,
           },
         },
       },
@@ -329,8 +342,9 @@ export async function getCandidateDashboard(
     ? Math.round((scores.reduce((a, b) => a + b, 0) / scores.length) * 10) / 10
     : null;
 
+  // callDuration is stored in milliseconds - divide by 60000 for minutes
   const averageDurationMinutes = durations.length > 0
-    ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length / 60)
+    ? Math.round(durations.reduce((a, b) => a + b, 0) / durations.length / 60000)
     : null;
 
   const passRate = scores.length > 0
@@ -390,17 +404,21 @@ export async function getCandidateDashboard(
     .reverse(); // Oldest first for charts
 
   // Build recent interviews list
+  // callDuration is stored in milliseconds - divide by 60000 for minutes
   const recentInterviews: RecentInterview[] = filteredInterviews.slice(0, limit).map((i) => ({
     id: i.id,
     date: (i.endedAt || i.createdAt).toISOString(),
     roleTitle: i.jobTitle,
     companyName: i.companyName,
     seniority: i.seniority,
-    resumeTitle: i.resumeDocument?.title || i.resumeFileName || null,
+    resumeTitle: i.resumeDocument?.title || i.resumeDocument?.fileName || null,
     resumeId: i.resumeId,
-    durationMinutes: i.callDuration ? Math.round(i.callDuration / 60) : null,
+    durationMinutes: i.callDuration ? Math.round(i.callDuration / 60000) : null,
+    callDuration: i.callDuration,
     score: i.score,
     status: i.status,
+    language: i.language || null,
+    country: i.roleCountryCode || null,
   }));
 
   // Build resume utilization stats
@@ -432,6 +450,37 @@ export async function getCandidateDashboard(
     resumes: resumes.map((r) => ({ id: r.id, title: r.title })),
   };
 
+  // Calculate total duration in milliseconds (sum of all callDuration values)
+  const totalDurationMs = durations.length > 0
+    ? durations.reduce((a, b) => a + b, 0)
+    : null;
+
+  // Build weekly activity data (counts and durations per day of week)
+  // Uses the date range from filters if provided, otherwise all filtered interviews
+  const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const weeklyActivityMap: Record<string, { count: number; durationMs: number }> = {};
+  dayNames.forEach((day) => {
+    weeklyActivityMap[day] = { count: 0, durationMs: 0 };
+  });
+
+  filteredInterviews.forEach((interview) => {
+    if (interview.endedAt) {
+      // JavaScript getDay() returns 0 for Sunday, 1 for Monday, etc.
+      // Convert to Monday-first format: Mon=0, Tue=1, ..., Sun=6
+      const jsDay = interview.endedAt.getDay();
+      const dayIndex = jsDay === 0 ? 6 : jsDay - 1;
+      const dayName = dayNames[dayIndex];
+      weeklyActivityMap[dayName].count++;
+      weeklyActivityMap[dayName].durationMs += interview.callDuration || 0;
+    }
+  });
+
+  const weeklyActivity: WeeklyActivityBucket[] = dayNames.map((day) => ({
+    day,
+    count: weeklyActivityMap[day].count,
+    durationMs: weeklyActivityMap[day].durationMs,
+  }));
+
   const response: CandidateDashboardResponse = {
     kpis: {
       totalInterviews: allCompletedInterviews.length,
@@ -439,6 +488,7 @@ export async function getCandidateDashboard(
       averageScore,
       scoreChange,
       averageDurationMinutes,
+      totalDurationMs,
       totalSpent: Math.round(totalSpent * 100) / 100,
       creditsRemaining: user.credits,
       interviewsThisMonth,
@@ -446,6 +496,7 @@ export async function getCandidateDashboard(
     },
     scoreEvolution,
     recentInterviews,
+    weeklyActivity,
     resumes: resumeUtilization,
     filterOptions,
     filters: {
@@ -458,7 +509,7 @@ export async function getCandidateDashboard(
   };
 
   dashboardLogger.info('Dashboard data fetched successfully', {
-    clerkId: clerkId.slice(0, 15),
+    userId: userId?.slice(0, 15),
     totalInterviews: response.kpis.totalInterviews,
     filteredInterviews: response.kpis.completedInterviews,
     resumeCount: response.resumes.length,
@@ -489,11 +540,11 @@ export async function updateResumeLastUsed(resumeId: string): Promise<void> {
  * Get spending history by month
  */
 export async function getSpendingHistory(
-  clerkId: string,
+  userId: string,
   months = 6
 ): Promise<Array<{ month: string; amount: number }>> {
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true },
   });
 

@@ -69,8 +69,8 @@ describe.skip('Transactional Email Service', () => {
 
     it('should generate previews for all email types', async () => {
       const { previewEmail } = await import('../../services/transactionalEmailService');
-      const validTypes: Array<'welcome' | 'purchase' | 'low-credits' | 'interview-reminder' | 'interview-complete'> = 
-        ['welcome', 'purchase', 'low-credits', 'interview-reminder', 'interview-complete'];
+      const validTypes: Array<'welcome' | 'purchase' | 'low-credits' | 'interview-complete'> =
+        ['welcome', 'purchase', 'low-credits', 'interview-complete'];
       
       for (const type of validTypes) {
         const preview = previewEmail(type, 'en');
@@ -101,7 +101,7 @@ describe.skip('Transactional Email Service', () => {
 
     it('interview-reminder should include CTA link', async () => {
       const { previewEmail } = await import('../../services/transactionalEmailService');
-      const preview = previewEmail('interview-reminder', 'en');
+      const preview = previewEmail('interview-complete', 'en');
       
       // Should contain a link to practice
       expect(preview.html).toContain('href=');

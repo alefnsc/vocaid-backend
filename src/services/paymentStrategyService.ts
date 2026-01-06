@@ -452,8 +452,14 @@ class PayPalProvider implements IPaymentProvider {
 
   async handleWebhook(payload: any, headers: Record<string, string>): Promise<WebhookResult> {
     // Verify webhook signature (in production)
-    const orderId = payload.resource?.id;
     const eventType = payload.event_type;
+
+    // PayPal webhook payloads differ by event type:
+    // - CHECKOUT.ORDER.* events: resource.id is the orderId
+    // - PAYMENT.CAPTURE.* events: resource.id is the captureId, and orderId is in supplementary_data.related_ids.order_id
+    const captureRelatedOrderId = payload.resource?.supplementary_data?.related_ids?.order_id;
+    const rawResourceId = payload.resource?.id;
+    const orderId = captureRelatedOrderId || rawResourceId;
 
     if (!orderId) {
       throw new Error('Order ID not found in webhook payload');
@@ -465,6 +471,34 @@ class PayPalProvider implements IPaymentProvider {
       customData = JSON.parse(customId || '{}');
     } catch (e) {
       paymentLogger.warn('Failed to parse custom_id', { orderId });
+    }
+
+    // For capture events we usually need to fetch order details to get custom_id/credits.
+    if ((!customData?.userId || !customData?.credits) && orderId) {
+      try {
+        const orderDetails = await this.getPaymentStatus(orderId);
+        // getPaymentStatus doesn't include custom_id; fetch full order for metadata
+        const { baseUrl } = this.getCredentials();
+        const token = await this.getAccessToken();
+        const orderResp = await fetch(`${baseUrl}/v2/checkout/orders/${orderId}`, {
+          headers: { 'Authorization': `Bearer ${token}` },
+        });
+        if (orderResp.ok) {
+          const orderJson = await orderResp.json() as any;
+          const customIdFromOrder = orderJson?.purchase_units?.[0]?.custom_id;
+          if (customIdFromOrder) {
+            customData = {
+              ...customData,
+              ...(JSON.parse(customIdFromOrder) || {}),
+            };
+          }
+        }
+      } catch (e: any) {
+        paymentLogger.warn('Failed to fetch PayPal order details for custom_id (webhook)', {
+          orderId,
+          error: e?.message,
+        });
+      }
     }
 
     const statusMap: Record<string, WebhookResult['status']> = {
@@ -579,8 +613,8 @@ export class PaymentGateway {
   /**
    * Get the best provider for a user based on their region
    */
-  async getProviderForUser(clerkId: string): Promise<IPaymentProvider> {
-    const { provider: providerType, isFallback } = await getPreferredPaymentProvider(clerkId);
+  async getProviderForUser(userId: string): Promise<IPaymentProvider> {
+    const { provider: providerType, isFallback } = await getPreferredPaymentProvider(userId);
     
     const provider = this.getProvider(providerType);
     
@@ -616,7 +650,7 @@ export class PaymentGateway {
    * Create payment with automatic provider selection
    */
   async createPayment(
-    clerkId: string,
+    userId: string,
     params: Omit<CreatePaymentParams, 'userId'>,
     preferredProvider?: PaymentProviderType
   ): Promise<PaymentPreferenceResponse & { selectedProvider: PaymentProviderType }> {
@@ -628,15 +662,15 @@ export class PaymentGateway {
         paymentLogger.warn('Preferred provider not available, falling back to auto-selection', {
           preferredProvider,
         });
-        provider = await this.getProviderForUser(clerkId);
+        provider = await this.getProviderForUser(userId);
       }
     } else {
-      provider = await this.getProviderForUser(clerkId);
+      provider = await this.getProviderForUser(userId);
     }
     
     const result = await provider.createPaymentPreference({
       ...params,
-      userId: clerkId,
+      userId,
     });
     
     return {

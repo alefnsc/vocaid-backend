@@ -14,6 +14,7 @@ import * as candidateDashboardService from '../services/candidateDashboardServic
 import * as resumeRepositoryService from '../services/resumeRepositoryService';
 import { downloadResume } from '../services/azureBlobService';
 import { apiLogger } from '../utils/logger';
+import { requireSession } from '../middleware/sessionAuthMiddleware';
 
 const router = Router();
 
@@ -30,65 +31,7 @@ const dashboardQuerySchema = z.object({
   limit: z.string().regex(/^\d+$/).transform(Number).optional(),
 });
 
-// Clerk user ID schema (matches format: user_xxxxx)
-const clerkUserIdSchema = z.string().regex(/^user_[a-zA-Z0-9]+$/, 'Invalid Clerk user ID format');
-
-// ========================================
-// MIDDLEWARE
-// ========================================
-
-/**
- * Extract Clerk user ID from request headers
- */
-function getClerkUserId(req: Request): string | null {
-  return (req.headers['x-user-id'] as string) || null;
-}
-
-/**
- * Require authentication middleware
- * Extracts and validates the Clerk user ID from headers
- */
-function requireAuth(req: Request, res: Response, next: NextFunction) {
-  const clerkId = getClerkUserId(req);
-  
-  // Debug logging
-  apiLogger.info('Dashboard auth check', {
-    requestId: (req as any).requestId,
-    clerkId: clerkId ? `${clerkId.slice(0, 15)}...` : null,
-    hasXUserId: !!req.headers['x-user-id'],
-    allHeaders: Object.keys(req.headers),
-  });
-  
-  if (!clerkId) {
-    apiLogger.warn('Dashboard auth failed - no user ID', {
-      requestId: (req as any).requestId,
-      headers: Object.keys(req.headers),
-    });
-    return res.status(401).json({
-      status: 'error',
-      code: 'UNAUTHORIZED',
-      message: 'Authentication required',
-    });
-  }
-  
-  // Validate Clerk ID format
-  try {
-    clerkUserIdSchema.parse(clerkId);
-    (req as any).clerkUserId = clerkId;
-    next();
-  } catch (error) {
-    apiLogger.warn('Dashboard auth failed - invalid user ID format', {
-      requestId: (req as any).requestId,
-      clerkIdPrefix: clerkId.slice(0, 10),
-    });
-    return res.status(401).json({
-      status: 'error',
-      code: 'UNAUTHORIZED',
-      message: 'Invalid user ID format',
-    });
-  }
-}
-
+// User ID is now UUID from session auth
 // ========================================
 // ROUTES
 // ========================================
@@ -107,9 +50,9 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
  * - resumeId: Filter by resume used
  * - limit: Max number of recent interviews (default 10)
  */
-router.get('/candidate', requireAuth, async (req: Request, res: Response) => {
+router.get('/candidate', requireSession, async (req: Request, res: Response) => {
   const requestId = (req as any).requestId || 'N/A';
-  const clerkId = (req as any).clerkUserId;
+  const userId = req.userId!; // Non-null: requireSession ensures userId exists
 
   try {
     // Validate query parameters
@@ -135,7 +78,7 @@ router.get('/candidate', requireAuth, async (req: Request, res: Response) => {
 
     apiLogger.info('Fetching candidate dashboard', {
       requestId,
-      clerkId: clerkId.slice(0, 15),
+      userId: userId?.slice(0, 15),
       hasFilters: !!(startDate || endDate || roleTitle || seniority || resumeId),
     });
 
@@ -148,7 +91,7 @@ router.get('/candidate', requireAuth, async (req: Request, res: Response) => {
     };
 
     const dashboard = await candidateDashboardService.getCandidateDashboard(
-      clerkId,
+      userId!,
       filters,
       limit || 10
     );
@@ -187,14 +130,14 @@ router.get('/candidate', requireAuth, async (req: Request, res: Response) => {
  * Query params:
  * - months: Number of months to include (default 6)
  */
-router.get('/candidate/spending', requireAuth, async (req: Request, res: Response) => {
+router.get('/candidate/spending', requireSession, async (req: Request, res: Response) => {
   const requestId = (req as any).requestId || 'N/A';
-  const clerkId = (req as any).clerkUserId;
+  const userId = req.userId!; // Non-null: requireSession ensures userId exists
 
   try {
     const months = parseInt(req.query.months as string) || 6;
 
-    const spendingHistory = await candidateDashboardService.getSpendingHistory(clerkId, months);
+    const spendingHistory = await candidateDashboardService.getSpendingHistory(userId, months);
 
     res.json({
       status: 'success',
@@ -220,14 +163,14 @@ router.get('/candidate/spending', requireAuth, async (req: Request, res: Respons
  * Download a resume file.
  * Returns the resume file for download.
  */
-router.get('/resumes/:resumeId/download', requireAuth, async (req: Request, res: Response) => {
+router.get('/resumes/:resumeId/download', requireSession, async (req: Request, res: Response) => {
   const requestId = (req as any).requestId || 'N/A';
-  const clerkId = (req as any).clerkUserId;
+  const userId = req.userId!; // Non-null: requireSession ensures userId exists
   const { resumeId } = req.params;
 
   try {
     // Get resume metadata (including storageKey)
-    const resume = await resumeRepositoryService.getResumeById(clerkId, resumeId, false);
+    const resume = await resumeRepositoryService.getResumeById(userId, resumeId, false);
 
     if (!resume) {
       return res.status(404).json({

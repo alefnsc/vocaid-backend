@@ -133,7 +133,7 @@ export async function getRecordingInfo(
   try {
     // Get interview from database
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { id: true }
     });
     
@@ -224,7 +224,7 @@ export async function getSynchronizedTranscript(
 ): Promise<SynchronizedTranscript | null> {
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { id: true }
     });
     
@@ -435,7 +435,7 @@ export async function generatePlaybackMarkers(
 ): Promise<PlaybackMarker[]> {
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { id: true }
     });
     
@@ -531,7 +531,7 @@ export async function saveCustomMarker(
 ): Promise<PlaybackMarker | null> {
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { id: true }
     });
     

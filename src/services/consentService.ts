@@ -13,7 +13,6 @@ import {
   getConsentRequirements,
   isConsentVersionCurrent,
 } from '../constants/consentVersions';
-import { updateUserPublicMetadata } from './clerkService';
 import logger from '../utils/logger';
 
 const prisma = new PrismaClient();
@@ -65,9 +64,9 @@ export interface ConsentSubmitResult {
  */
 export async function getConsentStatus(userId: string): Promise<ConsentStatus> {
   try {
-    // First find the user by clerkId
+    // Find user by id (first-party auth uses UUID)
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       include: { userConsent: true },
     });
 
@@ -156,9 +155,9 @@ export async function submitConsent(params: SubmitConsentParams): Promise<Consen
       };
     }
 
-    // Find user by clerkId
+    // Find user by id (first-party auth uses UUID)
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
     });
 
     if (!user) {
@@ -208,18 +207,7 @@ export async function submitConsent(params: SubmitConsentParams): Promise<Consen
       },
     });
 
-    // Sync to Clerk publicMetadata for fast frontend checks
-    try {
-      await updateUserPublicMetadata(userId, {
-        onboardingComplete: true,
-        termsVersionAccepted: TERMS_VERSION,
-        privacyVersionAccepted: PRIVACY_VERSION,
-        consentRecordedAt: now.toISOString(),
-      });
-    } catch (clerkError) {
-      // Log but don't fail - DB is source of truth
-      consentLogger.warn('Failed to sync consent to Clerk metadata', { userId, error: clerkError });
-    }
+    // The database (User.onboardingComplete, UserConsent) is the single source of truth.
 
     consentLogger.info('Consent submitted successfully', {
       userId,
@@ -249,10 +237,10 @@ export async function submitConsent(params: SubmitConsentParams): Promise<Consen
  * Check if a user has completed required consents
  * Used by middleware to gate access to protected endpoints
  */
-export async function hasRequiredConsents(clerkId: string): Promise<boolean> {
+export async function hasRequiredConsents(userId: string): Promise<boolean> {
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId },
+      where: { id: userId },
       select: { onboardingCompletedAt: true, userConsent: true },
     });
 
@@ -270,7 +258,7 @@ export async function hasRequiredConsents(clerkId: string): Promise<boolean> {
 
     return false;
   } catch (error) {
-    consentLogger.error('Error checking required consents', { clerkId, error });
+    consentLogger.error('Error checking required consents', { userId, error });
     return false;
   }
 }
@@ -296,12 +284,12 @@ export function getRequirements() {
  * Can be called from settings page
  */
 export async function updateMarketingPreference(
-  clerkId: string,
+  userId: string,
   marketingOptIn: boolean
 ): Promise<{ success: boolean; marketingOptIn: boolean }> {
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId },
+      where: { id: userId },
       include: { userConsent: true },
     });
 
@@ -320,11 +308,11 @@ export async function updateMarketingPreference(
       },
     });
 
-    consentLogger.info('Marketing preference updated', { clerkId, marketingOptIn });
+    consentLogger.info('Marketing preference updated', { userId, marketingOptIn });
 
     return { success: true, marketingOptIn };
   } catch (error) {
-    consentLogger.error('Error updating marketing preference', { clerkId, error });
+    consentLogger.error('Error updating marketing preference', { userId, error });
     throw error;
   }
 }
@@ -339,63 +327,27 @@ export async function updateMarketingPreference(
  * Transactional emails (receipts, security) require Terms + Privacy acceptance
  * Returns true for new users who haven't consented yet (essential account notifications)
  * 
- * @param userId - Either clerkId or DB userId
+ * @param userId - User's database ID (UUID)
  */
 export async function canSendTransactional(userId: string): Promise<boolean> {
-  try {
-    // Try to find by clerkId first, then by DB id
-    let user = await prisma.user.findUnique({
-      where: { clerkId: userId },
-      include: { userConsent: true },
-    });
-
-    if (!user) {
-      user = await prisma.user.findUnique({
-        where: { id: userId },
-        include: { userConsent: true },
-      });
-    }
-
-    if (!user) {
-      // User doesn't exist yet - allow transactional for account creation flow
-      consentLogger.debug('User not found, allowing transactional email', { userId });
-      return true;
-    }
-
-    // If no consent record, allow transactional (new user flow)
-    if (!user.userConsent) {
-      return true;
-    }
-
-    // Check if transactional is enabled (default true)
-    return user.userConsent.transactionalOptIn;
-  } catch (error) {
-    consentLogger.error('Error checking transactional consent', { userId, error });
-    // Fail open for transactional - these are essential
-    return true;
-  }
+  // Transactional emails are essential (receipts, account/security) and must always be allowed.
+  // Keep this fail-open by design.
+  return true;
 }
 
 /**
  * Check if marketing emails can be sent to a user
  * Marketing emails require explicit opt-in
  * 
- * @param userId - Either clerkId or DB userId
+ * @param userId - User's database ID (UUID)
  */
 export async function canSendMarketing(userId: string): Promise<boolean> {
   try {
-    // Try to find by clerkId first, then by DB id
-    let user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+    // Find user by id (first-party auth uses UUID)
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
       include: { userConsent: true },
     });
-
-    if (!user) {
-      user = await prisma.user.findUnique({
-        where: { id: userId },
-        include: { userConsent: true },
-      });
-    }
 
     if (!user || !user.userConsent) {
       // No user or no consent = no marketing
@@ -434,7 +386,7 @@ export async function getConsentByEmail(email: string): Promise<{
     }
 
     return {
-      canSendTransactional: user.userConsent?.transactionalOptIn ?? true,
+      canSendTransactional: true,
       canSendMarketing: user.userConsent?.marketingOptIn ?? false,
       userId: user.id,
     };

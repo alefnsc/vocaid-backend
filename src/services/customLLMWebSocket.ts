@@ -26,6 +26,7 @@ import {
   type CreateSessionParams,
   type FinalizeSessionParams,
 } from './interviewSessionService';
+import postCallProcessingService from './postCallProcessingService';
 
 /**
  * Retell Custom LLM WebSocket Handler
@@ -987,6 +988,16 @@ INSTRUCTIONS:
         completionRate: this.calculateCompletionRate(),
         retellDurationSec: Math.floor(this.interviewTimer.getElapsedMinutes() * 60),
         retellDisconnectReason: endReason,
+      });
+
+      // Trigger post-call processing asynchronously (don't await to avoid blocking)
+      // This will fetch Retell post-call data, generate metrics + study plan via OpenAI
+      postCallProcessingService.processInterview(interviewId).catch((error: any) => {
+        wsLogger.error('Post-call processing failed', {
+          callId: this.callId,
+          interviewId,
+          error: error.message,
+        });
       });
 
       wsLogger.info('Interview session completed', {

@@ -9,6 +9,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { z, ZodError } from 'zod';
 import { ConsentSource } from '@prisma/client';
 import * as consentService from '../services/consentService';
+import { validateSession, getSessionToken } from '../services/sessionService';
 import logger from '../utils/logger';
 
 const router = Router();
@@ -19,21 +20,43 @@ const consentLogger = logger.child({ route: 'consent' });
 // ========================================
 
 /**
- * Verify user authentication from header
+ * Verify user authentication from session cookie
  */
-const verifyAuth = (req: Request, res: Response, next: NextFunction) => {
-  const userId = req.headers['x-user-id'] as string;
-  
-  if (!userId || !userId.startsWith('user_')) {
-    return res.status(401).json({
+const verifyAuth = async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    // Get session token from cookie
+    const token = getSessionToken(req.cookies || {});
+    
+    if (!token) {
+      return res.status(401).json({
+        ok: false,
+        error: 'Authentication required',
+        code: 'UNAUTHORIZED',
+      });
+    }
+    
+    // Validate session
+    const session = await validateSession(token);
+    
+    if (!session) {
+      return res.status(401).json({
+        ok: false,
+        error: 'Session expired or invalid',
+        code: 'SESSION_INVALID',
+      });
+    }
+    
+    (req as any).userId = session.userId;
+    (req as any).session = session;
+    next();
+  } catch (error) {
+    consentLogger.error('Auth verification failed', { error });
+    return res.status(500).json({
       ok: false,
-      error: 'Authentication required',
-      code: 'UNAUTHORIZED',
+      error: 'Authentication check failed',
+      code: 'AUTH_ERROR',
     });
   }
-  
-  (req as any).userId = userId;
-  next();
 };
 
 /**

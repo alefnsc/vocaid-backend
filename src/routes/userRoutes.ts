@@ -14,9 +14,17 @@
 import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { PrismaClient, UserType } from '@prisma/client';
-import { requireAuth } from './apiRoutes';
-import { isIdVerificationAvailable, isValidCountryCode, B2CErrorCodes } from '../middleware/b2cMiddleware';
+import { requireSession } from '../middleware/sessionAuthMiddleware';
 import logger from '../utils/logger';
+
+const B2CErrorCodes = {
+  USER_NOT_FOUND: 'USER_NOT_FOUND',
+} as const;
+
+const isValidCountryCode = (countryCode: string) => /^[A-Z]{2}$/.test(countryCode);
+
+// Session-based auth is now active.
+const isIdVerificationAvailable = (countryCode: string) => isValidCountryCode(countryCode);
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -49,16 +57,15 @@ const updateProfileSchema = z.object({
 // ========================================
 // GET /api/users/me - Get current user profile
 // ========================================
-router.get('/me', requireAuth, async (req: Request, res: Response) => {
+router.get('/me', requireSession, async (req: Request, res: Response) => {
   const requestId = (req as any).requestId || 'N/A';
-  const clerkId = (req as any).clerkUserId;
+  const userId = req.userId!; // Non-null: requireSession ensures userId exists
 
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId },
+      where: { id: userId },
       select: {
         id: true,
-        clerkId: true,
         email: true,
         firstName: true,
         lastName: true,
@@ -115,9 +122,9 @@ router.get('/me', requireAuth, async (req: Request, res: Response) => {
 // ========================================
 // PUT /api/users/me - Update current user profile
 // ========================================
-router.put('/me', requireAuth, async (req: Request, res: Response) => {
+router.put('/me', requireSession, async (req: Request, res: Response) => {
   const requestId = (req as any).requestId || 'N/A';
-  const clerkId = (req as any).clerkUserId;
+  const userId = req.userId!; // Non-null: requireSession ensures userId exists
 
   try {
     // Validate request body
@@ -172,11 +179,10 @@ router.put('/me', requireAuth, async (req: Request, res: Response) => {
 
     // Update user
     const user = await prisma.user.update({
-      where: { clerkId },
+      where: { id: userId },
       data: updateData,
       select: {
         id: true,
-        clerkId: true,
         email: true,
         firstName: true,
         lastName: true,
@@ -253,9 +259,9 @@ router.put('/me', requireAuth, async (req: Request, res: Response) => {
 // POST /api/users/metadata - Legacy endpoint
 // Proxies to PUT /api/users/me for backward compatibility
 // ========================================
-router.post('/metadata', requireAuth, async (req: Request, res: Response) => {
+router.post('/metadata', requireSession, async (req: Request, res: Response) => {
   const requestId = (req as any).requestId || 'N/A';
-  const clerkId = (req as any).clerkUserId;
+  const userId = req.userId!; // Non-null: requireSession ensures userId exists
 
   try {
     // Map old fields to new format
@@ -280,11 +286,10 @@ router.post('/metadata', requireAuth, async (req: Request, res: Response) => {
     }
 
     const user = await prisma.user.update({
-      where: { clerkId },
+      where: { id: userId },
       data: updateData,
       select: {
         id: true,
-        clerkId: true,
         userType: true,
         countryCode: true,
         preferredLanguage: true,
@@ -352,13 +357,13 @@ router.post('/metadata', requireAuth, async (req: Request, res: Response) => {
 // ========================================
 // GET /api/users/me/b2c-status - Get B2C access status
 // ========================================
-router.get('/me/b2c-status', requireAuth, async (req: Request, res: Response) => {
+router.get('/me/b2c-status', requireSession, async (req: Request, res: Response) => {
   const requestId = (req as any).requestId || 'N/A';
-  const clerkId = (req as any).clerkUserId;
+  const userId = req.userId!; // Non-null: requireSession ensures userId exists
 
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId },
+      where: { id: userId },
       select: {
         userType: true,
         countryCode: true,
@@ -415,4 +420,4 @@ router.get('/me/b2c-status', requireAuth, async (req: Request, res: Response) =>
 });
 
 export default router;
-export { requireAuth };
+export { requireSession };

@@ -21,7 +21,6 @@
  */
 
 import Retell from 'retell-sdk';
-import { clerkClient } from '@clerk/express';
 import { wsLogger } from '../utils/logger';
 import {
   SupportedLanguageCode,
@@ -259,7 +258,7 @@ export class MultilingualRetellService {
     wsLogger.info('Registering call with auto language detection', { userId });
 
     try {
-      // Get user's language preference from Clerk
+      // Get user's language preference from database
       const preferences = await getUserPreferences(userId);
       const language = preferences?.language || 'en-US';
 

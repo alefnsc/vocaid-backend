@@ -1,0 +1,39 @@
+Ótimo trabalho, {{{CANDIDATE_FIRST_NAME}}}! 🎯
+
+Seus resultados da prática de entrevista estão prontos.
+
+RESUMO DA ENTREVISTA
+--------------------
+Cargo: {{{ROLE_TITLE}}}
+Empresa: {{{TARGET_COMPANY}}}
+Duração: {{{DURATION_MIN}}} min
+Perguntas: {{{QUESTIONS_ANSWERED}}}
+
+PONTUAÇÃO GERAL: {{{OVERALL_SCORE}}}/100
+
+DETALHAMENTO DA PONTUAÇÃO
+-------------------------
+Comunicação: {{{COMMUNICATION_SCORE}}}/100
+Conhecimento Técnico: {{{TECHNICAL_SCORE}}}/100
+Resolução de Problemas: {{{PROBLEM_SOLVING_SCORE}}}/100
+Profissionalismo: {{{PROFESSIONALISM_SCORE}}}/100
+
+💪 PONTOS FORTES
+{{{KEY_STRENGTHS}}}
+
+🎯 ÁREAS PARA MELHORAR
+{{{AREAS_TO_IMPROVE}}}
+
+Ver Feedback Completo: {{{FEEDBACK_URL}}}
+
+💡 DICA
+A prática leva à perfeição! Agende sua próxima entrevista simulada para continuar melhorando suas habilidades.
+
+---
+
+Dúvidas? Responda este email ou entre em contato em support@vocaid.ai
+
+Política de Privacidade: {{{PRIVACY_URL}}}
+Termos de Uso: {{{TERMS_URL}}}
+
+© {{{CURRENT_YEAR}}} Vocaid. Todos os direitos reservados.

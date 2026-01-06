@@ -11,6 +11,7 @@ import * as analyticsService from '../services/analyticsService';
 import * as performanceChatService from '../services/performanceChatService';
 import * as enhancedAbuseService from '../services/enhancedAbuseService';
 import { dbLogger, apiLogger } from '../utils/logger';
+import { requireSession } from '../middleware/sessionAuthMiddleware';
 
 // Create router
 const router = Router();
@@ -18,8 +19,6 @@ const router = Router();
 // ========================================
 // VALIDATION SCHEMAS
 // ========================================
-
-const clerkUserIdSchema = z.string().regex(/^user_[a-zA-Z0-9]+$/);
 
 const analyticsQuerySchema = z.object({
   startDate: z.string().datetime().optional(),
@@ -34,6 +33,17 @@ const timeSeriesQuerySchema = z.object({
   months: z.coerce.number().min(1).max(24).optional(),
   role: z.string().max(200).optional(),
   company: z.string().max(200).optional()
+});
+
+const performanceSummaryQuerySchema = z.object({
+  range: z.enum(['1W', '1M', '6M', 'ALL']).optional().default('1M'),
+  role: z.string().max(200).optional(),
+  company: z.string().max(200).optional()
+});
+
+const performanceGoalSchema = z.object({
+  weeklyInterviewGoal: z.coerce.number().int().min(1).max(50),
+  weeklyMinutesGoal: z.coerce.number().int().min(10).max(10000).optional()
 });
 
 const chatMessageSchema = z.object({
@@ -98,38 +108,6 @@ function validate<T extends z.ZodSchema>(
   };
 }
 
-/**
- * Get Clerk user ID from request
- */
-function getClerkUserId(req: Request): string | null {
-  return (req.headers['x-user-id'] as string) || req.body?.userId || null;
-}
-
-/**
- * Require authenticated user middleware
- */
-async function requireAuth(req: Request, res: Response, next: NextFunction) {
-  const clerkId = getClerkUserId(req);
-  
-  if (!clerkId) {
-    return res.status(401).json({
-      status: 'error',
-      message: 'Authentication required'
-    });
-  }
-  
-  try {
-    clerkUserIdSchema.parse(clerkId);
-    (req as any).clerkUserId = clerkId;
-    next();
-  } catch (error) {
-    return res.status(401).json({
-      status: 'error',
-      message: 'Invalid authentication'
-    });
-  }
-}
-
 // ========================================
 // ANALYTICS ENDPOINTS
 // ========================================
@@ -140,14 +118,14 @@ async function requireAuth(req: Request, res: Response, next: NextFunction) {
  */
 router.get(
   '/analytics/scores/by-role',
-  requireAuth,
+  requireSession,
   validate(analyticsQuerySchema, 'query'),
   async (req: Request, res: Response) => {
     try {
-      const clerkId = (req as any).clerkUserId;
+      const userId = req.userId!; // Non-null: requireSession ensures userId exists
       const query = (req as any).validatedQuery || {};
 
-      const scores = await analyticsService.getScoresByRole(clerkId, {
+      const scores = await analyticsService.getScoresByRole(userId, {
         startDate: query.startDate ? new Date(query.startDate) : undefined,
         endDate: query.endDate ? new Date(query.endDate) : undefined,
         role: query.role,
@@ -174,14 +152,14 @@ router.get(
  */
 router.get(
   '/analytics/scores/by-company',
-  requireAuth,
+  requireSession,
   validate(analyticsQuerySchema, 'query'),
   async (req: Request, res: Response) => {
     try {
-      const clerkId = (req as any).clerkUserId;
+      const userId = req.userId!; // Non-null: requireSession ensures userId exists
       const query = (req as any).validatedQuery || {};
 
-      const scores = await analyticsService.getScoresByCompany(clerkId, {
+      const scores = await analyticsService.getScoresByCompany(userId, {
         startDate: query.startDate ? new Date(query.startDate) : undefined,
         endDate: query.endDate ? new Date(query.endDate) : undefined,
         company: query.company,
@@ -208,15 +186,15 @@ router.get(
  */
 router.get(
   '/analytics/scores/history',
-  requireAuth,
+  requireSession,
   validate(timeSeriesQuerySchema, 'query'),
   async (req: Request, res: Response) => {
     try {
-      const clerkId = (req as any).clerkUserId;
+      const userId = req.userId!; // Non-null: requireSession ensures userId exists
       const query = (req as any).validatedQuery || {};
 
       const timeSeries = await analyticsService.getScoreTimeSeries(
-        clerkId,
+        userId,
         query.period || 'weekly',
         {
           months: query.months,
@@ -245,15 +223,15 @@ router.get(
  */
 router.get(
   '/analytics/volume',
-  requireAuth,
+  requireSession,
   validate(timeSeriesQuerySchema, 'query'),
   async (req: Request, res: Response) => {
     try {
-      const clerkId = (req as any).clerkUserId;
+      const userId = req.userId!; // Non-null: requireSession ensures userId exists
       const query = (req as any).validatedQuery || {};
 
       const volume = await analyticsService.getInterviewVolume(
-        clerkId,
+        userId,
         query.period || 'monthly',
         {
           months: query.months,
@@ -281,14 +259,14 @@ router.get(
  */
 router.get(
   '/analytics/percentile',
-  requireAuth,
+  requireSession,
   validate(analyticsQuerySchema, 'query'),
   async (req: Request, res: Response) => {
     try {
-      const clerkId = (req as any).clerkUserId;
+      const userId = req.userId!; // Non-null: requireSession ensures userId exists
       const query = (req as any).validatedQuery || {};
 
-      const percentile = await analyticsService.getUserPercentile(clerkId, {
+      const percentile = await analyticsService.getUserPercentile(userId, {
         role: query.role
       });
 
@@ -312,15 +290,15 @@ router.get(
  */
 router.get(
   '/analytics/dashboard',
-  requireAuth,
+  requireSession,
   validate(timeSeriesQuerySchema, 'query'),
   async (req: Request, res: Response) => {
     try {
-      const clerkId = (req as any).clerkUserId;
+      const userId = req.userId!; // Non-null: requireSession ensures userId exists
       const query = (req as any).validatedQuery || {};
 
       const dashboard = await analyticsService.getDashboardAnalytics(
-        clerkId,
+        userId,
         query.period || 'monthly'
       );
 
@@ -344,11 +322,11 @@ router.get(
  */
 router.get(
   '/analytics/filters',
-  requireAuth,
+  requireSession,
   async (req: Request, res: Response) => {
     try {
-      const clerkId = (req as any).clerkUserId;
-      const filters = await analyticsService.getAvailableFilters(clerkId);
+      const userId = req.userId!; // Non-null: requireSession ensures userId exists
+      const filters = await analyticsService.getAvailableFilters(userId);
 
       res.json({
         status: 'success',
@@ -365,6 +343,104 @@ router.get(
 );
 
 // ========================================
+// PERFORMANCE PAGE ENDPOINTS
+// ========================================
+
+/**
+ * GET /analytics/performance/summary
+ * Performance deep-dive metrics (distinct from dashboard bundle)
+ */
+router.get(
+  '/analytics/performance/summary',
+  requireSession,
+  validate(performanceSummaryQuerySchema, 'query'),
+  async (req: Request, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const query = (req as any).validatedQuery || {};
+
+      const summary = await analyticsService.getPerformanceSummary(
+        userId,
+        query.range,
+        {
+          role: query.role,
+          company: query.company
+        }
+      );
+
+      res.json({
+        status: 'success',
+        data: summary
+      });
+    } catch (error: any) {
+      apiLogger.error('Error getting performance summary', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to get performance summary'
+      });
+    }
+  }
+);
+
+/**
+ * GET /analytics/performance/goal
+ * Get user's weekly practice goal (persisted)
+ */
+router.get(
+  '/analytics/performance/goal',
+  requireSession,
+  async (req: Request, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const goal = await analyticsService.getPerformanceGoal(userId);
+
+      res.json({
+        status: 'success',
+        data: goal
+      });
+    } catch (error: any) {
+      apiLogger.error('Error getting performance goal', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to get performance goal'
+      });
+    }
+  }
+);
+
+/**
+ * PUT /analytics/performance/goal
+ * Update user's weekly practice goal (persisted)
+ */
+router.put(
+  '/analytics/performance/goal',
+  requireSession,
+  validate(performanceGoalSchema, 'body'),
+  async (req: Request, res: Response) => {
+    try {
+      const userId = req.userId!;
+      const { weeklyInterviewGoal, weeklyMinutesGoal } = req.body;
+
+      const goal = await analyticsService.upsertPerformanceGoal(userId, {
+        weeklyInterviewGoal,
+        weeklyMinutesGoal
+      });
+
+      res.json({
+        status: 'success',
+        data: goal
+      });
+    } catch (error: any) {
+      apiLogger.error('Error updating performance goal', { error: error.message });
+      res.status(500).json({
+        status: 'error',
+        message: 'Failed to update performance goal'
+      });
+    }
+  }
+);
+
+// ========================================
 // PERFORMANCE CHAT ENDPOINTS
 // ========================================
 
@@ -374,15 +450,15 @@ router.get(
  */
 router.post(
   '/chat/performance',
-  requireAuth,
+  requireSession,
   validate(chatMessageSchema, 'body'),
   async (req: Request, res: Response) => {
     try {
-      const clerkId = (req as any).clerkUserId;
+      const userId = req.userId!; // Non-null: requireSession ensures userId exists
       const { message, sessionId, filters, faqContext } = req.body;
 
       const result = await performanceChatService.getChatCompletion(
-        clerkId,
+        userId,
         message,
         sessionId,
         filters || {},
@@ -413,11 +489,11 @@ router.post(
  */
 router.post(
   '/chat/performance/stream',
-  requireAuth,
+  requireSession,
   validate(chatMessageSchema, 'body'),
   async (req: Request, res: Response) => {
     try {
-      const clerkId = (req as any).clerkUserId;
+      const userId = req.userId!; // Non-null: requireSession ensures userId exists
       const { message, sessionId, filters } = req.body;
 
       // Set up SSE
@@ -427,7 +503,7 @@ router.post(
       res.flushHeaders();
 
       await performanceChatService.streamChatCompletion(
-        clerkId,
+        userId,
         message,
         (chunk: string) => {
           res.write(`data: ${JSON.stringify({ chunk })}\n\n`);
@@ -452,15 +528,15 @@ router.post(
  */
 router.get(
   '/chat/context',
-  requireAuth,
+  requireSession,
   validate(analyticsQuerySchema, 'query'),
   async (req: Request, res: Response) => {
     try {
-      const clerkId = (req as any).clerkUserId;
+      const userId = req.userId!; // Non-null: requireSession ensures userId exists
       const query = (req as any).validatedQuery || {};
 
       const context = await performanceChatService.buildPerformanceContext(
-        clerkId,
+        userId,
         {
           roleFilter: query.role,
           companyFilter: query.company
@@ -499,14 +575,14 @@ router.get(
  */
 router.get(
   '/chat/sessions',
-  requireAuth,
+  requireSession,
   async (req: Request, res: Response) => {
     try {
-      const clerkId = (req as any).clerkUserId;
+      const userId = req.userId!; // Non-null: requireSession ensures userId exists
       const limit = Math.min(parseInt(req.query.limit as string) || 10, 50);
 
       const sessions = await performanceChatService.getUserChatSessions(
-        clerkId,
+        userId,
         limit
       );
 
@@ -530,7 +606,7 @@ router.get(
  */
 router.get(
   '/chat/session/:sessionId',
-  requireAuth,
+  requireSession,
   async (req: Request, res: Response) => {
     try {
       const { sessionId } = req.params;
@@ -563,11 +639,11 @@ router.get(
  */
 router.get(
   '/chat/insights',
-  requireAuth,
+  requireSession,
   async (req: Request, res: Response) => {
     try {
-      const clerkId = (req as any).clerkUserId;
-      const insights = await performanceChatService.generateQuickInsights(clerkId);
+      const userId = req.userId!; // Non-null: requireSession ensures userId exists
+      const insights = await performanceChatService.generateQuickInsights(userId);
 
       res.json({
         status: 'success',
@@ -626,11 +702,11 @@ router.post(
  */
 router.post(
   '/abuse/record',
-  requireAuth,
+  requireSession,
   validate(abuseCheckSchema, 'body'),
   async (req: Request, res: Response) => {
     try {
-      const clerkId = (req as any).clerkUserId;
+      const userId = req.userId!; // Non-null: requireSession ensures userId exists
       const signupInfo = req.body;
 
       // First perform the check
@@ -639,7 +715,7 @@ router.post(
       // Get user's UUID
       const { prisma } = await import('../services/databaseService');
       const user = await prisma.user.findUnique({
-        where: { clerkId },
+        where: { id: userId },
         select: { id: true }
       });
 
@@ -681,10 +757,10 @@ router.post(
  */
 router.post(
   '/abuse/verify',
-  requireAuth,
+  requireSession,
   async (req: Request, res: Response) => {
     try {
-      const clerkId = (req as any).clerkUserId;
+      const userId = req.userId!; // Non-null: requireSession ensures userId exists
       const { verificationType, verificationData } = req.body;
 
       if (!['phone', 'captcha', 'linkedin'].includes(verificationType)) {
@@ -697,7 +773,7 @@ router.post(
       // Get user's UUID
       const { prisma } = await import('../services/databaseService');
       const user = await prisma.user.findUnique({
-        where: { clerkId },
+        where: { id: userId },
         select: { id: true }
       });
 
@@ -734,7 +810,7 @@ router.post(
  */
 router.get(
   '/abuse/stats',
-  requireAuth,
+  requireSession,
   async (req: Request, res: Response) => {
     try {
       // TODO: Add admin role check

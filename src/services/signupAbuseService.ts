@@ -8,7 +8,7 @@
  * - Suspicious activity flagging
  */
 
-import { prisma, dbLogger } from './databaseService';
+import { dbLogger } from './databaseService';
 
 // Configuration: How many accounts from same IP/fingerprint before blocking free credits
 const MAX_ACCOUNTS_PER_IP = parseInt(process.env.MAX_ACCOUNTS_PER_IP || '2', 10);
@@ -28,6 +28,20 @@ export interface AbuseCheckResult {
   existingAccountsFromFingerprint: number;
 }
 
+type SignupRecord = {
+  userId: string;
+  ipAddress?: string;
+  deviceFingerprint?: string;
+  userAgent?: string;
+  freeCreditGranted: boolean;
+  isSuspicious: boolean;
+  suspicionReason?: string;
+  reviewedAt?: Date | null;
+  createdAt: Date;
+};
+
+const recordsByUserId = new Map<string, SignupRecord>();
+
 /**
  * Check if a new signup should receive free credits
  * Based on IP and device fingerprint analysis
@@ -42,12 +56,9 @@ export async function checkSignupAbuse(signupInfo: SignupInfo): Promise<AbuseChe
 
   // Check accounts from same IP
   if (ipAddress) {
-    existingAccountsFromIP = await prisma.signupRecord.count({
-      where: {
-        ipAddress,
-        freeCreditGranted: true
-      }
-    });
+    existingAccountsFromIP = Array.from(recordsByUserId.values()).filter(
+      (r) => r.ipAddress === ipAddress && r.freeCreditGranted
+    ).length;
 
     if (existingAccountsFromIP >= MAX_ACCOUNTS_PER_IP) {
       isSuspicious = true;
@@ -61,12 +72,9 @@ export async function checkSignupAbuse(signupInfo: SignupInfo): Promise<AbuseChe
 
   // Check accounts from same device fingerprint (more reliable than IP)
   if (deviceFingerprint) {
-    existingAccountsFromFingerprint = await prisma.signupRecord.count({
-      where: {
-        deviceFingerprint,
-        freeCreditGranted: true
-      }
-    });
+    existingAccountsFromFingerprint = Array.from(recordsByUserId.values()).filter(
+      (r) => r.deviceFingerprint === deviceFingerprint && r.freeCreditGranted
+    ).length;
 
     if (existingAccountsFromFingerprint >= MAX_ACCOUNTS_PER_FINGERPRINT) {
       isSuspicious = true;
@@ -110,17 +118,19 @@ export async function recordSignup(
   suspicionReason?: string
 ) {
   try {
-    const record = await prisma.signupRecord.create({
-      data: {
-        userId,
-        ipAddress: signupInfo.ipAddress,
-        deviceFingerprint: signupInfo.deviceFingerprint,
-        userAgent: signupInfo.userAgent,
-        freeCreditGranted,
-        isSuspicious,
-        suspicionReason
-      }
-    });
+    const record: SignupRecord = {
+      userId,
+      ipAddress: signupInfo.ipAddress,
+      deviceFingerprint: signupInfo.deviceFingerprint,
+      userAgent: signupInfo.userAgent,
+      freeCreditGranted,
+      isSuspicious,
+      suspicionReason,
+      reviewedAt: null,
+      createdAt: new Date(),
+    };
+
+    recordsByUserId.set(userId, record);
 
     dbLogger.info('Signup record created', {
       userId,
@@ -143,40 +153,31 @@ export async function recordSignup(
  * Get signup statistics for admin dashboard
  */
 export async function getSignupStats() {
-  const totalSignups = await prisma.signupRecord.count();
-  const suspiciousSignups = await prisma.signupRecord.count({
-    where: { isSuspicious: true }
-  });
-  const blockedFreeCredits = await prisma.signupRecord.count({
-    where: {
-      isSuspicious: true,
-      freeCreditGranted: false
-    }
-  });
+  const records = Array.from(recordsByUserId.values());
 
-  // Get top IPs with multiple signups
-  const suspiciousIPs = await prisma.signupRecord.groupBy({
-    by: ['ipAddress'],
-    where: {
-      ipAddress: { not: null }
-    },
-    _count: { ipAddress: true },
-    having: {
-      ipAddress: { _count: { gt: 1 } }
-    },
-    orderBy: {
-      _count: { ipAddress: 'desc' }
-    },
-    take: 10
-  });
+  const totalSignups = records.length;
+  const suspiciousSignups = records.filter((r) => r.isSuspicious).length;
+  const blockedFreeCredits = records.filter((r) => r.isSuspicious && !r.freeCreditGranted).length;
+
+  const ipCounts = new Map<string, number>();
+  for (const r of records) {
+    if (!r.ipAddress) continue;
+    ipCounts.set(r.ipAddress, (ipCounts.get(r.ipAddress) ?? 0) + 1);
+  }
+
+  const suspiciousIPs = Array.from(ipCounts.entries())
+    .filter(([, count]) => count > 1)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([ipAddress, count]) => ({ ipAddress, count }));
 
   return {
     totalSignups,
     suspiciousSignups,
     blockedFreeCredits,
-    suspiciousIPs: suspiciousIPs.map(ip => ({
-      ipPrefix: ip.ipAddress?.substring(0, 10) + '...',
-      count: ip._count.ipAddress
+    suspiciousIPs: suspiciousIPs.map((ip) => ({
+      ipPrefix: ip.ipAddress.substring(0, 10) + '...',
+      count: ip.count,
     }))
   };
 }
@@ -185,9 +186,7 @@ export async function getSignupStats() {
  * Check if a specific user's signup was suspicious
  */
 export async function getUserSignupRecord(userId: string) {
-  return prisma.signupRecord.findUnique({
-    where: { userId }
-  });
+  return recordsByUserId.get(userId) ?? null;
 }
 
 /**
@@ -198,11 +197,16 @@ export async function markSignupReviewed(
   isSuspicious: boolean,
   reason?: string
 ) {
-  return prisma.signupRecord.update({
-    where: { userId },
-    data: {
-      isSuspicious,
-      suspicionReason: reason
-    }
-  });
+  const existing = recordsByUserId.get(userId);
+  if (!existing) return null;
+
+  const updated: SignupRecord = {
+    ...existing,
+    isSuspicious,
+    suspicionReason: reason,
+    reviewedAt: new Date(),
+  };
+
+  recordsByUserId.set(userId, updated);
+  return updated;
 }

@@ -33,7 +33,7 @@
 ### 💳 MercadoPago Payment Integration
 - Payment preference creation for credit packages
 - Webhook handling for payment notifications
-- Automatic credit addition via Clerk Admin API
+- Automatic credit addition via the internal credits wallet/ledger
 - Support for Starter, Intermediate, and Professional packages
 
 ### 📊 AI Feedback Generation
@@ -42,10 +42,9 @@
 - Technical skills, Communication, and Problem-solving ratings
 - Transcript analysis and performance summary
 
-### 👥 User Management (Clerk)
-- Credit management via Clerk Admin API
-- User metadata storage for credits
-- Secure authentication verification
+### 👥 User Management
+- First-party cookie session authentication
+- User data stored in PostgreSQL (internal `user.id`)
 
 ---
 
@@ -58,7 +57,6 @@
 - OpenAI API key
 - Retell AI account
 - MercadoPago account
-- Clerk account
 
 ### Installation
 
@@ -116,11 +114,6 @@ RETELL_AGENT_ID=agent_your-agent-id
 MERCADOPAGO_ACCESS_TOKEN=TEST-your-access-token
 MERCADOPAGO_PUBLIC_KEY=APP_USR-your-public-key
 
-# Clerk (Required for user management)
-# Get keys at: https://dashboard.clerk.com/
-CLERK_PUBLISHABLE_KEY=pk_test_your-key
-CLERK_SECRET_KEY=sk_test_your-key
-
 # Interview Settings (Optional)
 MAX_INTERVIEW_DURATION_MINUTES=15
 ```
@@ -136,13 +129,13 @@ MAX_INTERVIEW_DURATION_MINUTES=15
 │   Frontend (React)   │◄───────►│  Backend (Node.js)   │
 │   Port: 3000         │  HTTP   │  Port: 3001          │
 └──────────────────────┘         └──────────────────────┘
-         │                               │
-         ▼                               ▼
+   │                               │
+   ▼                               ▼
 ┌──────────────────────┐         ┌──────────────────────┐
-│   Clerk              │         │  Retell AI           │
-│   (Auth & Credits)   │         │  (Voice Calls)       │
+│  Session Auth        │         │  Retell AI           │
+│  (Cookie)            │         │  (Voice Calls)       │
 └──────────────────────┘         └──────────────────────┘
-                                         │
+           │
                                          ▼
                                  ┌──────────────────────┐
                                  │  Custom LLM          │
@@ -387,7 +380,7 @@ Still silent → Graceful ending: "Thank you for your time..."
 4. User completes payment
 5. MercadoPago sends webhook → POST /webhook/mercadopago
 6. Backend verifies payment status
-7. Backend adds credits via Clerk Admin API
+7. Backend adds credits via internal credits ledger
 8. User redirected back with updated credits
 ```
 
@@ -546,8 +539,8 @@ lsof -ti:3001 | xargs kill -9
 ### Credits Not Updating
 
 1. Check backend logs for webhook calls
-2. Verify Clerk secret key is correct
-3. Ensure payment status is `approved`
+2. Ensure payment status is `approved`
+3. Verify the user session cookie is being sent
 
 ### TypeScript Errors
 
@@ -588,7 +581,6 @@ npm run build
 | Retell AI | https://docs.retellai.com/ |
 | OpenAI | https://platform.openai.com/docs |
 | MercadoPago | https://www.mercadopago.com.br/developers/pt/docs |
-| Clerk | https://clerk.com/docs |
 | Google Gemini | https://ai.google.dev/docs |
 
 ---

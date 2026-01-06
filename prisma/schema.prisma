@@ -1,5 +1,5 @@
 // ========================================
-// VOCAID B2C PRUNED SCHEMA (CLERK + AZURE)
+// VOCAID B2C PRUNED SCHEMA
 // This schema contains only the models needed for B2C Interview Practice
 // Models marked for legacy are NOT included here
 // ========================================
@@ -96,6 +96,7 @@ enum TransactionalEmailType {
   WELCOME                    // Registration confirmation email
   CREDITS_PURCHASE_RECEIPT   // Purchase confirmation with receipt
   PASSWORD_RESET             // Password reset instructions
+  EMAIL_VERIFICATION         // Email verification link
   INTERVIEW_REMINDER         // Reminder about scheduled/unfinished interview
   LOW_CREDITS_WARNING        // Warning when credits are running low
   INTERVIEW_COMPLETE         // Interview completed summary
@@ -107,16 +108,17 @@ enum EmailProvider {
 
 // ========================================
 // USER MODEL
-// For Clerk Auth - stores additional user data
 // ========================================
 model User {
   id                  String    @id @default(uuid()) @db.Uuid
-  // Clerk Auth user ID
-  clerkId             String    @unique @map("clerk_id")
   email               String    @unique
+  googleId            String?   @unique @map("google_id")
   firstName           String?   @map("first_name")
   lastName            String?   @map("last_name")
   imageUrl            String?   @map("image_url")
+  passwordHash        String?   @map("password_hash")
+  emailVerified       Boolean   @default(false) @map("email_verified")
+  emailVerifiedAt     DateTime? @map("email_verified_at")
   credits             Int       @default(0)
   isActive            Boolean   @default(true) @map("is_active")
   deletedAt           DateTime? @map("deleted_at")
@@ -143,23 +145,29 @@ model User {
   authProviders       String[]  @map("auth_providers") @db.VarChar(30)
   lastAuthProvider    String?   @map("last_auth_provider") @db.VarChar(30)
   
-  // Phone verification (Clerk + Twilio)
+  // Phone verification (Twilio)
   phoneNumber         String?   @map("phone_number") @db.VarChar(20)
   phoneVerified       Boolean   @default(false) @map("phone_verified")
   phoneVerifiedAt     DateTime? @map("phone_verified_at")
 
   // Relations
+  sessions        Session[]
+  emailVerificationTokens EmailVerificationToken[]
+  passwordResetTokens PasswordResetToken[]
   interviews      Interview[]
+  feedbackDocuments FeedbackDocument[]
   payments        Payment[]
   scoreHistory    InterviewScoreHistory[]
   usageLogs       UsageLog[]
   resumeDocuments ResumeDocument[]
+  chatSessions    ChatSession[]
+  linkedInProfiles LinkedInProfile[]
   creditsWallet   CreditsWallet?
   creditLedger    CreditLedger[]
   transactionalEmails TransactionalEmail[]
   userConsent     UserConsent?
+  performanceGoal PerformanceGoal?
 
-  @@index([clerkId])
   @@index([email])
   @@index([isActive])
   @@index([preferredLanguage])
@@ -171,6 +179,84 @@ model User {
   @@index([phoneNumber])
   @@index([phoneVerified])
   @@map("users")
+}
+
+// ========================================
+// PERFORMANCE GOAL MODEL
+// Stores user's weekly practice targets for the Performance page
+// ========================================
+model PerformanceGoal {
+  id                 String   @id @default(uuid()) @db.Uuid
+  userId             String   @unique @map("user_id") @db.Uuid
+
+  weeklyInterviewGoal Int     @default(3) @map("weekly_interview_goal")
+  weeklyMinutesGoal   Int     @default(60) @map("weekly_minutes_goal")
+
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("performance_goals")
+}
+
+// ========================================
+// FIRST-PARTY AUTH MODELS
+// ========================================
+
+model Session {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  tokenHash String   @unique @map("token_hash") @db.VarChar(64)
+
+  expiresAt  DateTime  @map("expires_at")
+  ipAddress  String?   @map("ip_address") @db.VarChar(45)
+  userAgent  String?   @map("user_agent") @db.VarChar(500)
+  lastUsedAt DateTime? @map("last_used_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("sessions")
+}
+
+model EmailVerificationToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  tokenHash String   @unique @map("token_hash") @db.VarChar(64)
+
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([usedAt])
+  @@map("email_verification_tokens")
+}
+
+model PasswordResetToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  tokenHash String   @unique @map("token_hash") @db.VarChar(64)
+
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  ipAddress String?   @map("ip_address") @db.VarChar(45)
+  userAgent String?   @map("user_agent") @db.VarChar(500)
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([usedAt])
+  @@map("password_reset_tokens")
 }
 
 // ========================================
@@ -214,7 +300,7 @@ model CreditLedger {
   balanceAfter    Int       @map("balance_after")
   
   referenceType   String?   @map("reference_type") @db.VarChar(50)
-  referenceId     String?   @map("reference_id") @db.Uuid
+  referenceId     String?   @map("reference_id") @db.VarChar(255)
   
   description     String    @db.VarChar(255)
   metadata        Json?     @db.JsonB
@@ -343,6 +429,13 @@ model UserConsent {
   ipAddress             String?       @map("ip_address") @db.VarChar(45)
   userAgent             String?       @map("user_agent") @db.Text
   source                ConsentSource @default(FORM)
+
+  // LinkedIn consent + connection metadata
+  linkedinConsentAt         DateTime? @map("linkedin_consent_at")
+  linkedinConsentVersion    String?   @map("linkedin_consent_version") @db.VarChar(20)
+  linkedinSectionsConsented String[]  @default([]) @map("linkedin_sections_consented") @db.VarChar(50)
+  linkedinConnectedAt       DateTime? @map("linkedin_connected_at")
+  linkedinMemberId          String?   @map("linkedin_member_id") @db.VarChar(100)
   
   createdAt             DateTime      @default(now()) @map("created_at")
   updatedAt             DateTime      @updatedAt @map("updated_at")
@@ -353,6 +446,9 @@ model UserConsent {
   @@index([privacyAcceptedAt])
   @@index([marketingOptIn])
   @@index([source])
+  @@index([linkedinConsentAt])
+  @@index([linkedinConnectedAt])
+  @@index([linkedinMemberId])
   @@map("user_consents")
 }
 
@@ -378,16 +474,16 @@ model Interview {
   voiceId         String?          @map("voice_id") @db.VarChar(100)
   resumeScoreAtSession Int?        @map("resume_score_at_session")
   
-  // Resume: Referenced via resumeId foreign key to ResumeDocument
-  // Resume content is stored in Azure Blob, accessed via ResumeDocument.storageKey
+  // Resume: required; file stored in Azure Blob via ResumeDocument.storageKey
   resumeId        String           @map("resume_id") @db.Uuid
-  resumeFileName  String?          @map("resume_file_name") // Cached for display purposes
+
+  // Feedback: created only after generation; PDF stored in Azure Blob
+  feedbackDocumentId String?       @unique @map("feedback_document_id") @db.Uuid
   
   status          InterviewStatus  @default(PENDING)
   score           Float?           @db.DoublePrecision
-  
-  // Feedback PDF: Azure Blob Storage key instead of base64
-  feedbackPdfStorageKey String?    @map("feedback_pdf_storage_key") @db.VarChar(500)
+
+  // Optional short summary stored directly on interview
   feedbackText    String?          @map("feedback_text") @db.Text
   
   callDuration    Int?             @map("call_duration")
@@ -410,13 +506,12 @@ model Interview {
   updatedAt       DateTime         @updatedAt @map("updated_at")
 
   user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
-  resumeDocument  ResumeDocument?  @relation("ResumeInterviews", fields: [resumeId], references: [id])
+  resumeDocument  ResumeDocument   @relation("ResumeInterviews", fields: [resumeId], references: [id])
+  feedbackDocument FeedbackDocument? @relation("InterviewFeedbackDocument", fields: [feedbackDocumentId], references: [id], onDelete: SetNull)
   metrics         InterviewMetric[]
   scoreHistory    InterviewScoreHistory[]
   transcriptSegments TranscriptSegment[]
   emailLogs       EmailLog[]
-  feedbackJsons   FeedbackJson[]
-  feedbackPdfs    FeedbackPdf[]
   session         InterviewSession?
   studyRecommendation StudyRecommendation?
 
@@ -429,6 +524,7 @@ model Interview {
   @@index([seniority])
   @@index([language])
   @@index([resumeId])
+  @@index([feedbackDocumentId])
   @@index([emailSendStatus])
   @@index([roleCountryCode])
   @@index([userId, createdAt])
@@ -437,66 +533,127 @@ model Interview {
 }
 
 // ========================================
-// FEEDBACK JSON MODEL
-// Stores versioned structured feedback from LLM
+// FEEDBACK DOCUMENT MODEL (CANONICAL)
+// Stores structured feedback JSON in DB + PDF key in Azure Blob
 // ========================================
-model FeedbackJson {
-  id              String    @id @default(uuid()) @db.Uuid
-  interviewId     String    @map("interview_id") @db.Uuid
-  
-  schemaVersion   String    @map("schema_version") @db.VarChar(20)
-  promptVersion   String    @map("prompt_version") @db.VarChar(50)
-  model           String    @db.VarChar(100)
-  
-  contentJson     Json      @map("content_json") @db.JsonB
-  overallScore    Float     @map("overall_score") @db.DoublePrecision
-  
-  generationTimeMs Int?     @map("generation_time_ms")
-  tokenCount      Int?      @map("token_count")
-  warningCount    Int?      @map("warning_count") @default(0)
-  
-  createdAt       DateTime  @default(now()) @map("created_at")
-  
-  interview       Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
-  pdfs            FeedbackPdf[]
-  
-  @@index([interviewId])
-  @@index([schemaVersion])
-  @@index([createdAt])
-  @@map("feedback_jsons")
+model FeedbackDocument {
+  id            String   @id @default(uuid()) @db.Uuid
+  interviewId   String   @unique @map("interview_id") @db.Uuid
+  userId        String   @map("user_id") @db.Uuid
+
+  // Structured feedback kept in DB
+  contentJson   Json?    @map("content_json") @db.JsonB
+  overallScore  Float?   @map("overall_score") @db.DoublePrecision
+  schemaVersion String?  @map("schema_version") @db.VarChar(20)
+  promptVersion String?  @map("prompt_version") @db.VarChar(50)
+  model         String?  @db.VarChar(100)
+
+  transcriptionText String? @map("transcription_text") @db.Text
+  feedbackText      String? @map("feedback_text") @db.Text
+
+  // Single blob key for feedback PDF
+  pdfStorageKey String? @map("pdf_storage_key") @db.VarChar(500)
+
+  generatedAt DateTime @map("generated_at")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  interview Interview? @relation("InterviewFeedbackDocument")
+
+  @@index([userId])
+  @@index([generatedAt])
+  @@index([pdfStorageKey])
+  @@map("feedback_documents")
 }
 
 // ========================================
-// FEEDBACK PDF MODEL
-// Stores generated PDF metadata and references
+// PERFORMANCE CHAT MODELS
 // ========================================
-model FeedbackPdf {
-  id              String    @id @default(uuid()) @db.Uuid
-  interviewId     String    @map("interview_id") @db.Uuid
-  feedbackJsonId  String    @map("feedback_json_id") @db.Uuid
-  
-  pageCount       Int       @map("page_count")
-  fileSizeBytes   Int       @map("file_size_bytes")
-  checksum        String    @db.VarChar(64)
-  
-  // Azure Blob Storage key
-  storageKey      String?   @map("storage_key") @db.VarChar(500)
-  
-  locale          String?   @db.VarChar(10)
-  includesStudyPlan Boolean @default(true) @map("includes_study_plan")
-  includesHighlights Boolean @default(true) @map("includes_highlights")
-  
-  createdAt       DateTime  @default(now()) @map("created_at")
-  
-  interview       Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
-  feedbackJson    FeedbackJson @relation(fields: [feedbackJsonId], references: [id], onDelete: Cascade)
-  
-  @@index([interviewId])
-  @@index([feedbackJsonId])
-  @@index([checksum])
+model ChatSession {
+  id          String   @id @default(uuid()) @db.Uuid
+  userId      String   @map("user_id") @db.Uuid
+
+  roleFilter    String? @map("role_filter") @db.VarChar(100)
+  companyFilter String? @map("company_filter") @db.VarChar(100)
+  isActive      Boolean @default(true) @map("is_active")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user     User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages ChatMessage[]
+
+  @@index([userId])
+  @@index([isActive])
+  @@index([updatedAt])
+  @@map("chat_sessions")
+}
+
+model ChatMessage {
+  id        String   @id @default(uuid()) @db.Uuid
+  sessionId String   @map("session_id") @db.Uuid
+  role      String   @db.VarChar(20)
+  content   String   @db.Text
+  metadata  Json?    @db.JsonB
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  session ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
   @@index([createdAt])
-  @@index([storageKey])
-  @@map("feedback_pdfs")
+  @@map("chat_messages")
+}
+
+// ========================================
+// LINKEDIN PROFILE MODELS
+// ========================================
+model LinkedInProfile {
+  id               String   @id @default(uuid()) @db.Uuid
+  userId           String   @unique @map("user_id") @db.Uuid
+
+  linkedinMemberId String?  @map("linkedin_member_id") @db.VarChar(100)
+  profileUrl       String?  @map("profile_url") @db.VarChar(500)
+
+  name       String? @db.VarChar(255)
+  email      String? @db.VarChar(255)
+  pictureUrl String? @map("picture_url") @db.VarChar(500)
+  headline   String? @db.Text
+
+  rawSections Json?  @map("raw_sections") @db.JsonB
+  source      String @db.VarChar(30)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  user          User                 @relation(fields: [userId], references: [id], onDelete: Cascade)
+  profileScores LinkedInProfileScore[]
+
+  @@index([linkedinMemberId])
+  @@map("linkedin_profiles")
+}
+
+model LinkedInProfileScore {
+  id        String   @id @default(uuid()) @db.Uuid
+  profileId String   @map("profile_id") @db.Uuid
+
+  roleKey   String   @map("role_key") @db.VarChar(100)
+  provider  ResumeScoreProvider
+  score     Float    @db.DoublePrecision
+  breakdown Json?    @db.JsonB
+
+  computedAt DateTime @default(now()) @map("computed_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  profile LinkedInProfile @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@unique([profileId, roleKey, provider], name: "profileId_roleKey_provider")
+  @@index([profileId])
+  @@index([roleKey])
+  @@index([computedAt])
+  @@map("linkedin_profile_scores")
 }
 
 // ========================================

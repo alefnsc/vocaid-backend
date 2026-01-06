@@ -1,25 +1,20 @@
 /**
  * User Preferences Service
  * 
- * Manages user language and region preferences in Clerk metadata.
- * Follows the "edge-first" approach by storing preferences in Clerk
- * so they're available in the JWT session without database calls.
+ * Manages user language and region preferences in the database.
+ * Preferences are stored directly on the User model for efficient access.
  * 
  * @module services/userPreferencesService
  */
 
-import { clerkClient } from '@clerk/express';
 import { prisma, dbLogger } from './databaseService';
 import { authLogger } from '../utils/logger';
 import {
   SupportedLanguageCode,
   RegionCode,
   PaymentProviderType,
-  ClerkPublicMetadata,
-  ClerkPrivateMetadata,
   UserPreferences,
   LANGUAGE_CONFIGS,
-  COUNTRY_CONFIGS,
   getRegionFromCountry,
   getDefaultLanguageForCountry,
   getPaymentProviderForRegion,
@@ -36,6 +31,7 @@ export interface UpdatePreferencesParams {
   country?: string;
   timezone?: string;
   setByUser?: boolean; // Whether user manually selected the language
+  preferredPhoneCountry?: string; // ISO2 country code for phone verification
 }
 
 export interface GeoDetectionResult {
@@ -155,40 +151,49 @@ export function detectLanguageFromHeader(acceptLanguage?: string): SupportedLang
 }
 
 // ========================================
-// CLERK METADATA OPERATIONS
+// DATABASE OPERATIONS
 // ========================================
 
 /**
- * Get user preferences from Clerk metadata
- * Combines public and private metadata into a unified preferences object
+ * Get user preferences from database
+ * @param userId - Database user ID (UUID)
  */
-export async function getUserPreferences(clerkId: string): Promise<UserPreferences | null> {
+export async function getUserPreferences(userId: string): Promise<UserPreferences | null> {
   try {
-    const clerkUser = await clerkClient.users.getUser(clerkId);
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        preferredLanguage: true,
+        registrationRegion: true,
+        registrationCountry: true,
+        countryCode: true,
+      },
+    });
+
+    if (!user) {
+      authLogger.warn('User not found for preferences lookup', { userId });
+      return null;
+    }
+
+    const language = (user.preferredLanguage || 'en-US') as SupportedLanguageCode;
+    const region = (user.registrationRegion || 'GLOBAL') as RegionCode;
+    const country = user.registrationCountry || user.countryCode || 'US';
     
-    const publicMeta = clerkUser.publicMetadata as Partial<ClerkPublicMetadata>;
-    const privateMeta = clerkUser.privateMetadata as Partial<ClerkPrivateMetadata>;
-    
-    const language = publicMeta.preferredLanguage || 'en-US';
-    const region = publicMeta.detectedRegion || 'GLOBAL';
-    const country = publicMeta.detectedCountry || 'US';
-    
-    // Determine payment provider from private metadata or region
-    const paymentProvider = 
-      privateMeta.paymentProviderPreference || 
-      getPaymentProviderForRegion(region);
-    
+    // Payment provider is derived from region (no persisted preference in schema)
+    const paymentProvider = getPaymentProviderForRegion(region);
+
     return {
-      language: language as SupportedLanguageCode,
+      language,
       languageConfig: getLanguageConfig(language),
-      region: region as RegionCode,
+      region,
       country,
       paymentProvider,
-      timezone: publicMeta.timezone,
+      timezone: undefined,
+      preferredPhoneCountry: undefined,
     };
   } catch (error: any) {
-    authLogger.error('Failed to get user preferences from Clerk', {
-      clerkId,
+    authLogger.error('Failed to get user preferences from database', {
+      userId,
       error: error.message,
     });
     return null;
@@ -196,73 +201,64 @@ export async function getUserPreferences(clerkId: string): Promise<UserPreferenc
 }
 
 /**
- * Update user preferences in Clerk metadata
- * Also syncs to local database for analytics
+ * Update user preferences in database
+ * @param userId - Database user ID (UUID)
+ * @param params - Preference updates
  */
 export async function updateUserPreferences(
-  clerkId: string,
+  userId: string,
   params: UpdatePreferencesParams
 ): Promise<UserPreferences> {
-  authLogger.info('Updating user preferences', { clerkId, params });
+  authLogger.info('Updating user preferences', { userId, params });
   
   try {
-    // Get current metadata
-    const clerkUser = await clerkClient.users.getUser(clerkId);
-    const currentPublicMeta = clerkUser.publicMetadata as Partial<ClerkPublicMetadata>;
-    const currentPrivateMeta = clerkUser.privateMetadata as Partial<ClerkPrivateMetadata>;
-    
-    // Build updated metadata
-    const updatedPublicMeta: Partial<ClerkPublicMetadata> = {
-      ...currentPublicMeta,
-    };
-    
-    const updatedPrivateMeta: Partial<ClerkPrivateMetadata> = {
-      ...currentPrivateMeta,
-      lastGeoUpdate: new Date().toISOString(),
-    };
-    
+    // Build update data
+    const updateData: Record<string, any> = {};
+
     if (params.language) {
-      updatedPublicMeta.preferredLanguage = params.language;
-      updatedPublicMeta.languageSetByUser = params.setByUser ?? true;
+      updateData.preferredLanguage = params.language;
     }
-    
+
     if (params.country) {
-      updatedPublicMeta.detectedCountry = params.country;
-      updatedPublicMeta.detectedRegion = getRegionFromCountry(params.country);
-      
-      // Update payment provider preference based on region
-      updatedPrivateMeta.paymentProviderPreference = 
-        getPaymentProviderForRegion(updatedPublicMeta.detectedRegion);
+      updateData.registrationCountry = params.country;
+      updateData.registrationRegion = getRegionFromCountry(params.country);
+      updateData.countryCode = params.country;
     }
-    
-    if (params.timezone) {
-      updatedPublicMeta.timezone = params.timezone;
-    }
-    
-    // Update Clerk metadata
-    await clerkClient.users.updateUserMetadata(clerkId, {
-      publicMetadata: updatedPublicMeta,
-      privateMetadata: updatedPrivateMeta,
+
+    // Update database
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: updateData,
+      select: {
+        preferredLanguage: true,
+        registrationRegion: true,
+        registrationCountry: true,
+        countryCode: true,
+      },
     });
-    
-    authLogger.info('User preferences updated in Clerk', {
-      clerkId,
-      language: updatedPublicMeta.preferredLanguage,
-      region: updatedPublicMeta.detectedRegion,
+
+    authLogger.info('User preferences updated in database', {
+      userId,
+      language: updatedUser.preferredLanguage,
+      region: updatedUser.registrationRegion,
     });
-    
-    // Return updated preferences
+
+    const language = (updatedUser.preferredLanguage || 'en-US') as SupportedLanguageCode;
+    const region = (updatedUser.registrationRegion || 'GLOBAL') as RegionCode;
+    const paymentProvider = getPaymentProviderForRegion(region);
+
     return {
-      language: updatedPublicMeta.preferredLanguage || 'en-US',
-      languageConfig: getLanguageConfig(updatedPublicMeta.preferredLanguage || 'en-US'),
-      region: updatedPublicMeta.detectedRegion || 'GLOBAL',
-      country: updatedPublicMeta.detectedCountry || 'US',
-      paymentProvider: updatedPrivateMeta.paymentProviderPreference || 'paypal',
-      timezone: updatedPublicMeta.timezone,
+      language,
+      languageConfig: getLanguageConfig(language),
+      region,
+      country: updatedUser.registrationCountry || updatedUser.countryCode || 'US',
+      paymentProvider,
+      timezone: undefined,
+      preferredPhoneCountry: undefined,
     };
   } catch (error: any) {
     authLogger.error('Failed to update user preferences', {
-      clerkId,
+      userId,
       error: error.message,
     });
     throw new Error(`Failed to update preferences: ${error.message}`);
@@ -272,45 +268,49 @@ export async function updateUserPreferences(
 /**
  * Initialize user preferences on first login
  * Auto-detects language and region from request context
+ * @param userId - Database user ID (UUID)
  */
 export async function initializeUserPreferences(
-  clerkId: string,
+  userId: string,
   ip: string,
   headers?: Record<string, string>
 ): Promise<UserPreferences> {
-  authLogger.info('Initializing user preferences', { clerkId });
+  authLogger.info('Initializing user preferences', { userId });
   
   try {
     // Check if preferences already exist
-    const clerkUser = await clerkClient.users.getUser(clerkId);
-    const publicMeta = clerkUser.publicMetadata as Partial<ClerkPublicMetadata>;
-    
-    // If user has manually set language, don't override
-    if (publicMeta.languageSetByUser && publicMeta.preferredLanguage) {
-      authLogger.info('User has existing manual preferences, skipping auto-detection', { clerkId });
-      return await getUserPreferences(clerkId) as UserPreferences;
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        preferredLanguage: true,
+      },
+    });
+
+    // If already set, don't override
+    if (user?.preferredLanguage) {
+      authLogger.info('User already has preferredLanguage, skipping auto-detection', { userId });
+      return (await getUserPreferences(userId)) as UserPreferences;
     }
-    
+
     // Auto-detect from request context
     const geoResult = await detectUserGeoFromIP(ip, headers);
-    
+
     // Check Accept-Language header for language preference
     const headerLanguage = headers ? detectLanguageFromHeader(headers['accept-language']) : null;
     const preferredLanguage = headerLanguage || geoResult.language;
-    
+
     // Update preferences with auto-detected values
-    return await updateUserPreferences(clerkId, {
+    return await updateUserPreferences(userId, {
       language: preferredLanguage,
       country: geoResult.country,
-      timezone: geoResult.timezone,
       setByUser: false, // Auto-detected, not manually set
     });
   } catch (error: any) {
     authLogger.error('Failed to initialize user preferences', {
-      clerkId,
+      userId,
       error: error.message,
     });
-    
+
     // Return defaults on error
     return {
       language: 'en-US',
@@ -325,11 +325,12 @@ export async function initializeUserPreferences(
 /**
  * Get user's preferred payment provider
  * With fallback logic if primary provider is unavailable
+ * @param userId - Database user ID (UUID)
  */
 export async function getPreferredPaymentProvider(
-  clerkId: string
+  userId: string
 ): Promise<{ provider: PaymentProviderType; isFallback: boolean }> {
-  const preferences = await getUserPreferences(clerkId);
+  const preferences = await getUserPreferences(userId);
   
   if (!preferences) {
     return { provider: 'paypal', isFallback: true };
@@ -347,21 +348,10 @@ export async function getPreferredPaymentProvider(
   const fallbackProvider: PaymentProviderType = primaryProvider === 'mercadopago' ? 'paypal' : 'mercadopago';
   
   authLogger.warn('Primary payment provider unavailable, using fallback', {
-    clerkId,
+    userId,
     primary: primaryProvider,
     fallback: fallbackProvider,
   });
-  
-  // Record that we used fallback
-  try {
-    await clerkClient.users.updateUserMetadata(clerkId, {
-      privateMetadata: {
-        paymentProviderFallbackUsed: true,
-      },
-    });
-  } catch (error) {
-    // Non-critical, continue with fallback
-  }
   
   return { provider: fallbackProvider, isFallback: true };
 }
@@ -394,20 +384,21 @@ async function checkPaymentProviderAvailability(
 
 /**
  * Update preferences for multiple users (admin operation)
+ * @param updates - Array of {userId, country} pairs
  */
 export async function bulkUpdateRegionPreferences(
-  updates: Array<{ clerkId: string; country: string }>
+  updates: Array<{ userId: string; country: string }>
 ): Promise<{ success: number; failed: number }> {
   let success = 0;
   let failed = 0;
   
-  for (const { clerkId, country } of updates) {
+  for (const { userId, country } of updates) {
     try {
-      await updateUserPreferences(clerkId, { country, setByUser: false });
+      await updateUserPreferences(userId, { country, setByUser: false });
       success++;
     } catch (error) {
       failed++;
-      authLogger.error('Failed to update user preferences in bulk', { clerkId, error });
+      authLogger.error('Failed to update user preferences in bulk', { userId, error });
     }
   }
   

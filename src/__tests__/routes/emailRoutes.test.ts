@@ -77,7 +77,7 @@ describe.skip('Email Routes', () => {
   describe('POST /api/email/feedback', () => {
     it('should require authentication', async () => {
       // This test checks that unauthenticated requests fail
-      // The actual Clerk middleware is mocked, so we test the flow
+      // Auth middleware is mocked, so we test the flow
       const response = await request(app)
         .post('/api/email/feedback')
         .send({

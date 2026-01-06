@@ -247,12 +247,12 @@ function getAvailableProvider(): LLMProvider {
  * Build performance context for a user
  */
 export async function buildPerformanceContext(
-  clerkId: string,
+  userId: string,
   filters: ChatContext = {}
 ): Promise<PerformanceContext> {
   // Get user's UUID
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
 
@@ -297,9 +297,9 @@ export async function buildPerformanceContext(
 
   // Get aggregated metrics
   const [scoresByRole, scoresByCompany, availableFilters] = await Promise.all([
-    getScoresByRole(clerkId, { limit: 10 }),
-    getScoresByCompany(clerkId, { limit: 10 }),
-    getAvailableFilters(clerkId)
+    getScoresByRole(userId, { limit: 10 }),
+    getScoresByCompany(userId, { limit: 10 }),
+    getAvailableFilters(userId)
   ]);
 
   // Calculate overall stats
@@ -403,11 +403,11 @@ function formatContextForLLM(context: PerformanceContext): string {
  * Create a new chat session
  */
 export async function createChatSession(
-  clerkId: string,
+  userId: string,
   filters: ChatContext = {}
 ): Promise<string> {
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
 
@@ -672,14 +672,14 @@ A: Ask "Compare my last two interviews" or "Show my progress over time" to see h
  * Get chat completion with automatic fallback and FAQ context
  */
 export async function getChatCompletion(
-  clerkId: string,
+  userId: string,
   message: string,
   sessionId?: string,
   filters: ChatContext = {},
   faqContext?: string
 ): Promise<{ message: string; sessionId: string; category: 'performance' | 'support' }> {
   // Build context
-  const context = await buildPerformanceContext(clerkId, filters);
+  const context = await buildPerformanceContext(userId, filters);
   const contextText = formatContextForLLM(context);
   
   // Inject FAQ context into system prompt
@@ -707,7 +707,7 @@ export async function getChatCompletion(
   }
 
   // Create session if not exists
-  const activeSessionId = sessionId || await createChatSession(clerkId, filters);
+  const activeSessionId = sessionId || await createChatSession(userId, filters);
 
   // Save user message
   await saveChatMessage(activeSessionId, 'user', message, { category });
@@ -795,14 +795,14 @@ export async function getChatCompletion(
  * Note: Uses Gemini streaming with OpenAI fallback
  */
 export async function streamChatCompletion(
-  clerkId: string,
+  userId: string,
   message: string,
   onChunk: (chunk: string) => void,
   sessionId?: string,
   filters: ChatContext = {}
 ): Promise<string> {
   // Build context
-  const context = await buildPerformanceContext(clerkId, filters);
+  const context = await buildPerformanceContext(userId, filters);
   const contextText = formatContextForLLM(context);
   const systemPrompt = `${PERFORMANCE_ANALYST_PROMPT}\n\n${contextText}`;
 
@@ -819,7 +819,7 @@ export async function streamChatCompletion(
   }
 
   // Create session if not exists
-  const activeSessionId = sessionId || await createChatSession(clerkId, filters);
+  const activeSessionId = sessionId || await createChatSession(userId, filters);
 
   // Save user message
   await saveChatMessage(activeSessionId, 'user', message);
@@ -975,8 +975,8 @@ async function streamOpenAICompletion(
 /**
  * Generate quick performance insights without chat context
  */
-export async function generateQuickInsights(clerkId: string): Promise<string> {
-  const context = await buildPerformanceContext(clerkId);
+export async function generateQuickInsights(userId: string): Promise<string> {
+  const context = await buildPerformanceContext(userId);
   
   if (context.aggregatedMetrics.totalInterviews === 0) {
     return "You haven't completed any interviews yet. Start a practice interview to get personalized insights!";
@@ -1034,9 +1034,9 @@ Format your response as bullet points, each starting with an emoji that represen
 /**
  * Get user's chat sessions
  */
-export async function getUserChatSessions(clerkId: string, limit = 10) {
+export async function getUserChatSessions(userId: string, limit = 10) {
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
 

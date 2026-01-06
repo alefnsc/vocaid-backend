@@ -32,8 +32,6 @@ Complete documentation for switching Vocaid from development to production envir
 | GET | `/payment/status/:preferenceId` | ❌ | Sensitive | Check payment status |
 | POST | `/payment/verify/:paymentId` | ❌ | General | Manual payment verification |
 | GET | `/payment/history/:userId` | ✅ verifyUserAuth | Sensitive | Get user payment history |
-| POST | `/webhook/clerk` | ❌ | Webhook | Clerk user event webhook |
-| GET | `/webhook/clerk` | ❌ | General | Clerk webhook endpoint info |
 | POST | `/api/users/sync` | ✅ verifyUserAuth | General | Sync user on login |
 | GET | `/api/users/me` | ✅ verifyUserAuth | General | Get current user data |
 | POST | `/api/users/validate` | ✅ verifyUserAuth | General | Validate user session |
@@ -117,8 +115,6 @@ Complete documentation for switching Vocaid from development to production envir
 | `MERCADOPAGO_PUBLIC_KEY` | ✅ | **PROD KEY** | **Production public key** |
 | `MERCADOPAGO_TEST_ACCESS_TOKEN` | ⚡ Dev only | Remove | Test access token |
 | `MERCADOPAGO_TEST_PUBLIC_KEY` | ⚡ Dev only | Remove | Test public key |
-| `CLERK_SECRET_KEY` | ✅ | **PROD KEY** | Clerk secret key |
-| `CLERK_WEBHOOK_SECRET` | ✅ | **PROD KEY** | Clerk webhook signing secret |
 | `FRONTEND_URL` | ✅ | **PROD URL** | Frontend URL for CORS/redirects |
 | `WEBHOOK_BASE_URL` | ✅ | **PROD URL** | Backend URL for webhooks |
 | `LOG_LEVEL` | ⚡ Optional | `warn` | Reduce logging in production |
@@ -128,7 +124,6 @@ Complete documentation for switching Vocaid from development to production envir
 | Variable | Required | Prod Switch | Description |
 |----------|----------|-------------|-------------|
 | `REACT_APP_ENV` | ✅ | `production` | **CRITICAL: Switch to 'production'** |
-| `REACT_APP_CLERK_PUBLISHABLE_KEY` | ✅ | **PROD KEY** | Clerk publishable key |
 | `REACT_APP_RECAPTCHA_SITE_KEY` | ⚡ Optional | Same | reCAPTCHA site key |
 | `REACT_APP_MERCADOPAGO_PUBLIC_KEY` | ✅ | **PROD KEY** | Production MP public key |
 | `REACT_APP_MERCADOPAGO_TEST_PUBLIC_KEY` | ⚡ Dev only | Remove | Test MP public key |
@@ -218,7 +213,7 @@ function getMercadoPagoPublicKey(): string {
 **File:** `src/services/APIService.ts` (line 179)
 **Issue:** `getUserInfo()` method calls `/get-user-info/:userId` which doesn't exist in backend
 **Impact:** Method will always fail if called
-**Recommendation:** Remove or mark as deprecated, use Clerk user data instead
+**Recommendation:** Remove or mark as deprecated, use the authenticated session user instead
 
 #### 2. Missing Authentication on Sensitive Endpoints
 **Endpoints:**
@@ -290,12 +285,6 @@ headers: {
   # MERCADOPAGO_TEST_PUBLIC_KEY=...
   ```
 
-- [ ] **Update Clerk Keys**
-  ```bash
-  CLERK_SECRET_KEY=<production_secret_key>
-  CLERK_WEBHOOK_SECRET=<production_webhook_secret>
-  ```
-
 - [ ] **Update URLs**
   ```bash
   FRONTEND_URL=https://your-production-domain.com
@@ -319,11 +308,6 @@ headers: {
   REACT_APP_ENV=production
   ```
 
-- [ ] **Update Clerk Key**
-  ```bash
-  REACT_APP_CLERK_PUBLISHABLE_KEY=pk_live_xxxxx
-  ```
-
 - [ ] **Update MercadoPago Key**
   ```bash
   REACT_APP_MERCADOPAGO_PUBLIC_KEY=<production_public_key>
@@ -343,7 +327,6 @@ headers: {
 1. **Go to Vercel Dashboard > Project Settings > Environment Variables**
 2. **Add Production Variables:**
    - `REACT_APP_ENV` = `production`
-   - `REACT_APP_CLERK_PUBLISHABLE_KEY` = `<production key>`
    - `REACT_APP_MERCADOPAGO_PUBLIC_KEY` = `<production key>`
    - `REACT_APP_BACKEND_URL` = `<production backend URL>`
    - `REACT_APP_RECAPTCHA_SITE_KEY` = `<site key>`
@@ -355,11 +338,6 @@ headers: {
    ```
 
 ### Phase 4: External Services
-
-- [ ] **Clerk Dashboard**
-  1. Create Production Instance
-  2. Configure production webhooks pointing to `WEBHOOK_BASE_URL/webhook/clerk`
-  3. Enable required webhook events: `user.created`, `user.updated`, `user.deleted`
 
 - [ ] **MercadoPago Dashboard**
   1. Switch to Production Mode

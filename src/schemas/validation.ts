@@ -12,10 +12,8 @@ import { z } from 'zod';
 // UUID validation
 export const uuidSchema = z.string().uuid();
 
-// Clerk User ID validation (format: user_xxxxx)
-export const clerkUserIdSchema = z.string().regex(/^user_[a-zA-Z0-9]+$/, {
-  message: 'Invalid Clerk user ID format'
-});
+// User ID validation (now always UUID from session auth)
+export const userIdSchema = uuidSchema;
 
 // Email validation
 export const emailSchema = z.string().email();
@@ -25,7 +23,6 @@ export const emailSchema = z.string().email();
 // ========================================
 
 export const createUserSchema = z.object({
-  clerkId: clerkUserIdSchema,
   email: emailSchema,
   firstName: z.string().min(1).max(100).optional(),
   lastName: z.string().min(1).max(100).optional(),
@@ -42,7 +39,7 @@ export const updateUserSchema = z.object({
 });
 
 export const userParamsSchema = z.object({
-  userId: uuidSchema.or(clerkUserIdSchema)
+  userId: uuidSchema
 });
 
 // ========================================
@@ -67,7 +64,7 @@ export const senioritySchema = z.enum([
 ]);
 
 export const createInterviewSchema = z.object({
-  userId: uuidSchema.or(clerkUserIdSchema),
+  userId: uuidSchema,
   jobTitle: z.string().min(1).max(200).transform(val => val.trim()),
   seniority: senioritySchema.optional().default('mid'),
   companyName: z.string().min(1).max(200).transform(val => val.trim()),
@@ -75,6 +72,8 @@ export const createInterviewSchema = z.object({
   // The AI interviewer can still conduct meaningful interviews with less context
   jobDescription: z.string().min(50).max(50000).transform(val => val.trim()),
   language: z.string().max(10).optional().default('en-US'),
+  // Job location country code (e.g., 'US', 'BR')
+  country: z.string().max(2).optional(),
   // Resume is required for all interviews - stored in Azure Blob, referenced by ID
   resumeId: uuidSchema,
   // Optional: filename for display purposes (fetched from ResumeDocument if not provided)
@@ -147,7 +146,7 @@ export const paymentStatusSchema = z.enum([
 export const packageIdSchema = z.enum(['starter', 'intermediate', 'professional']);
 
 export const createPaymentSchema = z.object({
-  userId: uuidSchema.or(clerkUserIdSchema),
+  userId: uuidSchema,
   packageId: packageIdSchema,
   preferenceId: z.string().optional(),
   amountUSD: z.number().positive(),
@@ -188,12 +187,6 @@ export const mercadoPagoWebhookSchema = z.object({
   live_mode: z.boolean().optional(),
   type: z.string(),
   user_id: z.union([z.string(), z.number()]).optional()
-});
-
-export const clerkWebhookSchema = z.object({
-  type: z.string(),
-  data: z.record(z.unknown()),
-  object: z.string().optional()
 });
 
 // ========================================

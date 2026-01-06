@@ -98,12 +98,11 @@ npm run dev
 ### Models
 
 #### User
-Stores user information synced from Clerk.
+Stores user information (internal `user.id` is the canonical identifier).
 
 | Field | Type | Description |
 |-------|------|-------------|
 | id | UUID | Internal unique identifier |
-| clerkId | String | Clerk user ID |
 | email | String | User email |
 | firstName | String | First name |
 | lastName | String | Last name |
@@ -242,9 +241,6 @@ NODE_ENV=development
 # Server
 PORT=3001
 FRONTEND_URL=http://localhost:3000
-
-# Clerk
-CLERK_SECRET_KEY=sk_test_xxxxx
 
 # MercadoPago
 MERCADOPAGO_ACCESS_TOKEN=TEST-xxxxx

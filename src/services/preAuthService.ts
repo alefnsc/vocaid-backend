@@ -402,165 +402,47 @@ export async function saveVerifiedCard(
   expiryYear: string,
   setAsDefault: boolean = true
 ): Promise<SavedCard | null> {
-  if (!preAuthResult.success || !preAuthResult.token) {
-    return null;
-  }
-  
-  try {
-    const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
-      select: { id: true }
-    });
-    
-    if (!user) {
-      preAuthLogger.error('User not found for card save', { userId });
-      return null;
-    }
-    
-    // If setting as default, unset current default first
-    if (setAsDefault) {
-      await prisma.savedCard?.updateMany({
-        where: { userId: user.id, isDefault: true },
-        data: { isDefault: false }
-      });
-    }
-    
-    // Create saved card record
-    const savedCard = await prisma.savedCard?.create({
-      data: {
-        userId: user.id,
-        token: preAuthResult.token,
-        lastFour: preAuthResult.lastFour || '',
-        brand: preAuthResult.brand || 'unknown',
-        expiryMonth,
-        expiryYear,
-        holderName,
-        isDefault: setAsDefault,
-        isVerified: true
-      }
-    });
-    
-    preAuthLogger.info('Card saved successfully', { 
-      userId,
-      lastFour: preAuthResult.lastFour,
-      isDefault: setAsDefault
-    });
-    
-    return savedCard as unknown as SavedCard;
-  } catch (error: any) {
-    preAuthLogger.error('Failed to save card', { error: error.message });
-    return null;
-  }
+  preAuthLogger.warn('saveVerifiedCard is disabled (no SavedCard model in schema)', {
+    userId,
+    hasToken: !!preAuthResult.token,
+    holderName,
+    expiryMonth,
+    expiryYear,
+    setAsDefault,
+  });
+  return null;
 }
 
 /**
  * Get user's saved cards
  */
 export async function getUserCards(userId: string): Promise<SavedCard[]> {
-  try {
-    const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
-      select: { id: true }
-    });
-    
-    if (!user) return [];
-    
-    const cards = await prisma.savedCard?.findMany({
-      where: { userId: user.id },
-      orderBy: { createdAt: 'desc' }
-    });
-    
-    return (cards || []) as unknown as SavedCard[];
-  } catch (error: any) {
-    preAuthLogger.error('Failed to get user cards', { error: error.message });
-    return [];
-  }
+  preAuthLogger.warn('getUserCards is disabled (no SavedCard model in schema)', { userId });
+  return [];
 }
 
 /**
  * Delete a saved card
  */
 export async function deleteCard(userId: string, cardId: string): Promise<boolean> {
-  try {
-    const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
-      select: { id: true }
-    });
-    
-    if (!user) return false;
-    
-    await prisma.savedCard?.delete({
-      where: { 
-        id: cardId,
-        userId: user.id
-      }
-    });
-    
-    preAuthLogger.info('Card deleted', { userId, cardId });
-    return true;
-  } catch (error: any) {
-    preAuthLogger.error('Failed to delete card', { error: error.message });
-    return false;
-  }
+  preAuthLogger.warn('deleteCard is disabled (no SavedCard model in schema)', { userId, cardId });
+  return false;
 }
 
 /**
  * Mark user as having verified payment method
  */
 export async function markPaymentVerified(userId: string): Promise<boolean> {
-  try {
-    const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
-      select: { id: true }
-    });
-    
-    if (!user) return false;
-    
-    // Update signup record
-    await prisma.signupRecord.upsert({
-      where: { userId: user.id },
-      update: {
-        creditTier: 'full',
-        behaviorScore: { increment: 20 }  // Boost trust score
-      },
-      create: {
-        userId: user.id,
-        creditTier: 'full'
-      }
-    });
-    
-    preAuthLogger.info('Payment method verified for user', { userId });
-    return true;
-  } catch (error: any) {
-    preAuthLogger.error('Failed to mark payment verified', { error: error.message });
-    return false;
-  }
+  preAuthLogger.warn('markPaymentVerified is disabled (no signupRecord model in schema)', { userId });
+  return false;
 }
 
 /**
  * Check if user has verified payment method
  */
 export async function hasVerifiedPayment(userId: string): Promise<boolean> {
-  try {
-    const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
-      select: { id: true }
-    });
-    
-    if (!user) return false;
-    
-    const verifiedCard = await prisma.savedCard?.findFirst({
-      where: { 
-        userId: user.id,
-        isVerified: true
-      }
-    });
-    
-    return verifiedCard !== null;
-  } catch (error: any) {
-    preAuthLogger.error('Failed to check payment verification', { error: error.message });
-    return false;
-  }
+  preAuthLogger.warn('hasVerifiedPayment is disabled (no SavedCard model in schema)', { userId });
+  return false;
 }
 
 // ========================================

@@ -9,15 +9,60 @@ This document describes all environment variables required for the Vocaid Backen
 | `PORT` | No | `3001` | Server port |
 | `NODE_ENV` | No | `development` | Environment mode (`development`, `production`, `test`) |
 | `DATABASE_URL` | Yes | - | PostgreSQL connection string |
-| `WEBHOOK_BASE_URL` | Yes | - | Base URL for webhooks (e.g., `https://api.Vocaid.com`) |
+| `WEBHOOK_BASE_URL` | Yes | - | Base URL for webhooks (e.g., `https://api.vocaid.io`) |
+| `FRONTEND_URL` | No | `http://localhost:3000` / `https://vocaid.io` | Frontend URL for redirects and email links |
 
-## Clerk Authentication
+## First-Party Authentication
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `CLERK_PUBLISHABLE_KEY` | Yes | Clerk publishable API key |
-| `CLERK_SECRET_KEY` | Yes | Clerk secret API key |
-| `CLERK_WEBHOOK_SECRET` | Yes | Webhook signing secret for Clerk events |
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `SESSION_SECRET` | Yes | - | Secret key for signing session cookies (min 32 chars) |
+| `SESSION_COOKIE_NAME` | No | `vocaid_session` | Name of the session cookie |
+| `SESSION_TTL_DAYS` | No | `30` | Session time-to-live in days |
+
+## Google OAuth
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `GOOGLE_CLIENT_ID` | Yes* | - | Google OAuth 2.0 Client ID |
+| `GOOGLE_CLIENT_SECRET` | Yes* | - | Google OAuth 2.0 Client Secret |
+| `GOOGLE_REDIRECT_URI` | No | Auto | OAuth callback URL (defaults to `{BACKEND_URL}/api/auth/google/callback`) |
+
+> *Required if Google SSO login is enabled
+
+### Google OAuth Setup
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com/)
+2. Create a new project or select an existing one
+3. Navigate to **APIs & Services > Credentials**
+4. Click **Create Credentials > OAuth 2.0 Client ID**
+5. Select **Web application** as the application type
+6. Add authorized redirect URIs:
+   - Development: `http://localhost:3001/api/auth/google/callback`
+   - Production: `https://api.vocaid.io/api/auth/google/callback`
+7. Copy the Client ID and Client Secret to your `.env` file
+
+## LinkedIn OAuth
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `LINKEDIN_CLIENT_ID` | Yes* | - | LinkedIn OAuth 2.0 Client ID |
+| `LINKEDIN_CLIENT_SECRET` | Yes* | - | LinkedIn OAuth 2.0 Client Secret |
+| `LINKEDIN_REDIRECT_URI` | No | Auto | OAuth callback URL (defaults to `{BACKEND_URL}/api/auth/linkedin/callback`) |
+
+> *Required if LinkedIn SSO login is enabled
+
+### LinkedIn OAuth Setup
+
+1. Go to [LinkedIn Developers](https://www.linkedin.com/developers/)
+2. Create a new app or select an existing one
+3. Navigate to **Auth** tab
+4. Under **OAuth 2.0 settings**, add authorized redirect URLs:
+   - Development: `http://localhost:3001/api/auth/linkedin/callback`
+   - Production: `https://api.vocaid.io/api/auth/linkedin/callback`
+5. Request the following products under **Products** tab:
+   - **Sign In with LinkedIn using OpenID Connect**
+6. Copy the Client ID and Client Secret to your `.env` file
 
 ## Retell AI (Voice Interview)
 
@@ -67,15 +112,34 @@ This document describes all environment variables required for the Vocaid Backen
 
 > *Required if using Mercado Pago as payment provider
 
-## Phone Verification (Twilio)
+## Phone Verification (Twilio Verify)
+
+Uses Twilio Verify API with API Key authentication (recommended approach).
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `TWILIO_ACCOUNT_SID` | No* | Twilio account SID |
-| `TWILIO_AUTH_TOKEN` | No* | Twilio authentication token |
-| `TWILIO_PHONE_NUMBER` | No* | Twilio phone number for sending SMS (e.g., `+15551234567`) |
+| `TWILIO_ACCOUNT_SID` | Yes* | Twilio account SID (starts with `AC`) |
+| `TWILIO_API_SID` | Yes* | Twilio API Key SID (starts with `SK`) |
+| `TWILIO_API_SECRET` | Yes* | Twilio API Key Secret |
+| `TWILIO_VERIFY_SERVICE_SID` | Yes* | Twilio Verify Service SID (starts with `VA`) |
+| `PHONE_VERIFICATION_CREDITS` | No | Credits granted on phone verification (default: `15`) |
 
 > *Required if phone verification feature is enabled
+
+### Setup Instructions
+
+1. Go to [Twilio Console](https://console.twilio.com/)
+2. Create a Verify Service under **Verify > Services**
+3. Create an API Key under **Account > API keys & tokens > Create API Key**
+4. Use the Standard Key type for server-side authentication
+
+### Deprecated Variables (Auth Token method)
+
+| Variable | Status | Description |
+|----------|--------|-------------|
+| `TWILIO_AUTH_TOKEN` | Deprecated | Twilio authentication token (use API Key instead) |
+| `TWILIO_PHONE_NUMBER` | Deprecated | Not needed for Verify API |
+| `TWILIO_MESSAGING_SERVICE_SID` | Deprecated | Not needed for Verify API |
 
 ## Security & Fraud Prevention
 
@@ -126,11 +190,6 @@ PORT=3001
 NODE_ENV=development
 DATABASE_URL=postgresql://user:password@localhost:5432/Vocaid
 WEBHOOK_BASE_URL=https://api.Vocaid.com
-
-# Clerk
-CLERK_PUBLISHABLE_KEY=pk_test_...
-CLERK_SECRET_KEY=sk_test_...
-CLERK_WEBHOOK_SECRET=whsec_...
 
 # Retell
 RETELL_API_KEY=key_...

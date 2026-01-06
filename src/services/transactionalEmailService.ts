@@ -1,106 +1,175 @@
 /**
  * Transactional Email Service
- * 
- * Handles sending transactional emails (welcome, purchase receipts) with:
- * - Idempotency to prevent duplicate sends
- * - Multi-language support (EN default, PT-BR)
- * - Audit logging via TransactionalEmail model
- * - Resend SDK integration
- * 
- * Design: Vocaid brand - white background, black text, zinc borders, purple-600 accents
- * 
- * @module services/transactionalEmailService
+ *
+ * Sends product emails via Resend and records audit logs in `TransactionalEmail`.
+ * This service supports Resend dashboard templates by alias (e.g. `transactional`).
  */
 
-import { PrismaClient, EmailSendStatus, TransactionalEmailType, EmailProvider, User } from '@prisma/client';
 import logger from '../utils/logger';
-import { canSendTransactional, canSendMarketing } from './consentService';
+import { prisma } from './databaseService';
+import { EMAIL_SENDERS, getCommonVariables, loadAndRenderTemplate, type TemplateLanguage } from '../templates/emails';
+import { getConsentStatus } from './consentService';
+import { downloadFeedbackPdf } from './azureBlobService';
 
-// Create email logger
+// Logger
 const emailLogger = logger.child({ component: 'transactional-email' });
 
-// Prisma client
-const prisma = new PrismaClient();
+// Environment
+const FRONTEND_URL = process.env.FRONTEND_URL || 'https://vocaid.ai';
 
-// ========================================
-// EMAIL PROVIDER MODE
-// ========================================
-// EMAIL_PROVIDER_MODE=mock  -> Log emails but don't send (still creates DB records)
-// EMAIL_PROVIDER_MODE=resend -> Actually send via Resend SDK (default when API key present)
-// If not set, defaults to 'resend' if RESEND_API_KEY exists, otherwise 'mock'
+// Resend dashboard template aliases
+const RESEND_WELCOME_TEMPLATE_ID = 'welcome_b2c';
 
-type EmailProviderMode = 'mock' | 'resend';
+// Common variables (string values)
+const COMMON_VARS = getCommonVariables();
+const PRIVACY_URL = String(COMMON_VARS.PRIVACY_URL);
+const TERMS_URL = String(COMMON_VARS.TERMS_URL);
+const SUPPORT_EMAIL = String(COMMON_VARS.SUPPORT_EMAIL);
+
+type EmailProviderMode = 'live' | 'mock' | 'disabled';
 
 function getEmailProviderMode(): EmailProviderMode {
-  const envMode = process.env.EMAIL_PROVIDER_MODE?.toLowerCase();
-  
-  // Explicit mode takes precedence
-  if (envMode === 'mock') {
-    return 'mock';
-  }
-  if (envMode === 'resend') {
-    return 'resend';
-  }
-  
-  // Default: use resend if API key exists, otherwise mock
-  return process.env.RESEND_API_KEY ? 'resend' : 'mock';
+  const raw = (process.env.EMAIL_PROVIDER_MODE || 'live').toLowerCase();
+  if (raw === 'mock') return 'mock';
+  if (raw === 'disabled') return 'disabled';
+  return 'live';
 }
 
-// Log the current mode on startup
-const currentMode = getEmailProviderMode();
-emailLogger.info('Email provider mode', { 
-  mode: currentMode, 
-  explicit: !!process.env.EMAIL_PROVIDER_MODE,
-  hasApiKey: !!process.env.RESEND_API_KEY
-});
-
-// Lazy-load Resend to avoid initialization errors when API key is missing
-let resend: any = null;
-let resendInitialized = false;
-
-function getResendClient(): any {
-  // Return null immediately in mock mode
-  if (getEmailProviderMode() === 'mock') {
-    if (!resendInitialized) {
-      emailLogger.info('Email provider in MOCK mode - emails will be logged but not sent');
-      resendInitialized = true;
-    }
-    return null;
-  }
-  
-  if (resendInitialized) return resend;
-  
-  resendInitialized = true;
-  const apiKey = process.env.RESEND_API_KEY;
-  
-  if (apiKey) {
-    try {
-      const { Resend } = require('resend');
-      resend = new Resend(apiKey);
-      emailLogger.info('Resend transactional email service initialized');
-    } catch (error: any) {
-      emailLogger.error('Failed to initialize Resend for transactional emails', { error: error.message });
-      resend = null;
-    }
-  } else {
-    emailLogger.warn('RESEND_API_KEY not set - transactional emails will be logged but not sent');
-  }
-  
-  return resend;
-}
-
-/**
- * Check if emails are being sent in mock mode
- * Useful for testing and logging
- */
 export function isEmailMockMode(): boolean {
   return getEmailProviderMode() === 'mock';
 }
 
-// Configuration
-const EMAIL_FROM = process.env.EMAIL_FROM || 'Vocaid <alex@vocaid.ai>';
-const FRONTEND_URL = process.env.FRONTEND_URL || 'https://vocaid.ai';
-const SUPPORT_EMAIL = 'support@vocaid.ai';
+// Lazy Resend init
+let resend: any = null;
+let resendInitialized = false;
+
+function getResendClient(): any {
+  if (resendInitialized) return resend;
+  resendInitialized = true;
+
+  const apiKey = process.env.RESEND_API_KEY;
+  if (!apiKey) {
+    emailLogger.warn('RESEND_API_KEY not set');
+    resend = null;
+    return resend;
+  }
+
+  try {
+    const { Resend } = require('resend');
+    resend = new Resend(apiKey);
+    return resend;
+  } catch (error: any) {
+    emailLogger.error('Failed to initialize Resend', { error: error.message });
+    resend = null;
+    return resend;
+  }
+}
+
+async function canSendTransactional(userId: string): Promise<boolean> {
+  try {
+    const status = await getConsentStatus(userId);
+    return status.transactionalOptIn;
+  } catch (error: any) {
+    emailLogger.warn('Consent check failed; defaulting to allow send', { userId, error: error.message });
+    return true;
+  }
+}
+
+type ResendAttachment = {
+  filename: string;
+  content: string | Buffer;
+  contentType?: string;
+};
+
+function compactAndJoinWithDash(parts: Array<string | null | undefined>): string {
+  return parts
+    .map(p => (typeof p === 'string' ? p.trim() : ''))
+    .filter(Boolean)
+    .join('-');
+}
+
+function sanitizeFilename(value: string): string {
+  // Remove characters that are problematic across common file systems.
+  return value
+    .replace(/[\\/\n\r\t:*?"<>|]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function buildFeedbackPdfFilenameFromInterview(interview: {
+  seniority?: string | null;
+  jobTitle?: string | null;
+  companyName?: string | null;
+}): string {
+  const joined = compactAndJoinWithDash([interview.seniority, interview.jobTitle, interview.companyName]);
+  const base = joined ? `Vocational Aid - ${joined}` : 'Vocational Aid - Feedback';
+  return sanitizeFilename(base);
+}
+
+type SendViaResendParams = {
+  to: string;
+  from?: string;
+  subject?: string;
+  html?: string;
+  text?: string;
+  templateId?: string;
+  templateVariables?: Record<string, any>;
+  attachments?: ResendAttachment[];
+};
+
+async function sendViaResend(params: SendViaResendParams): Promise<{ success: boolean; messageId?: string; error?: string }> {
+  const mode = getEmailProviderMode();
+  if (mode === 'disabled') {
+    return { success: false, error: 'Email provider disabled' };
+  }
+
+  if (mode === 'mock') {
+    const messageId = `mock-${Date.now()}`;
+    emailLogger.info('MOCK MODE - Email send skipped', {
+      to: params.to,
+      from: params.from,
+      subject: params.subject,
+      templateId: params.templateId,
+    });
+    return { success: true, messageId };
+  }
+
+  const client = getResendClient();
+  if (!client) {
+    return { success: false, error: 'Resend client not initialized' };
+  }
+
+  try {
+    const result = await client.emails.send({
+      from: params.from || EMAIL_SENDERS.transactional,
+      to: params.to,
+      subject: params.subject,
+      html: params.html,
+      text: params.text,
+      attachments: params.attachments,
+      templateId: params.templateId,
+      templateVariables: params.templateVariables,
+    });
+
+    if (result?.error) {
+      emailLogger.warn('Resend send failed', {
+        to: params.to,
+        error: result.error?.message || JSON.stringify(result.error),
+      });
+      return { success: false, error: result.error?.message || JSON.stringify(result.error) };
+    }
+
+    if (!result?.data?.id) {
+      emailLogger.warn('Resend returned no message ID', { to: params.to });
+      return { success: false, error: 'No message ID returned' };
+    }
+
+    return { success: true, messageId: result.data.id };
+  } catch (error: any) {
+    emailLogger.error('Resend send exception', { error: error.message, to: params.to });
+    return { success: false, error: error.message };
+  }
+}
 
 // ========================================
 // TYPES
@@ -108,7 +177,6 @@ const SUPPORT_EMAIL = 'support@vocaid.ai';
 
 export interface UserEmailData {
   id: string;           // DB UUID
-  clerkId: string;
   email: string;
   firstName?: string | null;
   lastName?: string | null;
@@ -119,7 +187,6 @@ export interface PurchaseEmailData {
   user: UserEmailData;
   paymentId: string;
   provider: 'mercadopago' | 'paypal';
-  packageName: string;
   creditsAmount: number;
   amountPaid: number;
   currency: string;
@@ -127,16 +194,16 @@ export interface PurchaseEmailData {
   paidAt: Date;
 }
 
-export interface InterviewReminderData {
-  user: UserEmailData;
-  interviewId?: string;           // Optional - for scheduled interview reminders
-  interviewTitle?: string;        // Optional - for scheduled interview reminders
-  jobRole?: string;               // Optional - for scheduled interview reminders
-  scheduledAt?: Date;             // Optional - for scheduled interview reminders
-  resumeUrl?: string;
-  // For engagement reminders (come back and practice)
-  lastInterviewDate?: Date;       // When they last practiced
-  lastInterviewTitle?: string;    // Title of their last interview
+function formatMoney(amount: number, currency: string, locale: string): string {
+  try {
+    return new Intl.NumberFormat(locale, {
+      style: 'currency',
+      currency,
+    }).format(amount);
+  } catch {
+    // Fallback if currency code is invalid
+    return `${currency} ${amount.toFixed(2)}`;
+  }
 }
 
 export interface LowCreditsData {
@@ -198,6 +265,43 @@ function getLanguage(preferredLanguage?: string | null): SupportedLanguage {
   if (lang.startsWith('pt')) return 'pt';
   // Add more languages as needed
   return 'en';
+}
+
+type TransactionalTemplateVariables = {
+  preheader: string;
+  subject: string;
+  reason: string;
+  header: string;
+  header_highlight: string;
+  content: string;
+} & Record<string, string | number>;
+
+function buildTransactionalTemplateVariables(vars: {
+  preheader: string;
+  subject: string;
+  reason: string;
+  header: string;
+  header_highlight: string;
+  content: string;
+}): TransactionalTemplateVariables {
+  return {
+    ...(getCommonVariables() as Record<string, string | number>),
+    ...vars,
+  };
+}
+
+async function sendTransactionalTemplateEmail(params: {
+  to: string;
+  from?: string;
+  templateVariables: TransactionalTemplateVariables;
+}): Promise<{ success: boolean; messageId?: string; error?: string }> {
+  return sendViaResend({
+    to: params.to,
+    from: params.from || EMAIL_SENDERS.transactional,
+    subject: String(params.templateVariables.subject),
+    templateId: 'transactional',
+    templateVariables: params.templateVariables,
+  });
 }
 
 // ========================================
@@ -1361,8 +1465,8 @@ Precisa de ajuda? ${supportEmail}
 // IDEMPOTENCY KEY GENERATORS
 // ========================================
 
-export function generateWelcomeIdempotencyKey(clerkUserId: string): string {
-  return `welcome:${clerkUserId}`;
+export function generateWelcomeIdempotencyKey(userId: string): string {
+  return `welcome:${userId}`;
 }
 
 export function generatePurchaseIdempotencyKey(provider: string, paymentId: string): string {
@@ -1370,21 +1474,12 @@ export function generatePurchaseIdempotencyKey(provider: string, paymentId: stri
 }
 
 export function generateLowCreditsIdempotencyKey(userId: string, threshold: number): string {
-  // Only one low credits email per user per threshold level per day
-  const date = new Date().toISOString().split('T')[0];
-  return `low-credits:${userId}:${threshold}:${date}`;
-}
-
-export function generateInterviewReminderIdempotencyKey(userId: string, interviewId?: string): string {
-  if (interviewId) {
-    // For scheduled interview reminders - one per interview
-    return `interview-reminder:${userId}:${interviewId}`;
-  }
-  // For engagement reminders - one per user per week
-  const weekStart = new Date();
-  weekStart.setDate(weekStart.getDate() - weekStart.getDay()); // Start of week
-  const weekKey = weekStart.toISOString().split('T')[0];
-  return `engagement-reminder:${userId}:${weekKey}`;
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, '0');
+  const dd = String(now.getDate()).padStart(2, '0');
+  // One email per user+threshold per day
+  return `low-credits:${userId}:${threshold}:${yyyy}-${mm}-${dd}`;
 }
 
 export function generateInterviewCompleteIdempotencyKey(userId: string, interviewId: string): string {
@@ -1402,7 +1497,7 @@ export function generateInterviewCompleteIdempotencyKey(userId: string, intervie
  */
 export async function sendWelcomeEmail(user: UserEmailData): Promise<EmailResult> {
   // Check transactional consent before sending
-  const canSend = await canSendTransactional(user.clerkId);
+  const canSend = await canSendTransactional(user.id);
   if (!canSend) {
     emailLogger.info('Welcome email blocked - user opted out of transactional emails', { 
       userId: user.id, 
@@ -1415,12 +1510,13 @@ export async function sendWelcomeEmail(user: UserEmailData): Promise<EmailResult
     };
   }
 
-  const idempotencyKey = generateWelcomeIdempotencyKey(user.clerkId);
+  const idempotencyKey = generateWelcomeIdempotencyKey(user.id);
   
   emailLogger.info('Attempting to send welcome email', { 
     userId: user.id, 
     email: user.email,
-    idempotencyKey 
+    idempotencyKey,
+    templateId: RESEND_WELCOME_TEMPLATE_ID,
   });
 
   // Check if already sent
@@ -1470,7 +1566,7 @@ export async function sendWelcomeEmail(user: UserEmailData): Promise<EmailResult
       language: getLanguage(user.preferredLanguage),
       payloadJson: {
         firstName: user.firstName,
-        clerkId: user.clerkId
+        userId: user.id
       }
     },
     update: {
@@ -1480,92 +1576,74 @@ export async function sendWelcomeEmail(user: UserEmailData): Promise<EmailResult
     }
   });
 
-  // Get Resend client
-  const resendClient = getResendClient();
-  
-  if (!resendClient) {
-    emailLogger.warn('Resend not configured - welcome email logged but not sent', { 
-      userId: user.id 
-    });
-    
-    await prisma.transactionalEmail.update({
-      where: { id: emailRecord.id },
-      data: {
-        status: 'FAILED',
-        errorJson: { message: 'Resend not configured' }
-      }
-    });
-    
-    return { 
-      success: false, 
-      error: 'Email service not configured',
-      emailId: emailRecord.id 
-    };
-  }
-
-  // Build email content
-  const lang = getLanguage(user.preferredLanguage);
-  const template = welcomeTemplates[lang];
-  const templateData = {
-    firstName: user.firstName || '',
-    dashboardUrl: `${FRONTEND_URL}/app/dashboard`,
-    supportEmail: SUPPORT_EMAIL
+  // Build email content using Resend Dashboard template
+  // Template id: 'transactional' configured in Resend dashboard
+  // Variables: free_credits, CANDIDATE_FIRST_NAME, DASHBOARD_URL, CURRENT_YEAR, PRIVACY_URL, TERMS_URL
+  const lang: TemplateLanguage = getLanguage(user.preferredLanguage);
+  const templateVariables = {
+    free_credits: 1,
+    CANDIDATE_FIRST_NAME: user.firstName || 'there',
+    DASHBOARD_URL: `${FRONTEND_URL}/app/dashboard`,
+    CURRENT_YEAR: new Date().getFullYear().toString(),
+    PRIVACY_URL,
+    TERMS_URL,
   };
 
-  try {
-    // Send via Resend
-    const result = await resendClient.emails.send({
-      from: EMAIL_FROM,
-      to: user.email,
-      subject: template.subject,
-      html: template.html(templateData),
-      text: template.text(templateData)
+  emailLogger.debug('Welcome email template variables prepared', {
+    userId: user.id,
+    templateId: RESEND_WELCOME_TEMPLATE_ID,
+    variableKeys: Object.keys(templateVariables),
+  });
+
+  // Send via Resend helper using dashboard template
+  const sendResult = await sendViaResend({
+    to: user.email,
+    from: EMAIL_SENDERS.welcome,
+    templateId: RESEND_WELCOME_TEMPLATE_ID,
+    templateVariables,
+  });
+
+  if (!sendResult.success) {
+    emailLogger.warn('Welcome email failed to send', { 
+      userId: user.id,
+      error: sendResult.error,
     });
-
-    // Update record as SENT
-    await prisma.transactionalEmail.update({
-      where: { id: emailRecord.id },
-      data: {
-        status: 'SENT',
-        providerMessageId: result.data?.id || null,
-        sentAt: new Date()
-      }
-    });
-
-    emailLogger.info('Welcome email sent successfully', { 
-      userId: user.id, 
-      messageId: result.data?.id 
-    });
-
-    return { 
-      success: true, 
-      emailId: emailRecord.id,
-      messageId: result.data?.id 
-    };
-
-  } catch (error: any) {
-    emailLogger.error('Failed to send welcome email', { 
-      userId: user.id, 
-      error: error.message 
-    });
-
+    
     await prisma.transactionalEmail.update({
       where: { id: emailRecord.id },
       data: {
         status: 'FAILED',
-        errorJson: { 
-          message: error.message,
-          stack: error.stack?.slice(0, 500)
-        }
+        errorJson: { message: sendResult.error || 'Unknown error' }
       }
     });
-
+    
     return { 
       success: false, 
-      error: error.message,
+      error: sendResult.error || 'Email service not configured',
       emailId: emailRecord.id 
     };
   }
+
+  // Update record as SENT
+  await prisma.transactionalEmail.update({
+    where: { id: emailRecord.id },
+    data: {
+      status: 'SENT',
+      providerMessageId: sendResult.messageId || null,
+      sentAt: new Date()
+    }
+  });
+
+  emailLogger.info('Welcome email sent successfully', { 
+    userId: user.id, 
+    messageId: sendResult.messageId 
+  });
+
+  return { 
+    success: true, 
+    emailId: emailRecord.id,
+    messageId: sendResult.messageId 
+  };
 }
 
 /**
@@ -1574,20 +1652,6 @@ export async function sendWelcomeEmail(user: UserEmailData): Promise<EmailResult
  * Respects consent: Checks transactional opt-in before sending
  */
 export async function sendPurchaseReceiptEmail(data: PurchaseEmailData): Promise<EmailResult> {
-  // Check transactional consent before sending
-  const canSend = await canSendTransactional(data.user.clerkId);
-  if (!canSend) {
-    emailLogger.info('Purchase receipt blocked - user opted out of transactional emails', { 
-      userId: data.user.id, 
-      paymentId: data.paymentId 
-    });
-    return { 
-      success: false, 
-      skipped: true, 
-      reason: 'Transactional emails disabled by user preference'
-    };
-  }
-
   const idempotencyKey = generatePurchaseIdempotencyKey(data.provider, data.paymentId);
   
   emailLogger.info('Attempting to send purchase receipt email', { 
@@ -1644,7 +1708,6 @@ export async function sendPurchaseReceiptEmail(data: PurchaseEmailData): Promise
       payloadJson: {
         paymentId: data.paymentId,
         provider: data.provider,
-        packageName: data.packageName,
         creditsAmount: data.creditsAmount,
         amountPaid: data.amountPaid,
         currency: data.currency,
@@ -1658,38 +1721,12 @@ export async function sendPurchaseReceiptEmail(data: PurchaseEmailData): Promise
     }
   });
 
-  // Get Resend client
-  const resendClient = getResendClient();
-  
-  if (!resendClient) {
-    emailLogger.warn('Resend not configured - purchase receipt logged but not sent', { 
-      userId: data.user.id 
-    });
-    
-    await prisma.transactionalEmail.update({
-      where: { id: emailRecord.id },
-      data: {
-        status: 'FAILED',
-        errorJson: { message: 'Resend not configured' }
-      }
-    });
-    
-    return { 
-      success: false, 
-      error: 'Email service not configured',
-      emailId: emailRecord.id 
-    };
-  }
-
-  // Build email content
+  // Build template variables for Resend Dashboard template alias `transactional`
   const lang = getLanguage(data.user.preferredLanguage);
-  const template = receiptTemplates[lang];
-  
-  // Format amount
-  const formattedAmount = data.amountPaid.toFixed(2);
-  
-  // Format date
-  const dateFormatter = new Intl.DateTimeFormat(lang === 'pt' ? 'pt-BR' : 'en-US', {
+  const locale = lang === 'pt' ? 'pt-BR' : 'en-US';
+  const providerDisplayName = data.provider === 'mercadopago' ? 'Mercado Pago' : 'PayPal';
+
+  const dateFormatter = new Intl.DateTimeFormat(locale, {
     year: 'numeric',
     month: 'long',
     day: 'numeric',
@@ -1697,81 +1734,115 @@ export async function sendPurchaseReceiptEmail(data: PurchaseEmailData): Promise
     minute: '2-digit',
     timeZoneName: 'short'
   });
-  const formattedDate = dateFormatter.format(data.paidAt);
-  
-  // Provider display name
-  const providerDisplayName = data.provider === 'mercadopago' ? 'Mercado Pago' : 'PayPal';
 
-  const templateData = {
-    firstName: data.user.firstName || '',
-    packageName: data.packageName,
-    creditsAmount: data.creditsAmount,
-    amountPaid: formattedAmount,
-    currency: data.currency,
-    newBalance: data.newBalance,
-    transactionId: data.paymentId,
-    provider: providerDisplayName,
-    paidAt: formattedDate,
-    creditsPageUrl: `${FRONTEND_URL}/app/b2c/billing`,
-    supportEmail: SUPPORT_EMAIL
+  const subject = lang === 'pt'
+    ? 'Recibo de compra de créditos'
+    : 'Credits purchase receipt';
+
+  const preheader = lang === 'pt'
+    ? 'Sua compra foi confirmada e os créditos já estão disponíveis.'
+    : 'Your purchase is confirmed and credits are now available.';
+
+  const contentLabels = {
+    creditsPurchased: lang === 'pt' ? 'Créditos comprados' : 'Credits Purchased',
+    amountPaid: lang === 'pt' ? 'Valor pago' : 'Amount Paid',
+    provider: lang === 'pt' ? 'Provedor' : 'Provider',
+    newBalance: lang === 'pt' ? 'Novo saldo' : 'New Balance',
+    transactionId: lang === 'pt' ? 'ID da transação' : 'Transaction ID',
+    paidAt: lang === 'pt' ? 'Data' : 'Paid At',
   };
 
-  try {
-    // Send via Resend
-    const result = await resendClient.emails.send({
-      from: EMAIL_FROM,
-      to: data.user.email,
-      subject: template.subject({ packageName: data.packageName }),
-      html: template.html(templateData),
-      text: template.text(templateData)
-    });
+  const formattedPaidAt = dateFormatter.format(data.paidAt);
+  const formattedAmountPaid = formatMoney(data.amountPaid, data.currency, locale);
 
-    // Update record as SENT
-    await prisma.transactionalEmail.update({
-      where: { id: emailRecord.id },
-      data: {
-        status: 'SENT',
-        providerMessageId: result.data?.id || null,
-        sentAt: new Date()
-      }
-    });
+  // Keep the “product” collapsed into a single Credits Purchased line (no tier/package name)
+  const contentHtml = `
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse: collapse;">
+      <tr>
+        <td style="padding: 10px 0; font-size: 14px; color: #18181b;">${contentLabels.creditsPurchased}</td>
+        <td style="padding: 10px 0; font-size: 14px; font-weight: 600; color: #18181b; text-align: right;">${data.creditsAmount}</td>
+      </tr>
+      <tr>
+        <td style="padding: 10px 0; font-size: 14px; color: #18181b;">${contentLabels.amountPaid}</td>
+        <td style="padding: 10px 0; font-size: 14px; font-weight: 600; color: #18181b; text-align: right;">${formattedAmountPaid}</td>
+      </tr>
+      <tr>
+        <td style="padding: 10px 0; font-size: 14px; color: #18181b;">${contentLabels.provider}</td>
+        <td style="padding: 10px 0; font-size: 14px; font-weight: 600; color: #18181b; text-align: right;">${providerDisplayName}</td>
+      </tr>
+      <tr>
+        <td style="padding: 10px 0; font-size: 14px; color: #18181b;">${contentLabels.newBalance}</td>
+        <td style="padding: 10px 0; font-size: 14px; font-weight: 600; color: #18181b; text-align: right;">${data.newBalance}</td>
+      </tr>
+      <tr>
+        <td style="padding: 10px 0; font-size: 14px; color: #18181b;">${contentLabels.transactionId}</td>
+        <td style="padding: 10px 0; font-size: 14px; font-weight: 600; color: #18181b; text-align: right;">${data.paymentId}</td>
+      </tr>
+      <tr>
+        <td style="padding: 10px 0; font-size: 14px; color: #18181b;">${contentLabels.paidAt}</td>
+        <td style="padding: 10px 0; font-size: 14px; font-weight: 600; color: #18181b; text-align: right;">${formattedPaidAt}</td>
+      </tr>
+    </table>
+  `.trim();
 
-    emailLogger.info('Purchase receipt email sent successfully', { 
-      userId: data.user.id, 
+  const templateVariables = buildTransactionalTemplateVariables({
+    preheader,
+    subject,
+    reason: lang === 'pt' ? 'Recibo de Compra' : 'Purchase Receipt',
+    header: lang === 'pt' ? 'Recibo' : 'Receipt',
+    header_highlight: lang === 'pt' ? 'Créditos' : 'Credits',
+    content: contentHtml,
+  });
+
+  const sendResult = await sendTransactionalTemplateEmail({
+    to: data.user.email,
+    from: EMAIL_SENDERS.transactional,
+    templateVariables,
+  });
+
+  if (!sendResult.success) {
+    emailLogger.warn('Purchase receipt email failed to send', { 
+      userId: data.user.id,
       paymentId: data.paymentId,
-      messageId: result.data?.id 
+      error: sendResult.error,
     });
-
-    return { 
-      success: true, 
-      emailId: emailRecord.id,
-      messageId: result.data?.id 
-    };
-
-  } catch (error: any) {
-    emailLogger.error('Failed to send purchase receipt email', { 
-      userId: data.user.id, 
-      paymentId: data.paymentId,
-      error: error.message 
-    });
-
+    
     await prisma.transactionalEmail.update({
       where: { id: emailRecord.id },
       data: {
         status: 'FAILED',
-        errorJson: { 
-          message: error.message,
-          stack: error.stack?.slice(0, 500)
-        }
+        errorJson: { message: sendResult.error || 'Unknown error' }
       }
     });
-
+    
     return { 
       success: false, 
-      error: error.message,
+      error: sendResult.error || 'Email send failed',
       emailId: emailRecord.id 
     };
   }
+
+  // Update record as SENT
+  await prisma.transactionalEmail.update({
+    where: { id: emailRecord.id },
+    data: {
+      status: 'SENT',
+      providerMessageId: sendResult.messageId || null,
+      sentAt: new Date()
+    }
+  });
+
+  emailLogger.info('Purchase receipt email sent successfully', { 
+    userId: data.user.id, 
+    paymentId: data.paymentId,
+    messageId: sendResult.messageId 
+  });
+
+  return { 
+    success: true, 
+    emailId: emailRecord.id,
+    messageId: sendResult.messageId 
+  };
 }
 
 // ========================================
@@ -1842,7 +1913,7 @@ export async function getEmailLogs(filters: EmailLogFilters = {}) {
         user: {
           select: {
             id: true,
-            clerkId: true,
+            
             email: true,
             firstName: true,
             lastName: true
@@ -1967,7 +2038,6 @@ export async function retryFailedEmails(maxRetries: number = 3): Promise<RetryRe
         case 'WELCOME':
           sendResult = await sendWelcomeEmail({
             id: userId,
-            clerkId: email.user?.clerkId || '',
             email: toEmail,
             firstName: email.user?.firstName,
             lastName: email.user?.lastName,
@@ -1980,7 +2050,6 @@ export async function retryFailedEmails(maxRetries: number = 3): Promise<RetryRe
           sendResult = await sendPurchaseReceiptEmail({
             user: {
               id: userId,
-              clerkId: email.user?.clerkId || '',
               email: toEmail,
               firstName: email.user?.firstName,
               lastName: email.user?.lastName,
@@ -1988,7 +2057,6 @@ export async function retryFailedEmails(maxRetries: number = 3): Promise<RetryRe
             },
             paymentId: payload?.paymentId || email.id,
             provider: payload?.provider || 'mercadopago',
-            packageName: payload?.packageName || 'Credits',
             creditsAmount: payload?.creditsAmount || 0,
             amountPaid: payload?.amountPaid || 0,
             currency: payload?.currency || 'USD',
@@ -2002,7 +2070,6 @@ export async function retryFailedEmails(maxRetries: number = 3): Promise<RetryRe
           sendResult = await sendLowCreditsEmail({
             user: {
               id: userId,
-              clerkId: email.user?.clerkId || '',
               email: toEmail,
               firstName: email.user?.firstName,
               lastName: email.user?.lastName,
@@ -2047,7 +2114,6 @@ export async function retryFailedEmails(maxRetries: number = 3): Promise<RetryRe
 export async function sendLowCreditsEmail(data: LowCreditsData): Promise<EmailResult> {
   const idempotencyKey = generateLowCreditsIdempotencyKey(data.user.id, data.threshold);
   const language = getLanguage(data.user.preferredLanguage);
-  const template = lowCreditsTemplates[language];
 
   // Check for existing
   const existing = await prisma.transactionalEmail.findUnique({
@@ -2080,180 +2146,127 @@ export async function sendLowCreditsEmail(data: LowCreditsData): Promise<EmailRe
     }
   });
 
-  try {
-    const resendClient = getResendClient();
-    if (!resendClient) {
-      emailLogger.warn('Resend not configured - logging low credits email', { userId: data.user.id });
-      return { success: false, error: 'Email service not configured', emailId: emailRecord.id };
-    }
+  const creditsPageUrl = `${FRONTEND_URL}/credits`;
+  const subject = language === 'pt' ? 'Seus créditos estão acabando' : 'Your credits are running low';
+  const preheader = language === 'pt'
+    ? 'Recarregue agora para continuar praticando sem interrupções.'
+    : 'Top up now to keep practicing without interruptions.';
 
-    const creditsPageUrl = `${FRONTEND_URL}/credits`;
-    const htmlContent = template.html({
-      firstName: data.user.firstName || '',
-      currentCredits: data.currentCredits,
-      threshold: data.threshold,
-      creditsPageUrl,
-      supportEmail: SUPPORT_EMAIL
-    });
-    const textContent = template.text({
-      firstName: data.user.firstName || '',
-      currentCredits: data.currentCredits,
-      threshold: data.threshold,
-      creditsPageUrl,
-      supportEmail: SUPPORT_EMAIL
-    });
+  const contentHtml = `
+    <p style="margin:0 0 12px; font-size:14px; color:#111827;">
+      ${language === 'pt'
+        ? `Olá${data.user.firstName ? ` ${data.user.firstName}` : ''},`
+        : `Hi${data.user.firstName ? ` ${data.user.firstName}` : ''},`}
+    </p>
+    <p style="margin:0 0 12px; font-size:14px; color:#111827;">
+      ${language === 'pt'
+        ? `Você tem <strong>${data.currentCredits}</strong> crédito${data.currentCredits !== 1 ? 's' : ''} restante${data.currentCredits !== 1 ? 's' : ''}.`
+        : `You have <strong>${data.currentCredits}</strong> credit${data.currentCredits !== 1 ? 's' : ''} remaining.`}
+    </p>
+    <p style="margin:0 0 16px; font-size:14px; color:#111827;">
+      ${language === 'pt'
+        ? `Recarregue seus créditos para continuar praticando entrevistas com o Vocaid.`
+        : `Top up your credits to keep practicing interviews with Vocaid.`}
+    </p>
+    <p style="margin:0; font-size:14px;">
+      <a href="${creditsPageUrl}" style="color:#6D28D9; font-weight:600; text-decoration:none;">
+        ${language === 'pt' ? 'Comprar créditos' : 'Buy credits'}
+      </a>
+    </p>
+  `.trim();
 
-    const response = await resendClient.emails.send({
-      from: EMAIL_FROM,
-      to: data.user.email,
-      subject: template.subject,
-      html: htmlContent,
-      text: textContent
-    });
-
-    await prisma.transactionalEmail.update({
-      where: { id: emailRecord.id },
-      data: {
-        status: 'SENT',
-        providerMessageId: response.id,
-        sentAt: new Date()
-      }
-    });
-
-    emailLogger.info('Low credits warning email sent', { userId: data.user.id, messageId: response.id });
-    return { success: true, emailId: emailRecord.id, messageId: response.id };
-
-  } catch (error: any) {
-    emailLogger.error('Failed to send low credits email', { userId: data.user.id, error: error.message });
-    
-    await prisma.transactionalEmail.update({
-      where: { id: emailRecord.id },
-      data: {
-        status: 'FAILED',
-        errorJson: { message: error.message, stack: error.stack?.slice(0, 500) }
-      }
-    });
-
-    return { success: false, error: error.message, emailId: emailRecord.id };
-  }
-}
-
-/**
- * Send interview reminder email
- * Idempotent: Only one per interview, or one per user per week for engagement reminders
- */
-export async function sendInterviewReminderEmail(data: InterviewReminderData): Promise<EmailResult> {
-  const isEngagementReminder = !data.interviewId;
-  const idempotencyKey = generateInterviewReminderIdempotencyKey(data.user.id, data.interviewId);
-  const language = getLanguage(data.user.preferredLanguage);
-  const template = interviewReminderTemplates[language];
-
-  const existing = await prisma.transactionalEmail.findUnique({
-    where: { idempotencyKey }
+  const templateVariables = buildTransactionalTemplateVariables({
+    preheader,
+    subject,
+    reason: language === 'pt' ? 'Aviso de créditos' : 'Credits warning',
+    header: language === 'pt' ? 'Créditos' : 'Credits',
+    header_highlight: language === 'pt' ? 'acabando' : 'running low',
+    content: contentHtml,
   });
 
-  if (existing?.status === 'SENT') {
-    return { success: true, skipped: true, reason: 'Already sent', emailId: existing.id };
-  }
+  const sendResult = await sendTransactionalTemplateEmail({
+    to: data.user.email,
+    from: EMAIL_SENDERS.transactional,
+    templateVariables,
+  });
 
-  const emailRecord = await prisma.transactionalEmail.upsert({
-    where: { idempotencyKey },
-    create: {
+  if (!sendResult.success) {
+    emailLogger.warn('Low credits email failed to send', { 
       userId: data.user.id,
-      toEmail: data.user.email,
-      emailType: 'INTERVIEW_REMINDER',
-      status: 'PENDING',
-      provider: 'RESEND',
-      idempotencyKey,
-      language,
-      payloadJson: {
-        interviewId: data.interviewId,
-        interviewTitle: data.interviewTitle,
-        jobRole: data.jobRole,
-        isEngagementReminder,
-        lastInterviewDate: data.lastInterviewDate?.toISOString()
-      }
-    },
-    update: {
-      status: 'PENDING',
-      retryCount: { increment: 1 }
-    }
-  });
-
-  try {
-    const resendClient = getResendClient();
-    if (!resendClient) {
-      return { success: false, error: 'Email service not configured', emailId: emailRecord.id };
-    }
-
-    // For engagement reminders, link to interview setup; for specific interviews, link to that interview
-    const interviewUrl = isEngagementReminder 
-      ? `${FRONTEND_URL}/interview-setup`
-      : `${FRONTEND_URL}/interviews/${data.interviewId}`;
-
-    const htmlContent = template.html({
-      firstName: data.user.firstName || '',
-      interviewTitle: data.interviewTitle,
-      jobRole: data.jobRole,
-      interviewUrl,
-      supportEmail: SUPPORT_EMAIL,
-      isEngagementReminder
+      error: sendResult.error,
     });
-    const textContent = template.text({
-      firstName: data.user.firstName || '',
-      interviewTitle: data.interviewTitle,
-      jobRole: data.jobRole,
-      interviewUrl,
-      supportEmail: SUPPORT_EMAIL,
-      isEngagementReminder
-    });
-
-    const response = await resendClient.emails.send({
-      from: EMAIL_FROM,
-      to: data.user.email,
-      subject: template.subject,
-      html: htmlContent,
-      text: textContent
-    });
-
-    await prisma.transactionalEmail.update({
-      where: { id: emailRecord.id },
-      data: {
-        status: 'SENT',
-        providerMessageId: response.id,
-        sentAt: new Date()
-      }
-    });
-
-    emailLogger.info('Interview reminder email sent', { userId: data.user.id, interviewId: data.interviewId });
-    return { success: true, emailId: emailRecord.id, messageId: response.id };
-
-  } catch (error: any) {
-    emailLogger.error('Failed to send interview reminder', { userId: data.user.id, error: error.message });
     
     await prisma.transactionalEmail.update({
       where: { id: emailRecord.id },
       data: {
         status: 'FAILED',
-        errorJson: { message: error.message }
+        errorJson: { message: sendResult.error || 'Unknown error' }
       }
     });
-
-    return { success: false, error: error.message, emailId: emailRecord.id };
+    
+    return { success: false, error: sendResult.error, emailId: emailRecord.id };
   }
+
+  await prisma.transactionalEmail.update({
+    where: { id: emailRecord.id },
+    data: {
+      status: 'SENT',
+      providerMessageId: sendResult.messageId || null,
+      sentAt: new Date()
+    }
+  });
+
+  emailLogger.info('Low credits warning email sent', { userId: data.user.id, messageId: sendResult.messageId });
+  return { success: true, emailId: emailRecord.id, messageId: sendResult.messageId };
 }
 
 /**
  * Send interview complete email with results
  * Idempotent: Only one per interview
  */
-export async function sendInterviewCompleteEmail(data: InterviewCompleteData): Promise<EmailResult> {
-  const idempotencyKey = generateInterviewCompleteIdempotencyKey(data.user.id, data.interviewId);
-  const language = getLanguage(data.user.preferredLanguage);
-  const template = interviewCompleteTemplates[language];
+export async function sendInterviewCompleteEmail(interviewId: string): Promise<EmailResult> {
+  const interview = await prisma.interview.findUnique({
+    where: { id: interviewId },
+    select: {
+      id: true,
+      jobTitle: true,
+      companyName: true,
+      seniority: true,
+      feedbackDocument: {
+        select: {
+          pdfStorageKey: true,
+        },
+      },
+      user: {
+        select: {
+          id: true,
+          email: true,
+          firstName: true,
+          lastName: true,
+          preferredLanguage: true,
+        },
+      },
+    },
+  });
+
+  if (!interview?.user?.email) {
+    return { success: false, error: 'Interview or user email not found' };
+  }
+
+  const canSend = await canSendTransactional(interview.user.id);
+  if (!canSend) {
+    emailLogger.info('Post-interview email blocked - user opted out of transactional emails', {
+      userId: interview.user.id,
+      interviewId,
+    });
+    return { success: false, skipped: true, reason: 'Transactional emails disabled by user preference' };
+  }
+
+  const idempotencyKey = generateInterviewCompleteIdempotencyKey(interview.user.id, interviewId);
+  const language: TemplateLanguage = getLanguage(interview.user.preferredLanguage);
 
   const existing = await prisma.transactionalEmail.findUnique({
-    where: { idempotencyKey }
+    where: { idempotencyKey },
   });
 
   if (existing?.status === 'SENT') {
@@ -2263,93 +2276,941 @@ export async function sendInterviewCompleteEmail(data: InterviewCompleteData): P
   const emailRecord = await prisma.transactionalEmail.upsert({
     where: { idempotencyKey },
     create: {
-      userId: data.user.id,
-      toEmail: data.user.email,
+      userId: interview.user.id,
+      toEmail: interview.user.email,
       emailType: 'INTERVIEW_COMPLETE',
       status: 'PENDING',
       provider: 'RESEND',
       idempotencyKey,
       language,
       payloadJson: {
-        interviewId: data.interviewId,
-        interviewTitle: data.interviewTitle,
-        jobRole: data.jobRole,
-        duration: data.duration,
-        overallScore: data.overallScore
-      }
+        interviewId,
+        jobTitle: interview.jobTitle,
+        companyName: interview.companyName,
+        seniority: interview.seniority,
+        pdfStorageKey: interview.feedbackDocument?.pdfStorageKey,
+      },
     },
     update: {
       status: 'PENDING',
-      retryCount: { increment: 1 }
-    }
+      retryCount: { increment: 1 },
+    },
   });
 
-  try {
-    const resendClient = getResendClient();
-    if (!resendClient) {
-      return { success: false, error: 'Email service not configured', emailId: emailRecord.id };
-    }
-
-    const feedbackUrl = `${FRONTEND_URL}/interviews/${data.interviewId}/feedback`;
-    const htmlContent = template.html({
-      firstName: data.user.firstName || '',
-      interviewTitle: data.interviewTitle,
-      jobRole: data.jobRole,
-      duration: data.duration,
-      overallScore: data.overallScore,
-      feedbackUrl,
-      supportEmail: SUPPORT_EMAIL
+  const pdfStorageKey = interview.feedbackDocument?.pdfStorageKey;
+  if (!pdfStorageKey) {
+    const errorMessage = 'Feedback PDF storage key not found for interview';
+    await prisma.transactionalEmail.update({
+      where: { id: emailRecord.id },
+      data: {
+        status: 'FAILED',
+        errorJson: { message: errorMessage },
+      },
     });
-    const textContent = template.text({
-      firstName: data.user.firstName || '',
-      interviewTitle: data.interviewTitle,
-      jobRole: data.jobRole,
-      duration: data.duration,
-      overallScore: data.overallScore,
-      feedbackUrl,
-      supportEmail: SUPPORT_EMAIL
-    });
+    return { success: false, error: errorMessage, emailId: emailRecord.id };
+  }
 
-    const response = await resendClient.emails.send({
-      from: EMAIL_FROM,
-      to: data.user.email,
-      subject: template.subject,
-      html: htmlContent,
-      text: textContent
+  const pdfDownload = await downloadFeedbackPdf(pdfStorageKey);
+  if (!pdfDownload.success || !pdfDownload.data) {
+    const errorMessage = pdfDownload.error || 'Failed to download feedback PDF';
+    await prisma.transactionalEmail.update({
+      where: { id: emailRecord.id },
+      data: {
+        status: 'FAILED',
+        errorJson: { message: errorMessage },
+      },
+    });
+    return { success: false, error: errorMessage, emailId: emailRecord.id };
+  }
+
+  const feedbackUrl = `${FRONTEND_URL}/interviews/${interviewId}/feedback`;
+
+  const templateVariables: Record<string, any> = {
+    ...getCommonVariables(),
+    FEEDBACK_URL: feedbackUrl,
+  };
+
+  if (interview.user.firstName?.trim()) templateVariables.CANDIDATE_FIRST_NAME = interview.user.firstName.trim();
+  if (interview.seniority?.trim()) templateVariables.SENIORITY = interview.seniority.trim();
+  if (interview.jobTitle?.trim()) templateVariables.ROLE_TITLE = interview.jobTitle.trim();
+  if (interview.companyName?.trim()) templateVariables.TARGET_COMPANY = interview.companyName.trim();
+
+  const attachmentFilename = buildFeedbackPdfFilenameFromInterview({
+    seniority: interview.seniority,
+    jobTitle: interview.jobTitle,
+    companyName: interview.companyName,
+  });
+
+  const sendResult = await sendViaResend({
+    to: interview.user.email,
+    from: EMAIL_SENDERS.feedback,
+    templateId: 'feedback',
+    templateVariables,
+    attachments: [
+      {
+        filename: attachmentFilename,
+        content: pdfDownload.data,
+        contentType: pdfDownload.contentType || 'application/pdf',
+      },
+    ],
+  });
+
+  if (!sendResult.success) {
+    emailLogger.warn('Post-interview feedback email failed to send', {
+      userId: interview.user.id,
+      interviewId,
+      error: sendResult.error,
     });
 
     await prisma.transactionalEmail.update({
       where: { id: emailRecord.id },
       data: {
-        status: 'SENT',
-        providerMessageId: response.id,
-        sentAt: new Date()
-      }
+        status: 'FAILED',
+        errorJson: { message: sendResult.error || 'Unknown error' },
+      },
     });
 
-    emailLogger.info('Interview complete email sent', { userId: data.user.id, interviewId: data.interviewId });
-    return { success: true, emailId: emailRecord.id, messageId: response.id };
+    return { success: false, error: sendResult.error, emailId: emailRecord.id };
+  }
 
-  } catch (error: any) {
-    emailLogger.error('Failed to send interview complete email', { userId: data.user.id, error: error.message });
+  await prisma.transactionalEmail.update({
+    where: { id: emailRecord.id },
+    data: {
+      status: 'SENT',
+      providerMessageId: sendResult.messageId || null,
+      sentAt: new Date(),
+    },
+  });
+
+  emailLogger.info('Post-interview feedback email sent', { userId: interview.user.id, interviewId });
+  return { success: true, emailId: emailRecord.id, messageId: sendResult.messageId };
+}
+
+// ========================================
+// PASSWORD RESET EMAIL
+// ========================================
+
+export interface PasswordResetEmailData {
+  user: {
+    id: string;
+    email: string;
+    firstName?: string;
+    preferredLanguage?: string;
+  };
+  resetToken: string;
+  expiresAt: Date;
+  ipAddress?: string;
+  userAgent?: string;
+}
+
+// Password reset templates
+const passwordResetTemplates: Record<SupportedLanguage, {
+  subject: string;
+  html: (data: any) => string;
+  text: (data: any) => string;
+}> = {
+  en: {
+    subject: 'Reset your Vocaid password',
+    html: (data) => `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin:0; padding:0; font-family:Arial, Helvetica, sans-serif; background-color:#FAFAFA;">
+  <div style="display:none;font-size:1px;color:#F7F5FF;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;">
+    Reset your Vocaid password - this link expires in 1 hour
+  </div>
+  
+  <center style="width:100%; background-color:#FAFAFA;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" align="center" style="width:100%; background-color:#FAFAFA; border-collapse:collapse; table-layout:fixed; margin:0 auto;">
+      <tr>
+        <td align="center" valign="top" style="padding:16px 0;">
+          <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" align="center" style="width:600px; max-width:600px; margin:0 auto; background-color:#FFFFFF; border-radius:18px; overflow:hidden; border-collapse:separate; box-shadow:0 10px 30px rgba(17,24,39,0.06);">
+            
+            <!-- Header -->
+            <tr>
+              <td style="background-color:#ffffff; padding:18px 20px; border-bottom:1px solid #E5E7EB;">
+                <table role="presentation" width="560" cellspacing="0" cellpadding="0" border="0" align="center" style="width:560px; max-width:560px; margin:0 auto; border-collapse:collapse;">
+                  <tr>
+                    <td align="left" style="vertical-align:middle;">
+                      <img src="https://resend-attachments.s3.amazonaws.com/6JI1baUnCt05bRK" width="140" alt="Vocaid" style="width:140px; height:auto; display:block;">
+                    </td>
+                    <td align="right" style="vertical-align:middle;">
+                      <span style="display:inline-block; padding:6px 10px; background-color:#9333EA; border:1px solid rgba(255,255,255,0.25); border-radius:999px; color:#ffffff; font-family:Arial, Helvetica, sans-serif; font-size:12px; font-weight:700;">
+                        Password Reset
+                      </span>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            
+            <!-- Content -->
+            <tr>
+              <td style="padding:18px 20px 8px; font-family:Arial, Helvetica, sans-serif;">
+                <div style="font-size:30px; line-height:38px; font-weight:800; color:#111827;">
+                  Reset your <span style="color:#6D28D9;">password</span>.
+                </div>
+                
+                <div style="margin-top:12px; font-size:16px; line-height:24px; color:#374151;">
+                  <p style="margin:0 0 16px;">Hi${data.firstName ? ' ' + data.firstName : ''},</p>
+                  <p style="margin:0 0 16px;">We received a request to reset the password for your Vocaid account. Click the button below to create a new password:</p>
+                </div>
+                
+                <!-- CTA Button -->
+                <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin:24px 0; border-collapse:separate;">
+                  <tr>
+                    <td align="center" bgcolor="#6D28D9" style="border-radius:12px;">
+                      <a href="${data.resetUrl}" style="display:inline-block; padding:14px 28px; font-family:Arial, Helvetica, sans-serif; font-size:16px; font-weight:800; color:#FFFFFF; background-color:#6D28D9; border-radius:12px; border:1px solid #6D28D9; text-decoration:none;">
+                        Reset Password
+                      </a>
+                    </td>
+                  </tr>
+                </table>
+                
+                <div style="font-size:14px; line-height:22px; color:#6B7280;">
+                  <p style="margin:0 0 12px;">Or copy and paste this link into your browser:</p>
+                  <p style="margin:0 0 16px; word-break:break-all;">
+                    <a href="${data.resetUrl}" style="color:#6D28D9; font-weight:600;">${data.resetUrl}</a>
+                  </p>
+                  <p style="margin:0 0 12px;"><strong>This link will expire in 1 hour.</strong></p>
+                  <p style="margin:0;">If you didn't request this password reset, you can safely ignore this email. Your password will remain unchanged.</p>
+                </div>
+              </td>
+            </tr>
+            
+            <!-- Divider -->
+            <tr>
+              <td style="padding:0 20px;">
+                <div style="height:1px; background-color:#E5E7EB; line-height:1px;">&nbsp;</div>
+              </td>
+            </tr>
+            
+            <!-- Footer -->
+            <tr>
+              <td style="padding:16px 20px 20px; font-family:Arial, Helvetica, sans-serif;">
+                <div style="font-size:12px; line-height:18px; color:#6B7280;">
+                  This is an automated security email. If you didn't request a password reset, please contact
+                  <a href="mailto:${data.supportEmail}" style="color:#6D28D9; font-weight:700;">${data.supportEmail}</a>.
+                </div>
+                <div style="margin-top:10px; font-size:12px; line-height:18px; color:#9CA3AF;">
+                  © ${new Date().getFullYear()} Vocaid. All rights reserved.
+                  &nbsp;•&nbsp;
+                  <a href="${data.privacyUrl}" style="color:#6D28D9;">Privacy</a>
+                  &nbsp;•&nbsp;
+                  <a href="${data.termsUrl}" style="color:#6D28D9;">Terms</a>
+                </div>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </center>
+</body>
+</html>
+    `,
+    text: (data) => `
+Reset your Vocaid password
+
+Hi${data.firstName ? ' ' + data.firstName : ''},
+
+We received a request to reset the password for your Vocaid account.
+
+Click here to reset your password: ${data.resetUrl}
+
+This link will expire in 1 hour.
+
+If you didn't request this password reset, you can safely ignore this email. Your password will remain unchanged.
+
+---
+© ${new Date().getFullYear()} Vocaid. All rights reserved.
+    `
+  },
+  pt: {
+    subject: 'Redefinir sua senha Vocaid',
+    html: (data) => `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin:0; padding:0; font-family:Arial, Helvetica, sans-serif; background-color:#FAFAFA;">
+  <div style="display:none;font-size:1px;color:#F7F5FF;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;">
+    Redefinir sua senha Vocaid - este link expira em 1 hora
+  </div>
+  
+  <center style="width:100%; background-color:#FAFAFA;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" align="center" style="width:100%; background-color:#FAFAFA; border-collapse:collapse; table-layout:fixed; margin:0 auto;">
+      <tr>
+        <td align="center" valign="top" style="padding:16px 0;">
+          <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" align="center" style="width:600px; max-width:600px; margin:0 auto; background-color:#FFFFFF; border-radius:18px; overflow:hidden; border-collapse:separate; box-shadow:0 10px 30px rgba(17,24,39,0.06);">
+            
+            <!-- Header -->
+            <tr>
+              <td style="background-color:#ffffff; padding:18px 20px; border-bottom:1px solid #E5E7EB;">
+                <table role="presentation" width="560" cellspacing="0" cellpadding="0" border="0" align="center" style="width:560px; max-width:560px; margin:0 auto; border-collapse:collapse;">
+                  <tr>
+                    <td align="left" style="vertical-align:middle;">
+                      <img src="https://resend-attachments.s3.amazonaws.com/6JI1baUnCt05bRK" width="140" alt="Vocaid" style="width:140px; height:auto; display:block;">
+                    </td>
+                    <td align="right" style="vertical-align:middle;">
+                      <span style="display:inline-block; padding:6px 10px; background-color:#9333EA; border:1px solid rgba(255,255,255,0.25); border-radius:999px; color:#ffffff; font-family:Arial, Helvetica, sans-serif; font-size:12px; font-weight:700;">
+                        Redefinir Senha
+                      </span>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            
+            <!-- Content -->
+            <tr>
+              <td style="padding:18px 20px 8px; font-family:Arial, Helvetica, sans-serif;">
+                <div style="font-size:30px; line-height:38px; font-weight:800; color:#111827;">
+                  Redefinir sua <span style="color:#6D28D9;">senha</span>.
+                </div>
+                
+                <div style="margin-top:12px; font-size:16px; line-height:24px; color:#374151;">
+                  <p style="margin:0 0 16px;">Olá${data.firstName ? ' ' + data.firstName : ''},</p>
+                  <p style="margin:0 0 16px;">Recebemos uma solicitação para redefinir a senha da sua conta Vocaid. Clique no botão abaixo para criar uma nova senha:</p>
+                </div>
+                
+                <!-- CTA Button -->
+                <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin:24px 0; border-collapse:separate;">
+                  <tr>
+                    <td align="center" bgcolor="#6D28D9" style="border-radius:12px;">
+                      <a href="${data.resetUrl}" style="display:inline-block; padding:14px 28px; font-family:Arial, Helvetica, sans-serif; font-size:16px; font-weight:800; color:#FFFFFF; background-color:#6D28D9; border-radius:12px; border:1px solid #6D28D9; text-decoration:none;">
+                        Redefinir Senha
+                      </a>
+                    </td>
+                  </tr>
+                </table>
+                
+                <div style="font-size:14px; line-height:22px; color:#6B7280;">
+                  <p style="margin:0 0 12px;">Ou copie e cole este link no seu navegador:</p>
+                  <p style="margin:0 0 16px; word-break:break-all;">
+                    <a href="${data.resetUrl}" style="color:#6D28D9; font-weight:600;">${data.resetUrl}</a>
+                  </p>
+                  <p style="margin:0 0 12px;"><strong>Este link expira em 1 hora.</strong></p>
+                  <p style="margin:0;">Se você não solicitou esta redefinição de senha, pode ignorar este email com segurança. Sua senha permanecerá inalterada.</p>
+                </div>
+              </td>
+            </tr>
+            
+            <!-- Divider -->
+            <tr>
+              <td style="padding:0 20px;">
+                <div style="height:1px; background-color:#E5E7EB; line-height:1px;">&nbsp;</div>
+              </td>
+            </tr>
+            
+            <!-- Footer -->
+            <tr>
+              <td style="padding:16px 20px 20px; font-family:Arial, Helvetica, sans-serif;">
+                <div style="font-size:12px; line-height:18px; color:#6B7280;">
+                  Este é um email automático de segurança. Se você não solicitou uma redefinição de senha, entre em contato com
+                  <a href="mailto:${data.supportEmail}" style="color:#6D28D9; font-weight:700;">${data.supportEmail}</a>.
+                </div>
+                <div style="margin-top:10px; font-size:12px; line-height:18px; color:#9CA3AF;">
+                  © ${new Date().getFullYear()} Vocaid. Todos os direitos reservados.
+                  &nbsp;•&nbsp;
+                  <a href="${data.privacyUrl}" style="color:#6D28D9;">Privacidade</a>
+                  &nbsp;•&nbsp;
+                  <a href="${data.termsUrl}" style="color:#6D28D9;">Termos</a>
+                </div>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </center>
+</body>
+</html>
+    `,
+    text: (data) => `
+Redefinir sua senha Vocaid
+
+Olá${data.firstName ? ' ' + data.firstName : ''},
+
+Recebemos uma solicitação para redefinir a senha da sua conta Vocaid.
+
+Clique aqui para redefinir sua senha: ${data.resetUrl}
+
+Este link expira em 1 hora.
+
+Se você não solicitou esta redefinição de senha, pode ignorar este email com segurança. Sua senha permanecerá inalterada.
+
+---
+© ${new Date().getFullYear()} Vocaid. Todos os direitos reservados.
+    `
+  }
+};
+
+/**
+ * Generate idempotency key for password reset email
+ */
+function generatePasswordResetIdempotencyKey(userId: string, tokenHash: string): string {
+  // Use first 16 chars of token hash for uniqueness
+  return `password_reset_${userId}_${tokenHash.substring(0, 16)}`;
+}
+
+/**
+ * Send password reset email
+ * NOT idempotent by design - each reset request should send a new email
+ * Does NOT require consent (security/account access email)
+ */
+export async function sendPasswordResetEmail(data: PasswordResetEmailData): Promise<EmailResult> {
+  const lang: TemplateLanguage = getLanguage(data.user.preferredLanguage);
+  
+  // Ensure FRONTEND_URL has proper scheme
+  let frontendUrl = FRONTEND_URL;
+  if (!frontendUrl.startsWith('http://') && !frontendUrl.startsWith('https://')) {
+    frontendUrl = process.env.NODE_ENV === 'production' ? `https://${frontendUrl}` : `http://${frontendUrl}`;
+  }
+  
+  // Use /auth/password-confirm path for password reset (matches frontend route)
+  const resetUrl = `${frontendUrl}/auth/password-confirm?token=${data.resetToken}`;
+  
+  emailLogger.info('Attempting to send password reset email', { 
+    userId: data.user.id, 
+    email: data.user.email 
+  });
+
+  // Create email record for audit (password reset doesn't use idempotency)
+  const emailRecord = await prisma.transactionalEmail.create({
+    data: {
+      userId: data.user.id,
+      toEmail: data.user.email,
+      emailType: 'PASSWORD_RESET',
+      status: 'PENDING',
+      provider: 'RESEND',
+      idempotencyKey: generatePasswordResetIdempotencyKey(data.user.id, data.resetToken),
+      language: lang,
+      payloadJson: {
+        expiresAt: data.expiresAt.toISOString(),
+        ipAddress: data.ipAddress,
+        userAgent: data.userAgent?.substring(0, 200),
+      }
+    }
+  });
+
+  // In dev/mock mode, log the reset URL for testing
+  if (process.env.NODE_ENV === 'development' || getEmailProviderMode() === 'mock') {
+    emailLogger.info('DEV MODE - Password reset URL (copy this):', { resetUrl });
+  }
+
+  const subject = lang === 'pt' ? 'Redefinir sua senha Vocaid' : 'Reset your Vocaid password';
+  const preheader = lang === 'pt'
+    ? 'Link de redefinição de senha (expira em 1 hora)'
+    : 'Password reset link (expires in 1 hour)';
+
+  const contentHtml = `
+    <p style="margin:0 0 12px; font-size:14px; color:#111827;">
+      ${lang === 'pt'
+        ? `Olá${data.user.firstName ? ` ${data.user.firstName}` : ''},`
+        : `Hi${data.user.firstName ? ` ${data.user.firstName}` : ''},`}
+    </p>
+    <p style="margin:0 0 12px; font-size:14px; color:#111827;">
+      ${lang === 'pt'
+        ? 'Recebemos uma solicitação para redefinir a senha da sua conta Vocaid.'
+        : 'We received a request to reset your Vocaid account password.'}
+    </p>
+    <p style="margin:0 0 16px; font-size:14px;">
+      <a href="${resetUrl}" style="color:#6D28D9; font-weight:700; text-decoration:none;">
+        ${lang === 'pt' ? 'Redefinir senha' : 'Reset password'}
+      </a>
+    </p>
+    <p style="margin:0; font-size:13px; color:#6B7280;">
+      ${lang === 'pt'
+        ? 'Este link expira em 1 hora. Se você não solicitou esta alteração, ignore este email.'
+        : "This link expires in 1 hour. If you didn't request this, you can safely ignore this email."}
+    </p>
+  `.trim();
+
+  const templateVariables = buildTransactionalTemplateVariables({
+    preheader,
+    subject,
+    reason: lang === 'pt' ? 'Segurança da conta' : 'Account security',
+    header: lang === 'pt' ? 'Redefinir' : 'Reset',
+    header_highlight: lang === 'pt' ? 'senha' : 'password',
+    content: contentHtml,
+  });
+
+  const sendResult = await sendTransactionalTemplateEmail({
+    to: data.user.email,
+    from: EMAIL_SENDERS.transactional,
+    templateVariables,
+  });
+
+  if (!sendResult.success) {
+    emailLogger.warn('Password reset email failed to send', { 
+      userId: data.user.id,
+      error: sendResult.error,
+    });
     
     await prisma.transactionalEmail.update({
       where: { id: emailRecord.id },
       data: {
         status: 'FAILED',
-        errorJson: { message: error.message }
+        errorJson: { message: sendResult.error || 'Unknown error' }
       }
     });
-
-    return { success: false, error: error.message, emailId: emailRecord.id };
+    
+    return { 
+      success: false, 
+      error: sendResult.error || 'Email send failed',
+      emailId: emailRecord.id 
+    };
   }
+
+  // Update record as SENT
+  await prisma.transactionalEmail.update({
+    where: { id: emailRecord.id },
+    data: {
+      status: 'SENT',
+      providerMessageId: sendResult.messageId || null,
+      sentAt: new Date()
+    }
+  });
+
+  emailLogger.info('Password reset email sent successfully', { 
+    userId: data.user.id, 
+    messageId: sendResult.messageId 
+  });
+
+  return { 
+    success: true, 
+    emailId: emailRecord.id,
+    messageId: sendResult.messageId 
+  };
+}
+
+// ========================================
+// EMAIL VERIFICATION EMAIL
+// ========================================
+
+export interface EmailVerificationData {
+  user: {
+    id: string;
+    email: string;
+    firstName?: string;
+    preferredLanguage?: string;
+  };
+  verificationCode: string;
+  expiresAt: Date;
+  ipAddress?: string;
+  userAgent?: string;
+}
+
+// Email verification templates
+const emailVerificationTemplates: Record<SupportedLanguage, {
+  subject: string;
+  html: (data: any) => string;
+  text: (data: any) => string;
+}> = {
+  en: {
+    subject: 'Verify your Vocaid email',
+    html: (data) => `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin:0; padding:0; font-family:Arial, Helvetica, sans-serif; background-color:#FAFAFA;">
+  <div style="display:none;font-size:1px;color:#F7F5FF;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;">
+    Verify your email to start practicing interviews with Vocaid
+  </div>
+  
+  <center style="width:100%; background-color:#FAFAFA;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" align="center" style="width:100%; background-color:#FAFAFA; border-collapse:collapse; table-layout:fixed; margin:0 auto;">
+      <tr>
+        <td align="center" valign="top" style="padding:16px 0;">
+          <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" align="center" style="width:600px; max-width:600px; margin:0 auto; background-color:#FFFFFF; border-radius:18px; overflow:hidden; border-collapse:separate; box-shadow:0 10px 30px rgba(17,24,39,0.06);">
+            
+            <!-- Header -->
+            <tr>
+              <td style="background-color:#ffffff; padding:18px 20px; border-bottom:1px solid #E5E7EB;">
+                <table role="presentation" width="560" cellspacing="0" cellpadding="0" border="0" align="center" style="width:560px; max-width:560px; margin:0 auto; border-collapse:collapse;">
+                  <tr>
+                    <td align="left" style="vertical-align:middle;">
+                      <img src="https://resend-attachments.s3.amazonaws.com/6JI1baUnCt05bRK" width="140" alt="Vocaid" style="width:140px; height:auto; display:block;">
+                    </td>
+                    <td align="right" style="vertical-align:middle;">
+                      <span style="display:inline-block; padding:6px 10px; background-color:#9333EA; border:1px solid rgba(255,255,255,0.25); border-radius:999px; color:#ffffff; font-family:Arial, Helvetica, sans-serif; font-size:12px; font-weight:700;">
+                        Email Verification
+                      </span>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            
+            <!-- Content -->
+            <tr>
+              <td style="padding:18px 20px 8px; font-family:Arial, Helvetica, sans-serif;">
+                <div style="font-size:30px; line-height:38px; font-weight:800; color:#111827;">
+                  Verify your <span style="color:#6D28D9;">email</span>.
+                </div>
+                
+                <div style="margin-top:12px; font-size:16px; line-height:24px; color:#374151;">
+                  <p style="margin:0 0 16px;">Hi${data.firstName ? ' ' + data.firstName : ''},</p>
+                  <p style="margin:0 0 16px;">Welcome to Vocaid! Enter this verification code to activate your account:</p>
+                </div>
+
+                <div style="margin:0 0 8px; padding:14px 16px; border:1px solid #E5E7EB; border-radius:12px; background-color:#F9FAFB; font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:22px; font-weight:800; letter-spacing:0.25em; color:#111827; text-align:center;">
+                  ${data.verificationCode}
+                </div>
+                
+                <!-- CTA Button -->
+                <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin:24px 0; border-collapse:separate;">
+                  <tr>
+                    <td align="center" bgcolor="#6D28D9" style="border-radius:12px;">
+                      <a href="${data.verifyUrl}" style="display:inline-block; padding:14px 28px; font-family:Arial, Helvetica, sans-serif; font-size:16px; font-weight:800; color:#FFFFFF; background-color:#6D28D9; border-radius:12px; border:1px solid #6D28D9; text-decoration:none;">
+                        Enter Code
+                      </a>
+                    </td>
+                  </tr>
+                </table>
+                
+                <div style="font-size:14px; line-height:22px; color:#6B7280;">
+                  <p style="margin:0 0 12px;">Or copy and paste this link into your browser:</p>
+                  <p style="margin:0 0 16px; word-break:break-all;">
+                    <a href="${data.verifyUrl}" style="color:#6D28D9; font-weight:600;">${data.verifyUrl}</a>
+                  </p>
+                  <p style="margin:0 0 12px;"><strong>This code will expire in 24 hours.</strong></p>
+                  <p style="margin:0;">If you didn't create a Vocaid account, you can safely ignore this email.</p>
+                </div>
+              </td>
+            </tr>
+            
+            <!-- Divider -->
+            <tr>
+              <td style="padding:0 20px;">
+                <div style="height:1px; background-color:#E5E7EB; line-height:1px;">&nbsp;</div>
+              </td>
+            </tr>
+            
+            <!-- Footer -->
+            <tr>
+              <td style="padding:16px 20px 20px; font-family:Arial, Helvetica, sans-serif;">
+                <div style="font-size:12px; line-height:18px; color:#6B7280;">
+                  Need help? Contact us at
+                  <a href="mailto:${data.supportEmail}" style="color:#6D28D9; font-weight:700;">${data.supportEmail}</a>.
+                </div>
+                <div style="margin-top:10px; font-size:12px; line-height:18px; color:#9CA3AF;">
+                  © ${new Date().getFullYear()} Vocaid. All rights reserved.
+                  &nbsp;•&nbsp;
+                  <a href="${data.privacyUrl}" style="color:#6D28D9;">Privacy</a>
+                  &nbsp;•&nbsp;
+                  <a href="${data.termsUrl}" style="color:#6D28D9;">Terms</a>
+                </div>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </center>
+</body>
+</html>
+    `,
+    text: (data) => `
+Verify your Vocaid email
+
+Hi${data.firstName ? ' ' + data.firstName : ''},
+
+Welcome to Vocaid! Please verify your email address to activate your account and start practicing interviews with our AI coach.
+
+Your verification code: ${data.verificationCode}
+
+Verification page: ${data.verifyUrl}
+
+This code will expire in 24 hours.
+
+If you didn't create a Vocaid account, you can safely ignore this email.
+
+---
+© ${new Date().getFullYear()} Vocaid. All rights reserved.
+    `
+  },
+  pt: {
+    subject: 'Verifique seu email Vocaid',
+    html: (data) => `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body style="margin:0; padding:0; font-family:Arial, Helvetica, sans-serif; background-color:#FAFAFA;">
+  <div style="display:none;font-size:1px;color:#F7F5FF;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;">
+    Verifique seu email para começar a praticar entrevistas com o Vocaid
+  </div>
+  
+  <center style="width:100%; background-color:#FAFAFA;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" align="center" style="width:100%; background-color:#FAFAFA; border-collapse:collapse; table-layout:fixed; margin:0 auto;">
+      <tr>
+        <td align="center" valign="top" style="padding:16px 0;">
+          <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" align="center" style="width:600px; max-width:600px; margin:0 auto; background-color:#FFFFFF; border-radius:18px; overflow:hidden; border-collapse:separate; box-shadow:0 10px 30px rgba(17,24,39,0.06);">
+            
+            <!-- Header -->
+            <tr>
+              <td style="background-color:#ffffff; padding:18px 20px; border-bottom:1px solid #E5E7EB;">
+                <table role="presentation" width="560" cellspacing="0" cellpadding="0" border="0" align="center" style="width:560px; max-width:560px; margin:0 auto; border-collapse:collapse;">
+                  <tr>
+                    <td align="left" style="vertical-align:middle;">
+                      <img src="https://resend-attachments.s3.amazonaws.com/6JI1baUnCt05bRK" width="140" alt="Vocaid" style="width:140px; height:auto; display:block;">
+                    </td>
+                    <td align="right" style="vertical-align:middle;">
+                      <span style="display:inline-block; padding:6px 10px; background-color:#10B981; border:1px solid rgba(255,255,255,0.25); border-radius:999px; color:#ffffff; font-family:Arial, Helvetica, sans-serif; font-size:12px; font-weight:700;">
+                        Verificação de Email
+                      </span>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            
+            <!-- Content -->
+            <tr>
+              <td style="padding:18px 20px 8px; font-family:Arial, Helvetica, sans-serif;">
+                <div style="font-size:30px; line-height:38px; font-weight:800; color:#111827;">
+                  Verifique seu <span style="color:#6D28D9;">email</span>.
+                </div>
+                
+                <div style="margin-top:12px; font-size:16px; line-height:24px; color:#374151;">
+                  <p style="margin:0 0 16px;">Olá${data.firstName ? ' ' + data.firstName : ''},</p>
+                  <p style="margin:0 0 16px;">Bem-vindo ao Vocaid! Use este código de verificação para ativar sua conta:</p>
+                </div>
+
+                <div style="margin:0 0 8px; padding:14px 16px; border:1px solid #E5E7EB; border-radius:12px; background-color:#F9FAFB; font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:22px; font-weight:800; letter-spacing:0.25em; color:#111827; text-align:center;">
+                  ${data.verificationCode}
+                </div>
+                
+                <!-- CTA Button -->
+                <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin:24px 0; border-collapse:separate;">
+                  <tr>
+                    <td align="center" bgcolor="#6D28D9" style="border-radius:12px;">
+                      <a href="${data.verifyUrl}" style="display:inline-block; padding:14px 28px; font-family:Arial, Helvetica, sans-serif; font-size:16px; font-weight:800; color:#FFFFFF; background-color:#6D28D9; border-radius:12px; border:1px solid #6D28D9; text-decoration:none;">
+                        Inserir Código
+                      </a>
+                    </td>
+                  </tr>
+                </table>
+                
+                <div style="font-size:14px; line-height:22px; color:#6B7280;">
+                  <p style="margin:0 0 12px;">Ou copie e cole este link no seu navegador:</p>
+                  <p style="margin:0 0 16px; word-break:break-all;">
+                    <a href="${data.verifyUrl}" style="color:#6D28D9; font-weight:600;">${data.verifyUrl}</a>
+                  </p>
+                  <p style="margin:0 0 12px;"><strong>Este código expira em 24 horas.</strong></p>
+                  <p style="margin:0;">Se você não criou uma conta Vocaid, pode ignorar este email com segurança.</p>
+                </div>
+              </td>
+            </tr>
+            
+            <!-- Divider -->
+            <tr>
+              <td style="padding:0 20px;">
+                <div style="height:1px; background-color:#E5E7EB; line-height:1px;">&nbsp;</div>
+              </td>
+            </tr>
+            
+            <!-- Footer -->
+            <tr>
+              <td style="padding:16px 20px 20px; font-family:Arial, Helvetica, sans-serif;">
+                <div style="font-size:12px; line-height:18px; color:#6B7280;">
+                  Precisa de ajuda? Entre em contato conosco em
+                  <a href="mailto:${data.supportEmail}" style="color:#6D28D9; font-weight:700;">${data.supportEmail}</a>.
+                </div>
+                <div style="margin-top:10px; font-size:12px; line-height:18px; color:#9CA3AF;">
+                  © ${new Date().getFullYear()} Vocaid. Todos os direitos reservados.
+                  &nbsp;•&nbsp;
+                  <a href="${data.privacyUrl}" style="color:#6D28D9;">Privacidade</a>
+                  &nbsp;•&nbsp;
+                  <a href="${data.termsUrl}" style="color:#6D28D9;">Termos</a>
+                </div>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </center>
+</body>
+</html>
+    `,
+    text: (data) => `
+Verifique seu email Vocaid
+
+Olá${data.firstName ? ' ' + data.firstName : ''},
+
+Bem-vindo ao Vocaid! Por favor, verifique seu endereço de email para ativar sua conta e começar a praticar entrevistas com nosso coach de IA.
+
+Seu código de verificação: ${data.verificationCode}
+
+Página de verificação: ${data.verifyUrl}
+
+Este código expira em 24 horas.
+
+Se você não criou uma conta Vocaid, pode ignorar este email com segurança.
+
+---
+© ${new Date().getFullYear()} Vocaid. Todos os direitos reservados.
+    `
+  }
+};
+
+/**
+ * Generate idempotency key for email verification
+ */
+function generateEmailVerificationIdempotencyKey(userId: string, tokenHash: string): string {
+  return `email_verify_${userId}_${tokenHash.substring(0, 16)}`;
+}
+
+/**
+ * Send email verification email
+ * Does NOT require consent (account security email)
+ */
+export async function sendEmailVerificationEmail(data: EmailVerificationData): Promise<EmailResult> {
+  const lang = getLanguage(data.user.preferredLanguage);
+  
+  // Ensure FRONTEND_URL has proper scheme
+  let frontendUrl = FRONTEND_URL;
+  if (!frontendUrl.startsWith('http://') && !frontendUrl.startsWith('https://')) {
+    frontendUrl = process.env.NODE_ENV === 'production' ? `https://${frontendUrl}` : `http://${frontendUrl}`;
+  }
+  
+  // Use /auth/verify-email path for email verification (code-based)
+  const verifyUrl = `${frontendUrl}/auth/verify-email?email=${encodeURIComponent(data.user.email)}`;
+  
+  emailLogger.info('Attempting to send email verification email', { 
+    userId: data.user.id, 
+    email: data.user.email 
+  });
+
+  // Create email record for audit
+  const tokenHash = require('crypto')
+    .createHash('sha256')
+    .update(`${data.user.id}:${data.verificationCode}`)
+    .digest('hex');
+  const emailRecord = await prisma.transactionalEmail.create({
+    data: {
+      userId: data.user.id,
+      toEmail: data.user.email,
+      emailType: 'EMAIL_VERIFICATION',
+      status: 'PENDING',
+      provider: 'RESEND',
+      idempotencyKey: generateEmailVerificationIdempotencyKey(data.user.id, tokenHash),
+      language: lang,
+      payloadJson: {
+        expiresAt: data.expiresAt.toISOString(),
+        ipAddress: data.ipAddress,
+        userAgent: data.userAgent?.substring(0, 200),
+      }
+    }
+  });
+
+  // In dev/mock mode, log the verification code for testing
+  if (process.env.NODE_ENV === 'development' || getEmailProviderMode() === 'mock') {
+    emailLogger.info('DEV MODE - Email verification code:', { code: data.verificationCode, verifyUrl });
+  }
+
+  const subject = lang === 'pt' ? 'Verifique seu email Vocaid' : 'Verify your Vocaid email';
+  const preheader = lang === 'pt'
+    ? 'Use o código para ativar sua conta.'
+    : 'Use the code to activate your account.';
+
+  const contentHtml = `
+    <p style="margin:0 0 12px; font-size:14px; color:#111827;">
+      ${lang === 'pt'
+        ? `Olá${data.user.firstName ? ` ${data.user.firstName}` : ''},`
+        : `Hi${data.user.firstName ? ` ${data.user.firstName}` : ''},`}
+    </p>
+    <p style="margin:0 0 12px; font-size:14px; color:#111827;">
+      ${lang === 'pt'
+        ? 'Bem-vindo ao Vocaid! Use este código para verificar seu email:'
+        : 'Welcome to Vocaid! Use this code to verify your email:'}
+    </p>
+    <p style="margin:0 0 16px; font-size:22px; font-weight:800; letter-spacing:0.2em; color:#111827;">
+      ${data.verificationCode}
+    </p>
+    <p style="margin:0; font-size:13px; color:#6B7280;">
+      <a href="${verifyUrl}" style="color:#6D28D9; font-weight:700; text-decoration:none;">
+        ${lang === 'pt' ? 'Abrir página de verificação' : 'Open verification page'}
+      </a>
+    </p>
+  `.trim();
+
+  const templateVariables = buildTransactionalTemplateVariables({
+    preheader,
+    subject,
+    reason: lang === 'pt' ? 'Verificação de email' : 'Email verification',
+    header: lang === 'pt' ? 'Verifique' : 'Verify',
+    header_highlight: lang === 'pt' ? 'email' : 'email',
+    content: contentHtml,
+  });
+
+  const sendResult = await sendTransactionalTemplateEmail({
+    to: data.user.email,
+    from: EMAIL_SENDERS.transactional,
+    templateVariables,
+  });
+
+  if (!sendResult.success) {
+    emailLogger.warn('Email verification email failed to send', { 
+      userId: data.user.id,
+      error: sendResult.error,
+    });
+    
+    await prisma.transactionalEmail.update({
+      where: { id: emailRecord.id },
+      data: {
+        status: 'FAILED',
+        errorJson: { message: sendResult.error || 'Unknown error' }
+      }
+    });
+    
+    return { 
+      success: false, 
+      error: sendResult.error || 'Email send failed',
+      emailId: emailRecord.id 
+    };
+  }
+
+  // Update record as SENT
+  await prisma.transactionalEmail.update({
+    where: { id: emailRecord.id },
+    data: {
+      status: 'SENT',
+      providerMessageId: sendResult.messageId || null,
+      sentAt: new Date()
+    }
+  });
+
+  emailLogger.info('Email verification email sent successfully', { 
+    userId: data.user.id, 
+    messageId: sendResult.messageId 
+  });
+
+  return { 
+    success: true, 
+    emailId: emailRecord.id,
+    messageId: sendResult.messageId 
+  };
 }
 
 // ========================================
 // EMAIL PREVIEW FUNCTIONS (For Testing)
 // ========================================
 
-export type PreviewableEmailType = 'welcome' | 'purchase' | 'low-credits' | 'interview-reminder' | 'interview-complete';
+export type PreviewableEmailType = 'welcome' | 'purchase' | 'low-credits' | 'interview-complete';
 
 /**
  * Generate a preview of an email template (for admin testing)
@@ -2403,12 +3264,6 @@ export function previewEmail(
         html: lowCreditsTemplates[language].html(data),
         text: lowCreditsTemplates[language].text(data)
       };
-    case 'interview-reminder':
-      return {
-        subject: interviewReminderTemplates[language].subject,
-        html: interviewReminderTemplates[language].html(data),
-        text: interviewReminderTemplates[language].text(data)
-      };
     case 'interview-complete':
       return {
         subject: interviewCompleteTemplates[language].subject,
@@ -2432,7 +3287,6 @@ export function getAvailableEmailTypes(): Array<{
     { type: 'welcome', name: 'Welcome Email', description: 'Sent when a new user registers' },
     { type: 'purchase', name: 'Purchase Receipt', description: 'Sent after successful credit purchase' },
     { type: 'low-credits', name: 'Low Credits Warning', description: 'Sent when credits fall below threshold' },
-    { type: 'interview-reminder', name: 'Interview Reminder', description: 'Sent to remind users about pending interviews' },
     { type: 'interview-complete', name: 'Interview Complete', description: 'Sent after completing an interview with results' }
   ];
 }

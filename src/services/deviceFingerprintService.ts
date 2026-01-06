@@ -264,6 +264,11 @@ export function analyzeFingerprint(fingerprint: DeviceFingerprint): DeviceValida
 // DATABASE OPERATIONS
 // ========================================
 
+// In-memory linkage (canonical schema has no signupRecord table).
+const userToVisitorId = new Map<string, string>();
+const visitorToUsers = new Map<string, Set<string>>();
+const blockedVisitors = new Map<string, { reason: string; blockedBy: string; blockedAt: Date }>();
+
 /**
  * Store or update device fingerprint for a user
  */
@@ -274,7 +279,7 @@ export async function storeDeviceFingerprint(
   try {
     // Get user's internal ID
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { id: true }
     });
     
@@ -282,29 +287,26 @@ export async function storeDeviceFingerprint(
       deviceLogger.error('User not found for fingerprint storage', { userId });
       return { success: false, isNewDevice: false, linkedAccounts: 0 };
     }
-    
-    // Check how many accounts are linked to this device
-    const existingRecords = await prisma.signupRecord.findMany({
-      where: { deviceFingerprint: fingerprint.visitorId },
-      select: { userId: true }
-    });
-    
-    const linkedAccounts = existingRecords.length;
-    const isNewDevice = linkedAccounts === 0;
-    
-    // Update signup record with device fingerprint
-    await prisma.signupRecord.upsert({
-      where: { userId: user.id },
-      update: {
-        deviceFingerprint: fingerprint.visitorId,
-        userAgent: `${fingerprint.browserName || ''} ${fingerprint.browserVersion || ''} on ${fingerprint.os || ''}`.trim()
-      },
-      create: {
-        userId: user.id,
-        deviceFingerprint: fingerprint.visitorId,
-        userAgent: `${fingerprint.browserName || ''} ${fingerprint.browserVersion || ''} on ${fingerprint.os || ''}`.trim()
-      }
-    });
+
+    const visitorId = fingerprint.visitorId;
+
+    // Remove any previous mapping for this user
+    const previousVisitorId = userToVisitorId.get(user.id);
+    if (previousVisitorId && previousVisitorId !== visitorId) {
+      const prevSet = visitorToUsers.get(previousVisitorId);
+      prevSet?.delete(user.id);
+      if (prevSet && prevSet.size === 0) visitorToUsers.delete(previousVisitorId);
+    }
+
+    // Link user -> visitorId
+    userToVisitorId.set(user.id, visitorId);
+    const users = visitorToUsers.get(visitorId) ?? new Set<string>();
+    const wasEmpty = users.size === 0;
+    users.add(user.id);
+    visitorToUsers.set(visitorId, users);
+
+    const linkedAccounts = users.size;
+    const isNewDevice = wasEmpty;
     
     deviceLogger.info('Device fingerprint stored', { 
       userId, 
@@ -328,24 +330,17 @@ export async function checkDeviceAccountLimit(
   excludeUserId?: string
 ): Promise<{ exceeds: boolean; count: number; limit: number }> {
   try {
-    const whereClause: any = {
-      deviceFingerprint: fingerprint.visitorId
-    };
-    
-    if (excludeUserId) {
-      const user = await prisma.user.findUnique({
-        where: { clerkId: excludeUserId },
-        select: { id: true }
-      });
-      
-      if (user) {
-        whereClause.NOT = { userId: user.id };
-      }
+    const visitorId = fingerprint.visitorId;
+    const users = visitorToUsers.get(visitorId);
+    if (!users) {
+      return { exceeds: false, count: 0, limit: MAX_ACCOUNTS_PER_DEVICE };
     }
-    
-    const count = await prisma.signupRecord.count({
-      where: whereClause
-    });
+
+    let count = users.size;
+    if (excludeUserId) {
+      // excludeUserId refers to User.id, which is already the primary id.
+      if (users.has(excludeUserId)) count = Math.max(0, count - 1);
+    }
     
     return {
       exceeds: count >= MAX_ACCOUNTS_PER_DEVICE,
@@ -363,19 +358,13 @@ export async function checkDeviceAccountLimit(
  */
 export async function getLinkedAccounts(visitorId: string): Promise<DeviceLinkResult> {
   try {
-    const records = await prisma.signupRecord.findMany({
-      where: { deviceFingerprint: visitorId },
-      select: { 
-        user: { 
-          select: { clerkId: true, email: true } 
-        } 
-      }
-    });
-    
+    const users = visitorToUsers.get(visitorId);
+    const accountIds = users ? Array.from(users) : [];
+
     return {
-      linkedAccounts: records.length,
-      accountIds: records.map(r => r.user.clerkId),
-      isNewDevice: records.length === 0
+      linkedAccounts: accountIds.length,
+      accountIds,
+      isNewDevice: accountIds.length === 0
     };
   } catch (error: any) {
     deviceLogger.error('Failed to get linked accounts', { error: error.message });
@@ -392,15 +381,7 @@ export async function blockDevice(
   blockedBy: string
 ): Promise<boolean> {
   try {
-    // Mark all signup records with this device as suspicious
-    await prisma.signupRecord.updateMany({
-      where: { deviceFingerprint: visitorId },
-      data: {
-        isSuspicious: true,
-        suspicionReason: reason,
-        creditTier: 'blocked'
-      }
-    });
+    blockedVisitors.set(visitorId, { reason, blockedBy, blockedAt: new Date() });
     
     deviceLogger.info('Device blocked', { 
       visitorId: visitorId.slice(0, 8) + '...', 
@@ -420,14 +401,7 @@ export async function blockDevice(
  */
 export async function isDeviceBlocked(visitorId: string): Promise<boolean> {
   try {
-    const blockedRecord = await prisma.signupRecord.findFirst({
-      where: {
-        deviceFingerprint: visitorId,
-        creditTier: 'blocked'
-      }
-    });
-    
-    return blockedRecord !== null;
+    return blockedVisitors.has(visitorId);
   } catch (error: any) {
     deviceLogger.error('Failed to check device block status', { error: error.message });
     return false;

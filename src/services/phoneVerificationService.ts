@@ -17,6 +17,7 @@
 
 import logger from '../utils/logger';
 import { PrismaClient } from '@prisma/client';
+import redisService from './azureRedisService';
 
 const prisma = new PrismaClient();
 
@@ -70,28 +71,56 @@ const OTP_EXPIRY_MINUTES = 10;
 const otpRequestCounts = new Map<string, { count: number; resetTime: number }>();
 const verificationAttempts = new Map<string, { count: number; lastAttempt: number }>();
 
+const PHONE_SKIP_FOR_CREDITS_KEY = (userId: string) => `phone:skip_for_credits:${userId}`;
+const PHONE_SKIP_FOR_CREDITS_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+
 // Twilio client (lazy-loaded)
 let twilioClient: any = null;
 let twilioInitialized = false;
 
+/**
+ * Initialize Twilio client with API Key auth (required).
+ * 
+ * Required env vars:
+ *   - TWILIO_ACCOUNT_SID: Twilio Account SID (starts with AC)
+ *   - TWILIO_API_SID: API Key SID (starts with SK)
+ *   - TWILIO_API_SECRET: API Key Secret
+ *   - TWILIO_VERIFY_SERVICE_SID: Verify Service SID (starts with VA)
+ * 
+ * Note: TWILIO_AUTH_TOKEN is deprecated and no longer used.
+ */
 function getTwilioClient(): any {
   if (twilioInitialized) return twilioClient;
   
   twilioInitialized = true;
-  const accountSid = process.env.TWILIO_ACCOUNT_SID;
-  const authToken = process.env.TWILIO_AUTH_TOKEN;
   
-  if (accountSid && authToken) {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const apiKeySid = process.env.TWILIO_API_SID;
+  const apiKeySecret = process.env.TWILIO_API_SECRET;
+  
+  // Require API Key auth (more secure, revocable)
+  if (accountSid && apiKeySid && apiKeySecret) {
     try {
       const twilio = require('twilio');
-      twilioClient = twilio(accountSid, authToken);
-      phoneLogger.info('Twilio client initialized');
+      twilioClient = twilio(apiKeySid, apiKeySecret, { accountSid });
+      phoneLogger.info('Twilio client initialized with API Key auth');
     } catch (error: any) {
-      phoneLogger.error('Failed to initialize Twilio', { error: error.message });
+      phoneLogger.error('Failed to initialize Twilio with API Key', { error: error.message });
       twilioClient = null;
     }
-  } else {
-    phoneLogger.warn('TWILIO credentials not set - SMS verification will be simulated');
+  } 
+  // Missing credentials
+  else {
+    const missing = [];
+    if (!accountSid) missing.push('TWILIO_ACCOUNT_SID');
+    if (!apiKeySid) missing.push('TWILIO_API_SID');
+    if (!apiKeySecret) missing.push('TWILIO_API_SECRET');
+    
+    if (process.env.NODE_ENV === 'production') {
+      phoneLogger.error('Twilio API Key credentials missing - phone verification disabled', { missing });
+    } else {
+      phoneLogger.warn('Twilio API Key credentials not set - SMS verification will be simulated', { missing });
+    }
   }
   
   return twilioClient;
@@ -172,21 +201,23 @@ export function formatPhoneNumber(phoneNumber: string, defaultCountryCode: strin
 
 /**
  * Check if a phone number is already registered
+ * 
+ * Checks User table for existing verified phone (phone stored only after OTP verification)
  */
 export async function checkPhoneUniqueness(phoneNumber: string): Promise<boolean> {
   try {
     const formatted = formatPhoneNumber(phoneNumber);
     if (!formatted.isValid) return false;
     
-    // Check in SignupRecord for existing verified phone
-    const existingRecord = await prisma.signupRecord.findFirst({
+    // Check in User table for existing verified phone
+    const existingUser = await prisma.user.findFirst({
       where: {
         phoneNumber: formatted.formattedNumber,
         phoneVerified: true
       }
     });
     
-    return existingRecord === null;
+    return existingUser === null;
   } catch (error: any) {
     phoneLogger.error('Error checking phone uniqueness', { error: error.message });
     return false;
@@ -348,17 +379,42 @@ export async function sendOTP(
       remainingAttempts: rateCheck.remainingAttempts
     };
   } catch (error: any) {
-    phoneLogger.error('Failed to send OTP', { error: error.message });
+    phoneLogger.error('Failed to send OTP', { 
+      error: error.message, 
+      code: error.code,
+      moreInfo: error.moreInfo 
+    });
     
-    // Handle specific Twilio errors
+    // Handle specific Twilio Verify errors
+    // See: https://www.twilio.com/docs/verify/api/verification#verify-error-codes
+    
+    // 60200: Invalid phone number format
     if (error.code === 60200) {
-      return { success: false, error: 'Invalid phone number' };
+      return { success: false, error: 'Invalid phone number format' };
     }
+    
+    // 60203: Max attempts reached for this phone
     if (error.code === 60203) {
       return { success: false, error: 'Maximum send attempts reached. Please try again later.', rateLimited: true };
     }
     
-    return { success: false, error: 'Failed to send verification code' };
+    // 60205: SMS not supported for this phone (landline/VoIP)
+    if (error.code === 60205) {
+      return { success: false, error: 'This phone number cannot receive SMS. Please use a mobile number.' };
+    }
+    
+    // 60212: Invalid destination (carrier rejection)
+    if (error.code === 60212) {
+      return { success: false, error: 'This phone number cannot receive verification codes.' };
+    }
+    
+    // 60410: Verification delivery attempt blocked (fraud prevention)
+    if (error.code === 60410) {
+      return { success: false, error: 'Verification temporarily blocked. Please try again later.' };
+    }
+    
+    // Generic fallback
+    return { success: false, error: 'Failed to send verification code. Please try a different number.' };
   }
 }
 
@@ -489,37 +545,35 @@ export async function verifyOTP(
 
 /**
  * Mark a user's phone number as verified
+ * 
+ * IMPORTANT: Phone number is stored on User table ONLY after successful OTP verification.
+ * This prevents phone number "reservation" before actual verification.
  */
 async function markPhoneAsVerified(userId: string, phoneNumber: string): Promise<void> {
   try {
-    // First get the user to find their SignupRecord
-    const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
-      select: { id: true }
-    });
-    
-    if (!user) {
-      phoneLogger.error('User not found for phone verification', { userId });
-      return;
-    }
-    
-    // Update or create SignupRecord with phone verification
-    await prisma.signupRecord.upsert({
-      where: { userId: user.id },
-      update: {
-        phoneNumber,
-        phoneVerified: true,
-        phoneVerifiedAt: new Date()
-      },
-      create: {
-        userId: user.id,
+    // Update User directly with phone verification data
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: {
         phoneNumber,
         phoneVerified: true,
         phoneVerifiedAt: new Date()
       }
     });
     
-    phoneLogger.info('Phone marked as verified', { userId, phoneNumber: phoneNumber.slice(0, -4) + '****' });
+    if (!updatedUser) {
+      phoneLogger.error('User not found for phone verification', { userId });
+      return;
+    }
+    
+    phoneLogger.info('Phone marked as verified on User', { 
+      userId, 
+      phoneNumber: phoneNumber.slice(0, -4) + '****',
+      userDbId: updatedUser.id
+    });
+
+    // If user verifies later, clear the "skipped" preference.
+    await redisService.del(PHONE_SKIP_FOR_CREDITS_KEY(userId));
   } catch (error: any) {
     phoneLogger.error('Failed to mark phone as verified', { error: error.message, userId });
   }
@@ -527,58 +581,92 @@ async function markPhoneAsVerified(userId: string, phoneNumber: string): Promise
 
 /**
  * Get user's phone verification status
+ * 
+ * Reads from User table (phone data stored after OTP verification)
  */
 export async function getPhoneVerificationStatus(userId: string): Promise<{
   hasPhone: boolean;
   isVerified: boolean;
+  phoneCreditsGranted: boolean;
+  phoneVerificationSkippedForCredits: boolean;
   phoneNumber?: string;
   verifiedAt?: Date;
 }> {
   try {
+    const skip = await redisService.get<{ skipped: boolean; skippedAt: string }>(
+      PHONE_SKIP_FOR_CREDITS_KEY(userId)
+    );
+
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { 
-        id: true,
-        signupRecord: {
-          select: {
-            phoneNumber: true,
-            phoneVerified: true,
-            phoneVerifiedAt: true
-          }
-        }
+        phoneNumber: true,
+        phoneVerified: true,
+        phoneVerifiedAt: true
       }
     });
     
-    if (!user || !user.signupRecord) {
-      return { hasPhone: false, isVerified: false };
+    if (!user) {
+      return { hasPhone: false, isVerified: false, phoneCreditsGranted: false, phoneVerificationSkippedForCredits: false };
     }
     
     return {
-      hasPhone: !!user.signupRecord.phoneNumber,
-      isVerified: user.signupRecord.phoneVerified || false,
-      phoneNumber: user.signupRecord.phoneNumber ? user.signupRecord.phoneNumber.slice(0, -4) + '****' : undefined,
-      verifiedAt: user.signupRecord.phoneVerifiedAt || undefined
+      hasPhone: !!user.phoneNumber,
+      isVerified: user.phoneVerified || false,
+      // Canonical schema does not track phone-credit flags in UserConsent.
+      phoneCreditsGranted: false,
+      phoneVerificationSkippedForCredits: (skip?.skipped === true) && user.phoneVerified !== true,
+      phoneNumber: user.phoneNumber ? user.phoneNumber.slice(0, -4) + '****' : undefined,
+      verifiedAt: user.phoneVerifiedAt || undefined
     };
   } catch (error: any) {
     phoneLogger.error('Failed to get phone verification status', { error: error.message });
-    return { hasPhone: false, isVerified: false };
+    return { hasPhone: false, isVerified: false, phoneCreditsGranted: false, phoneVerificationSkippedForCredits: false };
+  }
+}
+
+/**
+ * Mark that user skipped phone verification for credits during onboarding
+ * 
+ * This is stored in UserConsent and used for dashboard CTA targeting
+ */
+export async function skipPhoneVerificationForCredits(userId: string): Promise<boolean> {
+  try {
+    await redisService.set(
+      PHONE_SKIP_FOR_CREDITS_KEY(userId),
+      { skipped: true, skippedAt: new Date().toISOString() },
+      PHONE_SKIP_FOR_CREDITS_TTL_SECONDS
+    );
+
+    phoneLogger.info('Phone verification skipped for credits (cached)', { userId });
+    return true;
+  } catch (error: any) {
+    phoneLogger.error('Failed to mark phone verification as skipped', { error: error.message });
+    return false;
+  }
+}
+
+/**
+ * Clear the skip flag (called when user successfully verifies phone)
+ */
+export async function clearPhoneVerificationSkip(userId: string): Promise<void> {
+  try {
+    await redisService.del(PHONE_SKIP_FOR_CREDITS_KEY(userId));
+    phoneLogger.info('Phone verification skip flag cleared (cached)', { userId });
+  } catch (error: any) {
+    phoneLogger.warn('Failed to clear phone verification skip flag', { error: error.message });
   }
 }
 
 /**
  * Remove phone verification (for admin or user request)
+ * 
+ * Clears phone data from User table
  */
 export async function removePhoneVerification(userId: string): Promise<boolean> {
   try {
-    const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
-      select: { id: true }
-    });
-    
-    if (!user) return false;
-    
-    await prisma.signupRecord.update({
-      where: { userId: user.id },
+    await prisma.user.update({
+      where: { id: userId },
       data: {
         phoneNumber: null,
         phoneVerified: false,
@@ -586,7 +674,7 @@ export async function removePhoneVerification(userId: string): Promise<boolean> 
       }
     });
     
-    phoneLogger.info('Phone verification removed', { userId });
+    phoneLogger.info('Phone verification removed from User', { userId });
     return true;
   } catch (error: any) {
     phoneLogger.error('Failed to remove phone verification', { error: error.message });
@@ -599,58 +687,34 @@ export async function removePhoneVerification(userId: string): Promise<boolean> 
 // ========================================
 
 /**
- * Check if a phone number is blocked or suspicious
+ * Check if a phone number is blocked.
+ * 
+ * NOTE: Internal blocklist is disabled. VoIP/carrier detection is delegated
+ * to Twilio Verify, which will reject undeliverable numbers during send.
+ * This function always returns false to avoid false positives.
+ * 
+ * If you need blocklisting in the future:
+ * 1. Add a BlockedPhone model to Prisma schema
+ * 2. Re-implement the DB lookup here
  */
-export async function isPhoneBlocked(phoneNumber: string): Promise<boolean> {
-  const formatted = formatPhoneNumber(phoneNumber);
-  if (!formatted.isValid) return true;
-  
-  // Check for VoIP/virtual numbers (basic heuristic)
-  // In production, use a carrier lookup service like Twilio Lookup
-  const voipPrefixes = [
-    '+1200', '+1201', '+1202', // Known VoIP ranges (simplified)
-  ];
-  
-  // Check blocklist in database
-  try {
-    const blockedPhone = await prisma.blockedPhone?.findFirst({
-      where: { phoneNumber: formatted.formattedNumber }
-    });
-    
-    return blockedPhone !== null;
-  } catch {
-    // Table might not exist yet
-    return false;
-  }
+export async function isPhoneBlocked(_phoneNumber: string): Promise<boolean> {
+  // Blocklist disabled - Twilio handles carrier/VoIP rejections
+  return false;
 }
 
 /**
- * Block a phone number
+ * Block a phone number (no-op).
+ * 
+ * NOTE: Internal blocklist is disabled. This function is a no-op.
+ * Twilio Verify handles carrier-level rejections.
  */
 export async function blockPhone(
-  phoneNumber: string, 
-  reason: string,
-  blockedBy: string
+  _phoneNumber: string, 
+  _reason: string,
+  _blockedBy: string
 ): Promise<boolean> {
-  const formatted = formatPhoneNumber(phoneNumber);
-  if (!formatted.isValid) return false;
-  
-  try {
-    await prisma.blockedPhone?.create({
-      data: {
-        phoneNumber: formatted.formattedNumber,
-        reason,
-        blockedBy,
-        blockedAt: new Date()
-      }
-    });
-    
-    phoneLogger.info('Phone blocked', { phoneNumber: formatted.formattedNumber, reason });
-    return true;
-  } catch (error: any) {
-    phoneLogger.error('Failed to block phone', { error: error.message });
-    return false;
-  }
+  phoneLogger.warn('blockPhone called but internal blocklist is disabled');
+  return false;
 }
 
 // ========================================
@@ -663,6 +727,8 @@ export default {
   sendOTP,
   verifyOTP,
   getPhoneVerificationStatus,
+  skipPhoneVerificationForCredits,
+  clearPhoneVerificationSkip,
   removePhoneVerification,
   isPhoneBlocked,
   blockPhone

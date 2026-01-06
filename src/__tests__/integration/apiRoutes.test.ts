@@ -55,39 +55,31 @@ jest.mock('../../services/databaseService', () => ({
   },
 }));
 
-jest.mock('../../utils/logger', () => ({
-  default: {
+jest.mock('../../utils/logger', () => {
+  const childLogger = {
     info: jest.fn(),
     error: jest.fn(),
     warn: jest.fn(),
     debug: jest.fn(),
-  },
-  httpLogger: {
-    info: jest.fn(),
-    error: jest.fn(),
-    warn: jest.fn(),
-  },
-  wsLogger: {
-    info: jest.fn(),
-    error: jest.fn(),
-  },
-  authLogger: {
-    info: jest.fn(),
-    error: jest.fn(),
-    warn: jest.fn(),
-  },
-}));
+  };
 
-// Mock Clerk
-jest.mock('@clerk/express', () => ({
-  clerkMiddleware: () => (req: any, res: any, next: any) => next(),
-  requireAuth: () => (req: any, res: any, next: any) => {
-    req.auth = { userId: 'user_test123' };
-    (req as any).clerkUserId = 'user_test123';
-    next();
-  },
-  getAuth: () => ({ userId: 'user_test123' }),
-}));
+  const logger = {
+    info: jest.fn(),
+    error: jest.fn(),
+    warn: jest.fn(),
+    debug: jest.fn(),
+    child: jest.fn(() => childLogger),
+  };
+
+  return {
+    __esModule: true,
+    default: logger,
+    httpLogger: childLogger,
+    wsLogger: childLogger,
+    authLogger: childLogger,
+  };
+});
+
 
 // ============================================
 // TEST APP SETUP
@@ -99,8 +91,7 @@ function createTestApp(): Express {
   
   // Add request tracking middleware
   app.use((req: any, res, next) => {
-    req.auth = { userId: 'user_test123' };
-    req.clerkUserId = 'user_test123';
+    req.userId = 'user_test123';
     req.requestId = `test-${Date.now()}`;
     next();
   });

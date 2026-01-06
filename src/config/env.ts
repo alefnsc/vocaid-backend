@@ -61,10 +61,6 @@ const envSchema = z.object({
   AZURE_STORAGE_CONTAINER_EXPORTS: z.string().default('exports'),
   AZURE_STORAGE_SAS: z.string().optional(),
 
-  // Clerk Authentication
-  CLERK_SECRET_KEY: z.string().optional(),
-  CLERK_PUBLISHABLE_KEY: z.string().optional(),
-
   // Retell AI
   RETELL_API_KEY: z.string().optional(),
   RETELL_AGENT_ID: z.string().optional(),
@@ -100,13 +96,13 @@ const envSchema = z.object({
   ANALYTICS_CACHE_TTL_GLOBAL: z.string().regex(/^\d+$/).transform(Number).default('3600'),
   ANALYTICS_SNAPSHOT_CRON: z.string().default('0 * * * *'),
 
-  // Supabase (new - replacing Clerk + Azure Storage)
-  SUPABASE_URL: z.string().url().optional(),
-  SUPABASE_ANON_KEY: z.string().optional(),
-  SUPABASE_SERVICE_ROLE_KEY: z.string().optional(),
-  
-  // Twilio (for Supabase Phone Auth)
+  // Twilio (SMS verification - Verify API with API Key auth)
   TWILIO_ACCOUNT_SID: z.string().optional(),
+  TWILIO_API_SID: z.string().optional(),
+  TWILIO_API_SECRET: z.string().optional(),
+  TWILIO_VERIFY_SERVICE_SID: z.string().optional(),
+  PHONE_VERIFICATION_CREDITS: z.string().regex(/^\d+$/).transform(Number).default('5'),
+  // Legacy (deprecated - use API Key auth instead)
   TWILIO_AUTH_TOKEN: z.string().optional(),
   TWILIO_MESSAGING_SERVICE_SID: z.string().optional(),
 });
@@ -204,12 +200,6 @@ export const config = {
     sasToken: env.AZURE_STORAGE_SAS,
   },
 
-  // Auth
-  clerk: {
-    secretKey: env.CLERK_SECRET_KEY,
-    publishableKey: env.CLERK_PUBLISHABLE_KEY,
-  },
-
   // AI Services
   ai: {
     openaiApiKey: env.OPENAI_API_KEY,
@@ -261,16 +251,14 @@ export const config = {
     snapshotCron: env.ANALYTICS_SNAPSHOT_CRON,
   },
 
-  // Supabase (new - replacing Clerk + Azure Storage)
-  supabase: {
-    url: env.SUPABASE_URL || 'https://vnbauggmguyyyqpndwgn.supabase.co',
-    anonKey: env.SUPABASE_ANON_KEY,
-    serviceRoleKey: env.SUPABASE_SERVICE_ROLE_KEY,
-  },
-
-  // Twilio (for Supabase Phone Auth)
+  // Twilio (SMS verification - Verify API with API Key auth)
   twilio: {
     accountSid: env.TWILIO_ACCOUNT_SID,
+    apiSid: env.TWILIO_API_SID,
+    apiSecret: env.TWILIO_API_SECRET,
+    verifyServiceSid: env.TWILIO_VERIFY_SERVICE_SID,
+    phoneVerificationCredits: env.PHONE_VERIFICATION_CREDITS,
+    // Legacy (deprecated)
     authToken: env.TWILIO_AUTH_TOKEN,
     messagingServiceSid: env.TWILIO_MESSAGING_SERVICE_SID,
   },

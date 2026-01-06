@@ -1,0 +1,27 @@
+Bem-vindo ao Vocaid, {{{CANDIDATE_FIRST_NAME}}}! 🎉
+
+Você está pronto para transformar sua preparação para entrevistas com IA.
+
+SEUS CRÉDITOS GRÁTIS: {{{free_credits}}} créditos para começar a praticar
+
+O que você pode fazer com o Vocaid:
+
+🎯 Pratique Cenários Reais de Entrevista
+Entrevistas simuladas com IA adaptadas ao seu cargo alvo
+
+📊 Receba Feedback Detalhado
+Análise completa das suas respostas com dicas de melhoria
+
+📈 Acompanhe Seu Progresso
+Veja como você melhora ao longo do tempo com análises detalhadas
+
+Comece Sua Primeira Entrevista: {{{DASHBOARD_URL}}}
+
+---
+
+Dúvidas? Responda este email ou entre em contato em support@vocaid.ai
+
+Política de Privacidade: {{{PRIVACY_URL}}}
+Termos de Uso: {{{TERMS_URL}}}
+
+© {{{CURRENT_YEAR}}} Vocaid. Todos os direitos reservados.

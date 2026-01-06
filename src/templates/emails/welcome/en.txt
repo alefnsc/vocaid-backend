@@ -1,0 +1,27 @@
+Welcome to Vocaid, {{{CANDIDATE_FIRST_NAME}}}! 🎉
+
+You're ready to transform your interview preparation with AI.
+
+YOUR FREE CREDITS: {{{free_credits}}} credits to start practicing
+
+What you can do with Vocaid:
+
+🎯 Practice Real Interview Scenarios
+AI-powered mock interviews tailored to your target role
+
+📊 Get Detailed Feedback
+Comprehensive analysis of your answers with improvement tips
+
+📈 Track Your Progress
+See how you improve over time with detailed analytics
+
+Start Your First Interview: {{{DASHBOARD_URL}}}
+
+---
+
+Questions? Reply to this email or contact us at support@vocaid.ai
+
+Privacy Policy: {{{PRIVACY_URL}}}
+Terms of Use: {{{TERMS_URL}}}
+
+© {{{CURRENT_YEAR}}} Vocaid. All rights reserved.

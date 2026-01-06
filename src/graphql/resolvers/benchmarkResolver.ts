@@ -27,7 +27,7 @@ export const benchmarkResolver = {
       args: { roleTitle: string; userScore?: number },
       context: GraphQLContext
     ) => {
-      const { clerkId, prisma, requestId } = context;
+      const { userId, prisma, requestId } = context;
       const { roleTitle, userScore } = args;
 
       apiLogger.info('GraphQL: benchmarkByRole query', {
@@ -43,7 +43,7 @@ export const benchmarkResolver = {
 
         // Check cache first
         const cached = await analyticsCachingService.getCachedAnalytics<any>(
-          clerkId,
+          userId,
           cacheKey as any
         );
 
@@ -52,149 +52,82 @@ export const benchmarkResolver = {
           return cached;
         }
 
-        // Look up benchmark from database
-        const benchmark = await prisma.rolePerformanceBenchmark.findUnique({
-          where: { roleTitle: normalizedRole },
+        // Count interviews for this role; require minimum for a meaningful benchmark.
+        const roleInterviews = await prisma.interviewScoreHistory.count({
+          where: {
+            OR: [
+              { role: normalizedRole },
+              {
+                role: {
+                  contains: roleTitle,
+                  mode: 'insensitive',
+                },
+              },
+            ],
+          },
         });
 
-        // Check if we have enough data
-        if (!benchmark || benchmark.totalInterviews < MIN_INTERVIEWS_FOR_BENCHMARK) {
-          // Try to count interviews for this role
-          const roleInterviews = await prisma.interviewScoreHistory.count({
-            where: {
-              role: {
-                contains: roleTitle,
-                mode: 'insensitive',
-              },
-            },
-          });
-
-          if (roleInterviews < MIN_INTERVIEWS_FOR_BENCHMARK) {
-            const result = {
-              hasData: false,
-              message: `Be the first to set the benchmark for ${roleTitle}! Only ${roleInterviews} interview${roleInterviews === 1 ? '' : 's'} recorded so far.`,
-              data: null,
-            };
-
-            // Cache the "no data" result briefly (5 minutes)
-            await analyticsCachingService.setCachedAnalytics(
-              clerkId,
-              cacheKey as any,
-              result,
-              { ttlMs: 5 * 60 * 1000 }
-            );
-
-            apiLogger.info('GraphQL: Insufficient benchmark data', {
-              requestId,
-              roleTitle,
-              interviewCount: roleInterviews,
-            });
-
-            return result;
-          }
-
-          // Trigger background computation
-          analyticsService.recalculateRoleBenchmarks().catch(err => {
-            apiLogger.error('Background benchmark recalculation failed', { error: err.message });
-          });
-
-          // Return partial data while computing
-          const avgScore = await prisma.interviewScoreHistory.aggregate({
-            where: {
-              role: {
-                contains: roleTitle,
-                mode: 'insensitive',
-              },
-            },
-            _avg: { overallScore: true },
-            _count: true,
-          });
-
+        if (roleInterviews < MIN_INTERVIEWS_FOR_BENCHMARK) {
           const result = {
-            hasData: true,
-            message: null,
-            data: {
-              userScore: userScore ?? 0,
-              globalAverage: avgScore._avg.overallScore ?? 70,
-              percentile: 50, // Default to median until computed
-              roleTitle,
-              totalCandidates: avgScore._count,
-              breakdown: null,
-            },
+            hasData: false,
+            message: `Be the first to set the benchmark for ${roleTitle}! Only ${roleInterviews} interview${roleInterviews === 1 ? '' : 's'} recorded so far.`,
+            data: null,
           };
+
+          // Cache the "no data" result briefly (5 minutes)
+          await analyticsCachingService.setCachedAnalytics(
+            userId,
+            cacheKey as any,
+            result,
+            { ttlMs: 5 * 60 * 1000 }
+          );
+
+          apiLogger.info('GraphQL: Insufficient benchmark data', {
+            requestId,
+            roleTitle,
+            interviewCount: roleInterviews,
+          });
 
           return result;
         }
 
-        // Calculate percentile (simple linear interpolation)
-        const score = userScore ?? 0;
-        const scoreDistribution = benchmark.scoreDistribution as any;
-        let percentile = 50;
-        
-        if (scoreDistribution?.buckets) {
-          let belowCount = 0;
-          let totalCount = 0;
-          
-          for (const bucket of scoreDistribution.buckets) {
-            totalCount += bucket.count;
-            if (bucket.max < score) {
-              belowCount += bucket.count;
-            } else if (bucket.min <= score && bucket.max >= score) {
-              const bucketRatio = (score - bucket.min) / (bucket.max - bucket.min);
-              belowCount += bucket.count * bucketRatio;
-            }
-          }
-          
-          percentile = totalCount > 0 ? (belowCount / totalCount) * 100 : 50;
-        }
+        const computed = await analyticsService.getBenchmarkData(
+          requestId ?? 'benchmarkByRole',
+          roleTitle,
+          userScore ?? 0
+        );
+
+        // Very defensive fallback; should rarely happen given roleInterviews >= min.
+        const data =
+          computed ??
+          {
+            userScore: userScore ?? 0,
+            globalAverage: 70,
+            percentile: 50,
+            roleTitle,
+            totalCandidates: roleInterviews,
+            breakdown: null,
+          };
 
         const result = {
           hasData: true,
           message: null,
-          data: {
-            userScore: userScore ?? 0,
-            globalAverage: benchmark.globalAverageScore,
-            percentile,
-            roleTitle: benchmark.roleTitle,
-            totalCandidates: benchmark.totalInterviews,
-            breakdown: benchmark.avgCommunication ? {
-              communication: {
-                user: (userScore ?? 0) * 0.25,
-                average: benchmark.avgCommunication,
-              },
-              problemSolving: {
-                user: (userScore ?? 0) * 0.25,
-                average: benchmark.avgProblemSolving ?? 70,
-              },
-              technicalDepth: {
-                user: (userScore ?? 0) * 0.25,
-                average: benchmark.avgTechnicalDepth ?? 70,
-              },
-              leadership: {
-                user: (userScore ?? 0) * 0.15,
-                average: benchmark.avgLeadership ?? 60,
-              },
-              adaptability: {
-                user: (userScore ?? 0) * 0.1,
-                average: benchmark.avgAdaptability ?? 70,
-              },
-            } : null,
-          },
+          data,
         };
 
         // Cache for 30 minutes
         await analyticsCachingService.setCachedAnalytics(
-          clerkId,
+          userId,
           cacheKey as any,
           result,
           { ttlMs: 30 * 60 * 1000 }
         );
 
-        apiLogger.info('GraphQL: Benchmark data fetched', {
+        apiLogger.info('GraphQL: Benchmark data computed', {
           requestId,
           roleTitle,
-          totalCandidates: benchmark.totalInterviews,
-          percentile,
+          totalCandidates: data.totalCandidates,
+          percentile: data.percentile,
         });
 
         return result;

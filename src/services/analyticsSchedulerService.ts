@@ -233,23 +233,6 @@ async function computeGlobalAnalytics(): Promise<GlobalAnalyticsData> {
     // Cache the snapshot
     await redisService.set('analytics:global', snapshot, config.cacheTtlGlobal);
 
-    // Store in database using GlobalAnalyticsSnapshot model
-    // Uses upsert to maintain single record per snapshotType
-    await prisma.globalAnalyticsSnapshot.upsert({
-      where: { snapshotType: 'global_stats' },
-      update: {
-        snapshotData: snapshot as any,
-        recordCount: totalInterviews,
-        computedAt: now,
-      },
-      create: {
-        snapshotType: 'global_stats',
-        snapshotData: snapshot as any,
-        recordCount: totalInterviews,
-        computedAt: now,
-      },
-    });
-
     apiLogger.info('[analytics-scheduler] Global analytics snapshot computed', {
       totalUsers,
       totalInterviews,
@@ -278,18 +261,6 @@ export async function getGlobalAnalytics(): Promise<GlobalAnalyticsData | null> 
   // If scheduled jobs are enabled, don't compute on-demand
   // Wait for the next scheduled run
   if (config.enabled) {
-    // Try to get from database
-    const latest = await prisma.globalAnalyticsSnapshot.findUnique({
-      where: { snapshotType: 'global_stats' },
-    });
-
-    if (latest) {
-      const snapshot = latest.snapshotData as unknown as GlobalAnalyticsData;
-      // Re-cache it
-      await redisService.set('analytics:global', snapshot, config.cacheTtlGlobal);
-      return snapshot;
-    }
-
     return null;
   }
 

@@ -1,0 +1,39 @@
+Great work, {{{CANDIDATE_FIRST_NAME}}}! 🎯
+
+Your interview practice results are ready.
+
+INTERVIEW SUMMARY
+-----------------
+Role: {{{ROLE_TITLE}}}
+Company: {{{TARGET_COMPANY}}}
+Duration: {{{DURATION_MIN}}} min
+Questions: {{{QUESTIONS_ANSWERED}}}
+
+OVERALL SCORE: {{{OVERALL_SCORE}}}/100
+
+SCORE BREAKDOWN
+---------------
+Communication: {{{COMMUNICATION_SCORE}}}/100
+Technical Knowledge: {{{TECHNICAL_SCORE}}}/100
+Problem Solving: {{{PROBLEM_SOLVING_SCORE}}}/100
+Professionalism: {{{PROFESSIONALISM_SCORE}}}/100
+
+💪 KEY STRENGTHS
+{{{KEY_STRENGTHS}}}
+
+🎯 AREAS TO IMPROVE
+{{{AREAS_TO_IMPROVE}}}
+
+View Full Feedback: {{{FEEDBACK_URL}}}
+
+💡 PRO TIP
+Practice makes perfect! Schedule your next mock interview to keep improving your skills.
+
+---
+
+Questions? Reply to this email or contact us at support@vocaid.ai
+
+Privacy Policy: {{{PRIVACY_URL}}}
+Terms of Use: {{{TERMS_URL}}}
+
+© {{{CURRENT_YEAR}}} Vocaid. All rights reserved.

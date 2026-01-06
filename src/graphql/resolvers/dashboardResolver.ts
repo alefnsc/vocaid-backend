@@ -31,12 +31,12 @@ export const dashboardResolver = {
       args: { filters?: DashboardFilters },
       context: GraphQLContext
     ) => {
-      const { clerkId, requestId } = context;
+      const { userId, requestId } = context;
       const { filters = {} } = args;
 
       apiLogger.info('GraphQL: dashboardData query', {
         requestId,
-        clerkId: clerkId.slice(0, 15),
+        userId: userId.slice(0, 15),
         hasFilters: Object.keys(filters).length > 0,
       });
 
@@ -46,7 +46,7 @@ export const dashboardResolver = {
         
         if (!hasFilters) {
           const cached = await analyticsCachingService.getCachedAnalytics(
-            clerkId,
+            userId,
             'dashboard' as any
           );
           
@@ -66,13 +66,13 @@ export const dashboardResolver = {
         };
 
         const dashboard = await candidateDashboardService.getCandidateDashboard(
-          clerkId,
+          userId,
           serviceFilters,
           filters.limit || 10
         );
 
         if (!dashboard) {
-          apiLogger.warn('GraphQL: User not found for dashboard', { requestId, clerkId });
+          apiLogger.warn('GraphQL: User not found for dashboard', { requestId, userId });
           throw new Error('User not found');
         }
 
@@ -84,6 +84,7 @@ export const dashboardResolver = {
             averageScore: dashboard.kpis?.averageScore ?? null,
             scoreChange: dashboard.kpis?.scoreChange ?? null,
             averageDurationMinutes: dashboard.kpis?.averageDurationMinutes ?? null,
+            totalDurationMs: dashboard.kpis?.totalDurationMs ?? null,
             totalSpent: dashboard.kpis?.totalSpent ?? 0,
             creditsRemaining: dashboard.kpis?.creditsRemaining ?? 0,
             interviewsThisMonth: dashboard.kpis?.interviewsThisMonth ?? 0,
@@ -106,6 +107,8 @@ export const dashboardResolver = {
             durationMinutes: interview.durationMinutes || null,
             score: interview.score ?? null,
             status: interview.status,
+            language: interview.language || null,
+            country: interview.country || null,
           })),
           resumes: (dashboard.resumes || []).map((resume) => ({
             id: resume.id,
@@ -117,6 +120,11 @@ export const dashboardResolver = {
             filteredInterviewCount: resume.filteredInterviewCount,
             isPrimary: resume.isPrimary,
             qualityScore: resume.qualityScore,
+          })),
+          weeklyActivity: (dashboard.weeklyActivity || []).map((bucket) => ({
+            day: bucket.day,
+            count: bucket.count,
+            durationMs: bucket.durationMs,
           })),
           filterOptions: {
             roleTitles: dashboard.filterOptions?.roleTitles || [],
@@ -138,7 +146,7 @@ export const dashboardResolver = {
         // Cache unfiltered results
         if (!hasFilters) {
           await analyticsCachingService.setCachedAnalytics(
-            clerkId,
+            userId,
             'dashboard' as any,
             result
           );
@@ -169,16 +177,16 @@ export const dashboardResolver = {
       _args: unknown,
       context: GraphQLContext
     ) => {
-      const { clerkId, requestId } = context;
+      const { userId, requestId } = context;
 
       apiLogger.info('GraphQL: refreshDashboard mutation', { requestId });
 
       // Invalidate cache
-      await analyticsCachingService.invalidateUserCache(clerkId);
+      await analyticsCachingService.invalidateUserCache(userId);
 
       // Fetch fresh data
       const dashboard = await candidateDashboardService.getCandidateDashboard(
-        clerkId,
+        userId,
         {},
         10
       );
@@ -193,6 +201,7 @@ export const dashboardResolver = {
         scoreEvolution: dashboard.scoreEvolution || [],
         recentInterviews: dashboard.recentInterviews || [],
         resumes: dashboard.resumes || [],
+        weeklyActivity: dashboard.weeklyActivity || [],
         filterOptions: dashboard.filterOptions || {},
         filters: dashboard.filters || {},
       };

@@ -32,7 +32,7 @@ export const interviewResolver = {
       args: { pagination?: PaginationInput; filters?: InterviewFilters },
       context: GraphQLContext
     ) => {
-      const { clerkId, userId, prisma, requestId } = context;
+      const { userId, prisma, requestId } = context;
       const { pagination = {}, filters = {} } = args;
       const page = pagination.page || 1;
       const limit = Math.min(pagination.limit || 20, 100);
@@ -40,7 +40,7 @@ export const interviewResolver = {
 
       apiLogger.info('GraphQL: interviews query', {
         requestId,
-        clerkId: clerkId.slice(0, 15),
+        userId: userId?.slice(0, 15),
         page,
         limit,
       });
@@ -142,10 +142,6 @@ export const interviewResolver = {
               orderBy: { segmentIndex: 'asc' },
             },
             session: true,
-            feedbackJsons: {
-              orderBy: { createdAt: 'desc' },
-              take: 1,
-            },
           },
         });
 

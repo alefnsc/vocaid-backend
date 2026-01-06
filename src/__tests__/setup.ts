@@ -66,38 +66,36 @@ jest.mock('@prisma/client', () => {
   };
 });
 
-// Mock Clerk authentication
-jest.mock('@clerk/express', () => ({
-  requireAuth: jest.fn((req: any, res: any, next: any) => {
-    // Mock authenticated user
-    req.auth = {
-      userId: 'test-clerk-user-id',
-      sessionId: 'test-session-id'
-    };
-    (req as any).clerkUserId = 'test-clerk-user-id';
-    next();
-  }),
-  getAuth: jest.fn(() => ({
-    userId: 'test-clerk-user-id',
-    sessionId: 'test-session-id'
-  }))
-}));
-
 // Mock logger to suppress output during tests
-jest.mock('../utils/logger', () => ({
-  default: {
+jest.mock('../utils/logger', () => {
+  const childLogger = {
     info: jest.fn(),
     warn: jest.fn(),
     error: jest.fn(),
     debug: jest.fn(),
-    child: jest.fn(() => ({
-      info: jest.fn(),
-      warn: jest.fn(),
-      error: jest.fn(),
-      debug: jest.fn()
-    }))
-  }
-}));
+  };
+
+  const logger = {
+    info: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
+    debug: jest.fn(),
+    child: jest.fn(() => childLogger),
+  };
+
+  return {
+    __esModule: true,
+    default: logger,
+    wsLogger: childLogger,
+    retellLogger: childLogger,
+    feedbackLogger: childLogger,
+    paymentLogger: childLogger,
+    authLogger: childLogger,
+    dbLogger: childLogger,
+    apiLogger: childLogger,
+    httpLogger: childLogger,
+  };
+});
 
 // Global test utilities
 export const testUtils = {
@@ -111,7 +109,6 @@ export const testUtils = {
   
   createMockUser: (overrides = {}) => ({
     id: 'test-user-id',
-    clerkId: 'test-clerk-user-id',
     email: 'test@example.com',
     firstName: 'Test',
     lastName: 'User',

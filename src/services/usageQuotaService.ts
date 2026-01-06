@@ -169,33 +169,14 @@ export const USAGE_TIERS: Record<string, UsageTier> = {
 export async function getUserTier(userId: string): Promise<UsageTier> {
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { 
-        credits: true,
-        signupRecord: {
-          select: { creditTier: true }
-        }
+        credits: true
       }
     });
     
     if (!user) {
       return USAGE_TIERS.free;
-    }
-    
-    // Check if user has been blocked
-    if (user.signupRecord?.creditTier === 'blocked') {
-      return {
-        ...USAGE_TIERS.free,
-        limits: {
-          maxInterviewMinutes: 0,
-          maxInterviewsPerDay: 0,
-          maxAITokensPerInterview: 0,
-          maxAITokensTotal: 0,
-          maxResumesStored: 1,
-          maxChatMessagesPerDay: 5,
-          maxEmailsPerDay: 0
-        }
-      };
     }
     
     // Determine tier based on credits purchased
@@ -245,7 +226,7 @@ function getPeriodStart(resetPeriod: 'daily' | 'weekly' | 'monthly' | 'never'): 
 export async function getCurrentUsage(userId: string): Promise<CurrentUsage> {
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId: userId },
+      where: { id: userId },
       select: { id: true }
     });
     
@@ -297,11 +278,12 @@ export async function getCurrentUsage(userId: string): Promise<CurrentUsage> {
       .filter(log => log.resourceType === 'emails_sent')
       .reduce((sum, log) => sum + log.amount, 0);
     
-    // Count stored resumes
-    const resumesStored = await prisma.interview.count({
+    // Count stored resumes (blob-backed; count active documents)
+    const resumesStored = await prisma.resumeDocument.count({
       where: {
         userId: user.id,
-        resumeData: { not: null }
+        isActive: true,
+        storageKey: { not: null }
       }
     });
     
@@ -334,7 +316,7 @@ export async function getCurrentUsage(userId: string): Promise<CurrentUsage> {
 export async function logUsage(record: UsageRecord): Promise<boolean> {
   try {
     const user = await prisma.user.findUnique({
-      where: { clerkId: record.userId },
+      where: { id: record.userId },
       select: { id: true }
     });
     

@@ -90,7 +90,6 @@ MAX_SIGNUPS_PER_SUBNET_HOUR=3
 # ========================================
 # EXISTING VARIABLES (keep as-is)
 # ========================================
-CLERK_SECRET_KEY=xxx
 DATABASE_URL=xxx
 RETELL_API_KEY=xxx
 WEBHOOK_BASE_URL=https://your-backend.com
@@ -286,7 +285,6 @@ pm2 logs Vocaid-backend | grep "payment provider"
 - [ ] Multilingual routes accessible
 - [ ] Payment providers configured
 - [ ] Logs show no critical errors
-- [ ] Clerk metadata sync working
 - [ ] Retell agents responding in correct languages
 - [ ] Analytics tracking score history
 - [ ] Chat service responding (if enabled)
@@ -324,7 +322,7 @@ pm2 set pm2-logrotate:retain 7
 ## Support
 
 For issues, check:
-- `MULTILINGUAL_ARCHITECTURE.md` for architecture details
+- `docs/PROJECT_LOGIC.md` for architecture details
 - PM2 logs: `pm2 logs Vocaid-backend`
 - Database logs: Check RDS/PostgreSQL logs
 - Retell dashboard: Check agent call history

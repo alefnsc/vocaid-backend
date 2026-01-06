@@ -3,7 +3,7 @@
  * 
  * Comprehensive type definitions for:
  * - Supported languages and regions
- * - Clerk metadata structure
+ * - User preferences
  * - Retell language configurations
  * - Payment provider strategy
  */
@@ -190,43 +190,18 @@ export const COUNTRY_CONFIGS: Record<string, CountryConfig> = {
 };
 
 // ========================================
-// CLERK METADATA SCHEMA
+// USER PREFERENCES
 // ========================================
 
 /**
- * Clerk publicMetadata structure (accessible client-side)
- * Stores non-sensitive user preferences
- */
-export interface ClerkPublicMetadata {
-  credits: number;
-  preferredLanguage: SupportedLanguageCode;
-  detectedRegion: RegionCode;
-  detectedCountry: string;
-  timezone?: string;
-  onboardingCompleted?: boolean;
-  languageSetByUser?: boolean; // true if user manually selected, false if auto-detected
-}
-
-/**
- * Clerk privateMetadata structure (server-side only)
- * Stores sensitive or internal data
- */
-export interface ClerkPrivateMetadata {
-  paymentProviderPreference?: PaymentProviderType;
-  paymentProviderFallbackUsed?: boolean;
-  lastGeoUpdate?: string; // ISO date string
-  ipHistory?: string[];   // For fraud detection
-  internalNotes?: string;
-}
-
-/**
- * Combined user preferences (from both metadata types)
+ * Combined user preferences
  */
 export interface UserPreferences {
   language: SupportedLanguageCode;
   languageConfig: LanguageConfig;
   region: RegionCode;
   country: string;
+  preferredPhoneCountry?: string; // ISO-2 country code for phone verification UI
   paymentProvider: PaymentProviderType;
   timezone?: string;
 }

@@ -11,7 +11,7 @@ import { Prisma, PaymentStatus } from '@prisma/client';
 // ========================================
 
 interface CreatePaymentData {
-  userId: string; // Can be UUID or Clerk ID
+  userId: string; // DB UUID
   packageId: string;
   packageName: string;
   creditsAmount: number;
@@ -43,21 +43,8 @@ export async function createPayment(data: CreatePaymentData) {
     amount: `$${data.amountUSD} / R$${data.amountBRL}`
   });
 
-  // Resolve user ID (might be Clerk ID or UUID)
-  let resolvedUserId = data.userId;
-  
-  if (data.userId.startsWith('user_')) {
-    const user = await prisma.user.findUnique({
-      where: { clerkId: data.userId },
-      select: { id: true }
-    });
-    
-    if (!user) {
-      throw new Error(`User not found for Clerk ID: ${data.userId}`);
-    }
-    
-    resolvedUserId = user.id;
-  }
+  // User ID is DB UUID (session auth)
+  const resolvedUserId = data.userId;
 
   const payment = await prisma.payment.create({
     data: {
@@ -86,7 +73,6 @@ export async function getPaymentById(id: string) {
       user: {
         select: {
           id: true,
-          clerkId: true,
           firstName: true,
           lastName: true,
           email: true
@@ -115,7 +101,6 @@ export async function getPaymentByPreferenceId(preferenceId: string) {
       user: {
         select: {
           id: true,
-          clerkId: true,
           credits: true
         }
       }
@@ -127,7 +112,7 @@ export async function getPaymentByPreferenceId(preferenceId: string) {
  * Get user's payments with pagination
  */
 export async function getUserPayments(
-  clerkId: string,
+  userId: string,
   options: PaymentQueryOptions = {}
 ) {
   const {
@@ -139,7 +124,7 @@ export async function getUserPayments(
   const skip = (page - 1) * limit;
 
   const where: Prisma.PaymentWhereInput = {
-    user: { clerkId }
+    user: { id: userId }
   };
 
   if (status) {
@@ -214,21 +199,21 @@ export async function updatePaymentByMercadoPagoId(
  * Finds the most recent pending payment for the user/package and updates it
  */
 export async function linkMercadoPagoPayment(
-  clerkId: string,
+  userId: string,
   packageId: string,
   mercadoPagoId: string,
   statusDetail?: string
 ) {
-  dbLogger.info('Linking MercadoPago payment to record', { clerkId, packageId, mercadoPagoId });
+  dbLogger.info('Linking MercadoPago payment to record', { userId, packageId, mercadoPagoId });
 
-  // Find user by Clerk ID
+  // Find user by ID
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
 
   if (!user) {
-    dbLogger.warn('User not found for payment linking', { clerkId });
+    dbLogger.warn('User not found for payment linking', { userId });
     return null;
   }
 
@@ -243,7 +228,7 @@ export async function linkMercadoPagoPayment(
   });
 
   if (!payment) {
-    dbLogger.warn('No pending payment found to link', { clerkId, packageId });
+    dbLogger.warn('No pending payment found to link', { userId, packageId });
     return null;
   }
 
@@ -271,21 +256,21 @@ export async function linkMercadoPagoPayment(
  * Mark a payment as failed by finding recent pending payment
  */
 export async function markPaymentFailed(
-  clerkId: string,
+  userId: string,
   packageId: string,
   status: 'REJECTED' | 'CANCELLED',
   statusDetail?: string
 ) {
-  dbLogger.info('Marking payment as failed', { clerkId, packageId, status });
+  dbLogger.info('Marking payment as failed', { userId, packageId, status });
 
-  // Find user by Clerk ID
+  // Find user by ID
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
 
   if (!user) {
-    dbLogger.warn('User not found for payment status update', { clerkId });
+    dbLogger.warn('User not found for payment status update', { userId });
     return null;
   }
 
@@ -300,7 +285,7 @@ export async function markPaymentFailed(
   });
 
   if (!payment) {
-    dbLogger.warn('No pending payment found to mark as failed', { clerkId, packageId });
+    dbLogger.warn('No pending payment found to mark as failed', { userId, packageId });
     return null;
   }
 
@@ -338,7 +323,7 @@ export async function processSuccessfulPayment(
       where: { mercadoPagoId },
       include: {
         user: {
-          select: { id: true, clerkId: true, credits: true }
+          select: { id: true,  credits: true }
         }
       }
     });
@@ -410,9 +395,9 @@ export async function processFailedPayment(
 /**
  * Get payment statistics for dashboard
  */
-export async function getPaymentStats(clerkId: string) {
+export async function getPaymentStats(userId: string) {
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
 

@@ -74,7 +74,7 @@ export interface UsageEvent {
 // ========================================
 
 /**
- * Record interview score in history
+ * Record interview score in history (idempotent via upsert)
  * Called after interview completion
  */
 export async function recordInterviewScore(
@@ -91,19 +91,42 @@ export async function recordInterviewScore(
   callDuration?: number
 ) {
   try {
-    const record = await prisma.interviewScoreHistory.create({
-      data: {
-        userId,
-        interviewId,
-        role: normalizeRole(role),
-        company: normalizeCompany(company),
-        overallScore: scores.overall,
-        technicalScore: scores.technical,
-        communicationScore: scores.communication,
-        confidenceScore: scores.confidence,
-        callDuration
-      }
+    const normalizedRole = normalizeRole(role);
+    const normalizedCompany = normalizeCompany(company);
+
+    // Idempotency: schema does not define a (userId, interviewId) unique constraint,
+    // so we emulate upsert with a lookup + update/create.
+    const existing = await prisma.interviewScoreHistory.findFirst({
+      where: { userId, interviewId },
+      select: { id: true },
     });
+
+    const record = existing
+      ? await prisma.interviewScoreHistory.update({
+          where: { id: existing.id },
+          data: {
+            role: normalizedRole,
+            company: normalizedCompany,
+            overallScore: scores.overall,
+            technicalScore: scores.technical,
+            communicationScore: scores.communication,
+            confidenceScore: scores.confidence,
+            callDuration,
+          },
+        })
+      : await prisma.interviewScoreHistory.create({
+          data: {
+            userId,
+            interviewId,
+            role: normalizedRole,
+            company: normalizedCompany,
+            overallScore: scores.overall,
+            technicalScore: scores.technical,
+            communicationScore: scores.communication,
+            confidenceScore: scores.confidence,
+            callDuration,
+          },
+        });
 
     dbLogger.info('Interview score recorded in history', {
       userId,
@@ -140,6 +163,76 @@ export async function recordInterviewScore(
       error: error.message
     });
     throw error;
+  }
+}
+
+/**
+ * Ensure score history exists for an interview (backfill-on-read helper)
+ * Non-blocking: logs errors but doesn't throw
+ * 
+ * @param interviewId - Interview to ensure score history for
+ * @returns true if score history exists or was created, false on error
+ */
+export async function ensureInterviewScoreHistory(interviewId: string): Promise<boolean> {
+  try {
+    // Check if score history already exists for this interview
+    const existing = await prisma.interviewScoreHistory.findFirst({
+      where: { interviewId },
+      select: { id: true }
+    });
+
+    if (existing) {
+      return true; // Already exists
+    }
+
+    // Fetch interview to get required data
+    const interview = await prisma.interview.findUnique({
+      where: { id: interviewId },
+      select: {
+        id: true,
+        userId: true,
+        jobTitle: true,
+        companyName: true,
+        score: true,
+        callDuration: true,
+        status: true
+      }
+    });
+
+    if (!interview) {
+      dbLogger.warn('ensureInterviewScoreHistory: Interview not found', { interviewId });
+      return false;
+    }
+
+    // Only create score history for completed interviews with a score
+    if (interview.status !== 'COMPLETED' || interview.score === null) {
+      dbLogger.debug('ensureInterviewScoreHistory: Interview not eligible', {
+        interviewId,
+        status: interview.status,
+        hasScore: interview.score !== null
+      });
+      return false;
+    }
+
+    // Create score history using the idempotent upsert
+    await recordInterviewScore(
+      interview.userId,
+      interview.id,
+      interview.jobTitle,
+      interview.companyName,
+      { overall: interview.score },
+      interview.callDuration ?? undefined
+    );
+
+    dbLogger.info('ensureInterviewScoreHistory: Created missing score history', { interviewId });
+    return true;
+  } catch (error: any) {
+    // Non-blocking: log but don't throw
+    dbLogger.warn('ensureInterviewScoreHistory: Failed to ensure score history', {
+      interviewId,
+      error: error.message
+    });
+    return false;
   }
 }
 
@@ -219,7 +312,7 @@ function normalizeCompany(company: string): string {
  * Get scores grouped by role
  */
 export async function getScoresByRole(
-  clerkId: string,
+  userId: string,
   options: {
     startDate?: Date;
     endDate?: Date;
@@ -229,9 +322,9 @@ export async function getScoresByRole(
 ): Promise<ScoreByRole[]> {
   const { startDate, endDate, role, limit = 10 } = options;
 
-  // First get the user's UUID from clerkId
+  // First get the user's UUID from userId
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
 
@@ -318,7 +411,7 @@ export async function getScoresByRole(
  * Get scores grouped by company
  */
 export async function getScoresByCompany(
-  clerkId: string,
+  userId: string,
   options: {
     startDate?: Date;
     endDate?: Date;
@@ -329,7 +422,7 @@ export async function getScoresByCompany(
   const { startDate, endDate, company, limit = 10 } = options;
 
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
 
@@ -412,7 +505,7 @@ export async function getScoresByCompany(
  * Get score history as time series
  */
 export async function getScoreTimeSeries(
-  clerkId: string,
+  userId: string,
   period: TimePeriod = 'weekly',
   options: {
     months?: number;
@@ -423,7 +516,7 @@ export async function getScoreTimeSeries(
   const { months = 6, role, company } = options;
 
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
 
@@ -497,7 +590,7 @@ function getPeriodKey(date: Date, period: TimePeriod): string {
  * Get interview volume over time
  */
 export async function getInterviewVolume(
-  clerkId: string,
+  userId: string,
   period: TimePeriod = 'monthly',
   options: {
     months?: number;
@@ -507,7 +600,7 @@ export async function getInterviewVolume(
   const { months = 6, role } = options;
 
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
 
@@ -556,7 +649,7 @@ export async function getInterviewVolume(
  * Calculate user's percentile ranking
  */
 export async function getUserPercentile(
-  clerkId: string,
+  userId: string,
   options: {
     role?: string;
     months?: number;
@@ -565,7 +658,7 @@ export async function getUserPercentile(
   const { role, months = 3 } = options;
 
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
 
@@ -637,15 +730,15 @@ export async function getUserPercentile(
  */
 export async function logUsageEvent(event: UsageEvent) {
   try {
-    // Get user UUID from clerkId if necessary
+    // Get user UUID from userId if necessary
     let userId = event.userId;
     if (userId.startsWith('user_')) {
       const user = await prisma.user.findUnique({
-        where: { clerkId: userId },
+        where: { id: userId },
         select: { id: true }
       });
       if (!user) {
-        dbLogger.warn('User not found for usage event', { clerkId: userId });
+        dbLogger.warn('User not found for usage event', { userId: userId });
         return null;
       }
       userId = user.id;
@@ -673,14 +766,14 @@ export async function logUsageEvent(event: UsageEvent) {
  * Get usage summary for a user
  */
 export async function getUsageSummary(
-  clerkId: string,
+  userId: string,
   options: {
     startDate?: Date;
     endDate?: Date;
   } = {}
 ) {
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
 
@@ -715,12 +808,12 @@ export async function getUsageSummary(
 /**
  * Get available roles and companies for a user (for filter dropdowns)
  */
-export async function getAvailableFilters(clerkId: string): Promise<{
+export async function getAvailableFilters(userId: string): Promise<{
   roles: string[];
   companies: string[];
 }> {
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
 
@@ -756,13 +849,13 @@ export async function getAvailableFilters(clerkId: string): Promise<{
  * Uses caching layer for performance optimization
  */
 export async function getDashboardAnalytics(
-  clerkId: string,
+  userId: string,
   period: TimePeriod = 'monthly',
   options?: { forceRefresh?: boolean }
 ) {
   // Use cache-through pattern for dashboard data
   return getOrComputeAnalytics(
-    clerkId,
+    userId,
     CACHE_KEYS.DASHBOARD,
     async () => {
       const [
@@ -773,12 +866,12 @@ export async function getDashboardAnalytics(
         percentile,
         filters
       ] = await Promise.all([
-        getScoresByRole(clerkId, { limit: 5 }),
-        getScoresByCompany(clerkId, { limit: 5 }),
-        getScoreTimeSeries(clerkId, period),
-        getInterviewVolume(clerkId, period),
-        getUserPercentile(clerkId),
-        getAvailableFilters(clerkId)
+        getScoresByRole(userId, { limit: 5 }),
+        getScoresByCompany(userId, { limit: 5 }),
+        getScoreTimeSeries(userId, period),
+        getInterviewVolume(userId, period),
+        getUserPercentile(userId),
+        getAvailableFilters(userId)
       ]);
 
       return {
@@ -978,80 +1071,86 @@ function extractSoftSkills(callAnalysis: any): SoftSkillsData {
 // TRANSCRIPT SEGMENTATION
 // ========================================
 
+/**
+ * Create transcript segments from Retell data or plain text
+ * Uses transcript adapter to normalize input into unified segment shape.
+ * Idempotent: clears existing segments before creating new ones.
+ * 
+ * NOTE: Stores startTime/endTime in SECONDS for DB compatibility with frontend TranscriptViewer.
+ * Adapter internally uses ms; we convert before persisting.
+ * 
+ * @param interviewId - Interview UUID
+ * @param transcriptData - Retell call details object OR plain text string
+ * @param totalDurationMs - Optional total duration in ms (for scaling plain text segments)
+ */
 export async function createTranscriptSegments(
   interviewId: string,
-  transcriptData: any
+  transcriptData: any,
+  totalDurationMs?: number
 ): Promise<TranscriptSegmentData[]> {
-  dbLogger.info('Creating transcript segments', { interviewId });
+  const { normalizeRetellTranscript, normalizePlainTextTranscript, msToSeconds } = await import('../utils/transcriptAdapter');
   
-  const segments: TranscriptSegmentData[] = [];
+  dbLogger.info('Creating transcript segments via adapter', { interviewId });
   
-  if (!transcriptData?.transcript_with_tool_calls) {
-    if (typeof transcriptData === 'string') {
-      return parseTextTranscript(interviewId, transcriptData);
-    }
-    return segments;
-  }
-  
-  const rawSegments = transcriptData.transcript_with_tool_calls;
-  let segmentIndex = 0;
-  
-  for (const seg of rawSegments) {
-    if (seg.role !== 'tool_calls') {
-      const startTime = seg.words?.[0]?.start || segmentIndex * 30;
-      const endTime = seg.words?.[seg.words?.length - 1]?.end || startTime + 30;
-      
-      const segment: TranscriptSegmentData = {
-        id: `${interviewId}-${segmentIndex}`,
-        speaker: seg.role === 'agent' ? 'agent' : 'user',
-        content: seg.content || '',
-        startTime,
-        endTime,
-        sentimentScore: seg.sentiment ? mapSentimentToScore(seg.sentiment) : undefined
-      };
-      
-      segments.push(segment);
-      
-      await prisma.transcriptSegment.create({
-        data: {
-          interviewId,
-          speaker: segment.speaker,
-          content: segment.content,
-          startTime: segment.startTime,
-          endTime: segment.endTime,
-          sentimentScore: segment.sentimentScore,
-          segmentIndex
-        }
-      });
-      
-      segmentIndex++;
-    }
-  }
-  
-  return segments;
-}
-
-function parseTextTranscript(interviewId: string, text: string): TranscriptSegmentData[] {
-  const segments: TranscriptSegmentData[] = [];
-  const lines = text.split('\n').filter(l => l.trim());
-  let currentTime = 0;
-  const avgSegmentDuration = 15;
-  
-  lines.forEach((line, index) => {
-    const isAgent = line.toLowerCase().includes('agent:') || line.toLowerCase().includes('interviewer:');
-    const content = line.replace(/^(agent:|interviewer:|user:|candidate:)/i, '').trim();
-    
-    if (content) {
-      segments.push({
-        id: `${interviewId}-${index}`,
-        speaker: isAgent ? 'agent' : 'user',
-        content,
-        startTime: currentTime,
-        endTime: currentTime + avgSegmentDuration
-      });
-      currentTime += avgSegmentDuration;
-    }
+  // Idempotency: delete existing segments first
+  await prisma.transcriptSegment.deleteMany({
+    where: { interviewId }
   });
+  
+  // Normalize transcript using adapter
+  let normalizationResult;
+  
+  if (typeof transcriptData === 'string') {
+    normalizationResult = normalizePlainTextTranscript(transcriptData, totalDurationMs || 0);
+  } else {
+    normalizationResult = normalizeRetellTranscript(transcriptData);
+  }
+  
+  const { segments: normalizedSegments, source } = normalizationResult;
+  
+  if (normalizedSegments.length === 0) {
+    dbLogger.warn('No transcript segments to persist', { interviewId, source });
+    return [];
+  }
+  
+  dbLogger.info('Persisting transcript segments', { 
+    interviewId, 
+    count: normalizedSegments.length, 
+    source 
+  });
+  
+  const segments: TranscriptSegmentData[] = [];
+  
+  for (const seg of normalizedSegments) {
+    // Convert ms to seconds for DB storage (frontend TranscriptViewer uses seconds)
+    const startTime = msToSeconds(seg.startMs);
+    const endTime = msToSeconds(seg.endMs);
+    
+    const segment: TranscriptSegmentData = {
+      id: `${interviewId}-${seg.segmentIndex}`,
+      speaker: seg.speaker,
+      content: seg.content,
+      startTime,
+      endTime,
+      sentimentScore: seg.sentimentScore
+    };
+    
+    segments.push(segment);
+    
+    await prisma.transcriptSegment.create({
+      data: {
+        interviewId,
+        speaker: segment.speaker,
+        content: segment.content,
+        startTime: segment.startTime,
+        endTime: segment.endTime,
+        sentimentScore: segment.sentimentScore,
+        segmentIndex: seg.segmentIndex
+      }
+    });
+  }
+  
+  dbLogger.info('Transcript segments created', { interviewId, count: segments.length });
   
   return segments;
 }
@@ -1118,31 +1217,45 @@ export async function getBenchmarkData(
   
   try {
     const normalizedRole = normalizeRoleTitle(roleTitle);
-    
-    const benchmark = await prisma.rolePerformanceBenchmark.findUnique({
-      where: { roleTitle: normalizedRole }
+
+    const stats = await prisma.interviewScoreHistory.aggregate({
+      where: { role: normalizedRole },
+      _count: { _all: true },
+      _avg: {
+        overallScore: true,
+        communicationScore: true,
+      },
     });
-    
-    if (!benchmark) return null;
-    
-    const percentile = calculatePercentileFromDistribution(
-      userScore, 
-      benchmark.scoreDistribution as any
-    );
-    
+
+    const totalCandidates = stats._count._all;
+    if (!totalCandidates) return null;
+
+    const scores = await prisma.interviewScoreHistory.findMany({
+      where: { role: normalizedRole },
+      select: { overallScore: true },
+      orderBy: { overallScore: 'asc' },
+    });
+
+    const distribution = calculateScoreDistribution(scores.map((s) => s.overallScore));
+    const percentile = calculatePercentileFromDistribution(userScore, distribution);
+    const globalAverage = stats._avg.overallScore ?? 70;
+    const avgCommunication = stats._avg.communicationScore ?? null;
+
     return {
       userScore,
-      globalAverage: benchmark.globalAverageScore,
+      globalAverage,
       percentile,
-      roleTitle: benchmark.roleTitle,
-      totalCandidates: benchmark.totalInterviews,
-      breakdown: benchmark.avgCommunication ? {
-        communication: { user: userScore * 0.25, average: benchmark.avgCommunication },
-        problemSolving: { user: userScore * 0.25, average: benchmark.avgProblemSolving || 70 },
-        technicalDepth: { user: userScore * 0.25, average: benchmark.avgTechnicalDepth || 70 },
-        leadership: { user: userScore * 0.15, average: benchmark.avgLeadership || 60 },
-        adaptability: { user: userScore * 0.1, average: benchmark.avgAdaptability || 70 }
-      } : undefined
+      roleTitle: normalizedRole,
+      totalCandidates,
+      breakdown: avgCommunication
+        ? {
+            communication: { user: userScore * 0.25, average: avgCommunication },
+            problemSolving: { user: userScore * 0.25, average: 70 },
+            technicalDepth: { user: userScore * 0.25, average: 70 },
+            leadership: { user: userScore * 0.15, average: 60 },
+            adaptability: { user: userScore * 0.1, average: 70 },
+          }
+        : undefined,
     };
   } catch (error) {
     dbLogger.error('Failed to get benchmark data', { error });
@@ -1172,56 +1285,9 @@ function calculateScoreDistribution(scores: number[]): { buckets: { min: number;
 }
 
 export async function recalculateRoleBenchmarks(): Promise<void> {
-  dbLogger.info('Starting role benchmark recalculation');
-  
-  const roleStats = await prisma.interviewScoreHistory.groupBy({
-    by: ['role'],
-    _count: { role: true },
-    _avg: { overallScore: true, communicationScore: true, confidenceScore: true },
-    where: { overallScore: { not: undefined } }
-  });
-  
-  for (const stat of roleStats) {
-    const normalizedRole = normalizeRoleTitle(stat.role);
-    
-    const scores = await prisma.interviewScoreHistory.findMany({
-      where: { role: stat.role },
-      select: { overallScore: true },
-      orderBy: { overallScore: 'asc' }
-    });
-    
-    const distribution = calculateScoreDistribution(scores.map(s => s.overallScore));
-    
-    // Safely access aggregated values
-    const avgScore = stat._avg?.overallScore ?? 70;
-    const countRole = typeof stat._count === 'object' ? (stat._count?.role ?? 0) : 0;
-    const avgComm = stat._avg?.communicationScore ?? null;
-    
-    await prisma.rolePerformanceBenchmark.upsert({
-      where: { roleTitle: normalizedRole },
-      create: {
-        roleTitle: normalizedRole,
-        globalAverageScore: avgScore,
-        totalInterviews: countRole,
-        scoreDistribution: distribution,
-        avgCommunication: avgComm,
-        avgAdaptability: 70,
-        avgProblemSolving: 70,
-        avgTechnicalDepth: 70,
-        avgLeadership: 60,
-        lastCalculatedAt: new Date()
-      },
-      update: {
-        globalAverageScore: avgScore,
-        totalInterviews: countRole,
-        scoreDistribution: distribution,
-        avgCommunication: avgComm,
-        lastCalculatedAt: new Date()
-      }
-    });
-  }
-  
-  dbLogger.info('Role benchmark recalculation complete', { rolesProcessed: roleStats.length });
+  // Previously persisted to a `rolePerformanceBenchmark` table.
+  // That model does not exist in the canonical schema; benchmarks are computed on-demand.
+  dbLogger.info('Role benchmark recalculation skipped (computed on-demand)');
 }
 
 // ========================================
@@ -1446,11 +1512,11 @@ export function getDateRangeFromPreset(preset: DateRangePreset): { startDate: Da
  * Get filtered analytics with advanced filtering
  */
 export async function getFilteredAnalytics(
-  clerkId: string,
+  userId: string,
   filters: AdvancedFilters
 ): Promise<FilteredAnalyticsResult | null> {
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
   
@@ -1571,9 +1637,9 @@ export async function getFilteredAnalytics(
   
   // Get chart data
   const [scoreTimeSeries, scoresByRole, scoresByCompany] = await Promise.all([
-    getScoreTimeSeries(clerkId, 'daily', { months: 1 }),
-    getScoresByRole(clerkId),
-    getScoresByCompany(clerkId)
+    getScoreTimeSeries(userId, 'daily', { months: 1 }),
+    getScoresByRole(userId),
+    getScoresByCompany(userId)
   ]);
   
   return {
@@ -1608,12 +1674,12 @@ export async function getFilteredAnalytics(
  * Compare two interviews
  */
 export async function compareInterviews(
-  clerkId: string,
+  userId: string,
   interviewId1: string,
   interviewId2: string
 ): Promise<ComparisonResult | null> {
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
   
@@ -1728,7 +1794,7 @@ export async function compareInterviews(
  * Get interview progression (same role/company over time)
  */
 export async function getInterviewProgression(
-  clerkId: string,
+  userId: string,
   options: {
     role?: string;
     company?: string;
@@ -1742,7 +1808,7 @@ export async function getInterviewProgression(
   const { role, company, limit = 20 } = options;
   
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
   
@@ -1813,14 +1879,14 @@ export async function getInterviewProgression(
 /**
  * Get enhanced filter options with counts
  */
-export async function getEnhancedFilterOptions(clerkId: string): Promise<{
+export async function getEnhancedFilterOptions(userId: string): Promise<{
   roles: { name: string; count: number }[];
   companies: { name: string; count: number }[];
   dateRange: { earliest: Date | null; latest: Date | null };
   scoreRange: { min: number; max: number };
 }> {
   const user = await prisma.user.findUnique({
-    where: { clerkId },
+    where: { id: userId },
     select: { id: true }
   });
   
@@ -1869,5 +1935,377 @@ export async function getEnhancedFilterOptions(clerkId: string): Promise<{
       min: aggregate._min.score || 0,
       max: aggregate._max.score || 100
     }
+  };
+}
+
+// ========================================
+// PERFORMANCE PAGE - SUMMARY + GOALS
+// ========================================
+
+export type PerformanceRange = '1W' | '1M' | '6M' | 'ALL';
+
+export interface PerformanceSummary {
+  range: PerformanceRange;
+  startDate: string | null;
+  endDate: string;
+  totals: {
+    completedInterviews: number;
+    totalMinutes: number;
+    thisWeekInterviews: number;
+    thisWeekMinutes: number;
+    activeWeeks: number;
+    currentWeekStreak: number;
+  };
+  scores: {
+    averageScore: number | null;
+    bestScore: number | null;
+    latestScore: number | null;
+  };
+  recentScores: Array<{ date: string; score: number }>;
+  velocity: {
+    pointsPerWeek: number;
+    label: 'up' | 'down' | 'flat';
+  };
+  consistencyScore: number | null; // 0..100
+  communication: {
+    sentimentScore: number | null; // 0..100
+    paceWpm: number | null;
+    score: number | null; // 0..100
+  };
+  composite: {
+    score: number | null; // 0..100
+    components: {
+      score: number | null;
+      velocity: number | null;
+      consistency: number | null;
+      communication: number | null;
+    };
+  };
+  breakdown: {
+    technical: number | null;
+    communication: number | null;
+    confidence: number | null;
+  };
+}
+
+function clamp(num: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, num));
+}
+
+function getRangeStart(range: PerformanceRange, now = new Date()): Date | null {
+  const end = new Date(now);
+  if (range === 'ALL') return null;
+  const days = range === '1W' ? 7 : range === '1M' ? 30 : 180;
+  return new Date(end.getTime() - days * 24 * 60 * 60 * 1000);
+}
+
+function getIsoWeekKey(date: Date): string {
+  // ISO week (Monday-based) key: YYYY-Www
+  const d = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  const weekNo = Math.ceil((((d.getTime() - yearStart.getTime()) / 86400000) + 1) / 7);
+  return `${d.getUTCFullYear()}-W${String(weekNo).padStart(2, '0')}`;
+}
+
+function getCurrentIsoWeekStartUtc(now = new Date()): Date {
+  const d = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const dayNum = d.getUTCDay() || 7; // 1..7 (Mon..Sun)
+  d.setUTCDate(d.getUTCDate() - (dayNum - 1));
+  d.setUTCHours(0, 0, 0, 0);
+  return d;
+}
+
+function computeLinearSlopePointsPerWeek(points: Array<{ t: number; y: number }>): number {
+  if (points.length < 2) return 0;
+  const n = points.length;
+  const meanT = points.reduce((s, p) => s + p.t, 0) / n;
+  const meanY = points.reduce((s, p) => s + p.y, 0) / n;
+  let num = 0;
+  let den = 0;
+  for (const p of points) {
+    const dt = p.t - meanT;
+    num += dt * (p.y - meanY);
+    den += dt * dt;
+  }
+  if (den === 0) return 0;
+  const slopePerMs = num / den;
+  const msPerWeek = 7 * 24 * 60 * 60 * 1000;
+  return slopePerMs * msPerWeek;
+}
+
+function mapVelocityToScore(pointsPerWeek: number): number {
+  // -10..+10 points/week maps to 0..100 (clamped)
+  return clamp(50 + pointsPerWeek * 5, 0, 100);
+}
+
+function mapSentimentToScore100(sentiment: number): number {
+  // Support either [-1..1] or [0..1] inputs.
+  const normalized = sentiment < 0 ? (sentiment + 1) / 2 : sentiment;
+  return clamp(normalized * 100, 0, 100);
+}
+
+function mapWpmToScore100(wpm: number): number {
+  // Optimal speaking pace ~145 WPM; penalize deviation.
+  const penalty = Math.abs(wpm - 145) * 1.2;
+  return clamp(100 - penalty, 0, 100);
+}
+
+function computeCommunicationScore(sentimentScore100: number | null, wpm: number | null): number | null {
+  const parts: number[] = [];
+  if (sentimentScore100 != null) parts.push(sentimentScore100);
+  if (wpm != null) parts.push(mapWpmToScore100(wpm));
+  if (parts.length === 0) return null;
+  return Math.round((parts.reduce((a, b) => a + b, 0) / parts.length) * 10) / 10;
+}
+
+export async function getPerformanceGoal(userId: string) {
+  const goal = await prisma.performanceGoal.upsert({
+    where: { userId },
+    create: { userId },
+    update: {},
+    select: {
+      weeklyInterviewGoal: true,
+      weeklyMinutesGoal: true,
+      updatedAt: true
+    }
+  });
+
+  return {
+    weeklyInterviewGoal: goal.weeklyInterviewGoal,
+    weeklyMinutesGoal: goal.weeklyMinutesGoal,
+    updatedAt: goal.updatedAt.toISOString()
+  };
+}
+
+export async function upsertPerformanceGoal(
+  userId: string,
+  input: { weeklyInterviewGoal: number; weeklyMinutesGoal?: number }
+) {
+  const goal = await prisma.performanceGoal.upsert({
+    where: { userId },
+    create: {
+      userId,
+      weeklyInterviewGoal: input.weeklyInterviewGoal,
+      weeklyMinutesGoal: input.weeklyMinutesGoal ?? 60
+    },
+    update: {
+      weeklyInterviewGoal: input.weeklyInterviewGoal,
+      weeklyMinutesGoal: input.weeklyMinutesGoal ?? undefined
+    },
+    select: {
+      weeklyInterviewGoal: true,
+      weeklyMinutesGoal: true,
+      updatedAt: true
+    }
+  });
+
+  return {
+    weeklyInterviewGoal: goal.weeklyInterviewGoal,
+    weeklyMinutesGoal: goal.weeklyMinutesGoal,
+    updatedAt: goal.updatedAt.toISOString()
+  };
+}
+
+export async function getPerformanceSummary(
+  userId: string,
+  range: PerformanceRange,
+  options: { role?: string; company?: string } = {}
+): Promise<PerformanceSummary> {
+  const end = new Date();
+  const start = getRangeStart(range, end);
+
+  const where: Prisma.InterviewWhereInput = {
+    userId,
+    status: 'COMPLETED',
+    ...(start ? { createdAt: { gte: start } } : {}),
+    ...(options.role ? { jobTitle: { contains: options.role, mode: 'insensitive' } } : {}),
+    ...(options.company ? { companyName: { contains: options.company, mode: 'insensitive' } } : {})
+  };
+
+  const interviews = await prisma.interview.findMany({
+    where,
+    select: {
+      createdAt: true,
+      score: true,
+      callDuration: true,
+      sentimentScore: true,
+      wpmAverage: true
+    },
+    orderBy: { createdAt: 'asc' },
+    take: 750
+  });
+
+  const completedInterviews = interviews.length;
+  const totalMinutes = Math.round(
+    interviews.reduce((sum, i) => sum + ((i.callDuration ?? 0) / 60), 0)
+  );
+
+  const weekStart = getCurrentIsoWeekStartUtc(end);
+  const thisWeek = interviews.filter(i => i.createdAt >= weekStart);
+  const thisWeekInterviews = thisWeek.length;
+  const thisWeekMinutes = Math.round(thisWeek.reduce((sum, i) => sum + ((i.callDuration ?? 0) / 60), 0));
+
+  const scoreValues = interviews
+    .map(i => i.score)
+    .filter((s): s is number => typeof s === 'number');
+
+  const averageScore = scoreValues.length
+    ? Math.round((scoreValues.reduce((a, b) => a + b, 0) / scoreValues.length) * 10) / 10
+    : null;
+  const bestScore = scoreValues.length ? Math.max(...scoreValues) : null;
+  const latestScore = scoreValues.length ? scoreValues[scoreValues.length - 1] : null;
+
+  const recentScores = interviews
+    .filter(i => typeof i.score === 'number')
+    .slice(-12)
+    .map(i => ({
+      date: i.createdAt.toISOString().split('T')[0],
+      score: Math.round((i.score as number) * 10) / 10
+    }));
+
+  const weekKeys = new Set<string>();
+  for (const i of interviews) weekKeys.add(getIsoWeekKey(i.createdAt));
+  const activeWeeks = weekKeys.size;
+
+  // Streak: count consecutive ISO weeks ending at current week
+  const currentWeekKey = getIsoWeekKey(end);
+  const sortedWeeks = Array.from(weekKeys).sort();
+  const weekIndex = new Set(sortedWeeks);
+  let currentWeekStreak = 0;
+  if (weekIndex.has(currentWeekKey)) {
+    // Walk back week-by-week using a safe date decrement
+    let cursor = new Date(end);
+    while (true) {
+      const key = getIsoWeekKey(cursor);
+      if (!weekIndex.has(key)) break;
+      currentWeekStreak++;
+      cursor = new Date(cursor.getTime() - 7 * 24 * 60 * 60 * 1000);
+    }
+  }
+
+  // Consistency score: active weeks divided by total weeks in range
+  let totalWeeksInRange: number | null = null;
+  if (start) {
+    totalWeeksInRange = Math.max(1, Math.ceil((end.getTime() - start.getTime()) / (7 * 24 * 60 * 60 * 1000)));
+  }
+  const consistencyScore = totalWeeksInRange != null
+    ? Math.round((activeWeeks / totalWeeksInRange) * 1000) / 10
+    : (activeWeeks > 0 ? 100 : null);
+
+  // Velocity: regression slope of score over time
+  const regressionPoints = interviews
+    .filter(i => typeof i.score === 'number')
+    .map(i => ({ t: i.createdAt.getTime(), y: i.score as number }));
+  const pointsPerWeek = Math.round(computeLinearSlopePointsPerWeek(regressionPoints) * 10) / 10;
+  const velocityLabel: 'up' | 'down' | 'flat' =
+    pointsPerWeek > 0.5 ? 'up' : pointsPerWeek < -0.5 ? 'down' : 'flat';
+
+  // Communication signals (Interview table)
+  const sentimentVals = interviews
+    .map(i => i.sentimentScore)
+    .filter((s): s is number => typeof s === 'number');
+  const wpmVals = interviews
+    .map(i => i.wpmAverage)
+    .filter((w): w is number => typeof w === 'number');
+  const sentimentScore100 = sentimentVals.length
+    ? Math.round(mapSentimentToScore100(sentimentVals.reduce((a, b) => a + b, 0) / sentimentVals.length) * 10) / 10
+    : null;
+  const paceWpm = wpmVals.length
+    ? Math.round((wpmVals.reduce((a, b) => a + b, 0) / wpmVals.length) * 10) / 10
+    : null;
+  const communicationScore = computeCommunicationScore(sentimentScore100, paceWpm);
+
+  // Breakdowns from InterviewScoreHistory when available (avoid duplicating Dashboard by aggregating differently)
+  const scoreHistory = await prisma.interviewScoreHistory.findMany({
+    where: {
+      userId,
+      ...(start ? { createdAt: { gte: start } } : {}),
+      ...(options.role ? { role: { contains: options.role, mode: 'insensitive' } } : {}),
+      ...(options.company ? { company: { contains: options.company, mode: 'insensitive' } } : {})
+    },
+    select: {
+      technicalScore: true,
+      communicationScore: true,
+      confidenceScore: true
+    },
+    take: 750
+  });
+
+  const avg = (vals: Array<number | null | undefined>): number | null => {
+    const n = vals.filter((v): v is number => typeof v === 'number');
+    if (!n.length) return null;
+    return Math.round((n.reduce((a, b) => a + b, 0) / n.length) * 10) / 10;
+  };
+
+  const breakdown = {
+    technical: avg(scoreHistory.map(s => s.technicalScore)),
+    communication: avg(scoreHistory.map(s => s.communicationScore)),
+    confidence: avg(scoreHistory.map(s => s.confidenceScore))
+  };
+
+  // Composite: score + velocity + consistency + communication (weights renormalized by availability)
+  const components = {
+    score: averageScore,
+    velocity: regressionPoints.length >= 2 ? mapVelocityToScore(pointsPerWeek) : null,
+    consistency: consistencyScore,
+    communication: communicationScore
+  };
+
+  const weightConfig: Record<keyof typeof components, number> = {
+    score: 0.5,
+    velocity: 0.2,
+    consistency: 0.2,
+    communication: 0.1
+  };
+
+  let weightedSum = 0;
+  let weightSum = 0;
+  (Object.keys(components) as Array<keyof typeof components>).forEach((key) => {
+    const value = components[key];
+    if (value == null) return;
+    const w = weightConfig[key];
+    weightedSum += value * w;
+    weightSum += w;
+  });
+
+  const compositeScore = weightSum > 0
+    ? Math.round((weightedSum / weightSum) * 10) / 10
+    : null;
+
+  return {
+    range,
+    startDate: start ? start.toISOString() : null,
+    endDate: end.toISOString(),
+    totals: {
+      completedInterviews,
+      totalMinutes,
+      thisWeekInterviews,
+      thisWeekMinutes,
+      activeWeeks,
+      currentWeekStreak
+    },
+    scores: {
+      averageScore,
+      bestScore,
+      latestScore
+    },
+    recentScores,
+    velocity: {
+      pointsPerWeek,
+      label: velocityLabel
+    },
+    consistencyScore,
+    communication: {
+      sentimentScore: sentimentScore100,
+      paceWpm,
+      score: communicationScore
+    },
+    composite: {
+      score: compositeScore,
+      components
+    },
+    breakdown
   };
 }

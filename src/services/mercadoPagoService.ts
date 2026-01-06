@@ -1,7 +1,6 @@
 import { MercadoPagoConfig, Preference, Payment } from 'mercadopago';
-import { clerkClient } from '@clerk/express';
 import { paymentLogger } from '../utils/logger';
-import { updateUserCredits, getUserFromDatabase } from './clerkService';
+import { updateUserCredits, getUserById } from './userService';
 import { addPurchasedCredits, getWalletBalance } from './creditsWalletService';
 import { sendPurchaseReceiptEmail, PurchaseEmailData, UserEmailData } from './transactionalEmailService';
 
@@ -330,7 +329,7 @@ export class MercadoPagoService {
             // ========================================
             try {
               // Get user info for email
-              const dbUser = await getUserFromDatabase(userId);
+              const dbUser = await getUserById(userId);
               
               if (dbUser && dbUser.email) {
                 // Get package info
@@ -339,7 +338,6 @@ export class MercadoPagoService {
                 const purchaseData: PurchaseEmailData = {
                   user: {
                     id: dbUser.id,
-                    clerkId: dbUser.clerkId,
                     email: dbUser.email,
                     firstName: dbUser.firstName,
                     lastName: dbUser.lastName,
@@ -347,7 +345,6 @@ export class MercadoPagoService {
                   },
                   paymentId: String(paymentId),
                   provider: 'mercadopago',
-                  packageName: pkg?.name || packageId,
                   creditsAmount: credits,
                   amountPaid: pkg?.priceBRL || 0,
                   currency: 'BRL',
@@ -436,7 +433,7 @@ export class MercadoPagoService {
 
   /**
    * Add credits to user via PostgreSQL database
-   * Uses clerkService which updates both PostgreSQL (source of truth) and Clerk metadata
+   * Updates PostgreSQL (source of truth)
    * Also records the transaction in the credits wallet ledger for audit
    */
   private async addCreditsToUser(userId: string, creditsToAdd: number, paymentId?: string) {

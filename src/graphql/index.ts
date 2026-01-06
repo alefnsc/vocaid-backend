@@ -2,7 +2,7 @@
  * GraphQL Server Setup
  * 
  * Configures Apollo Server with Express integration.
- * Uses Clerk JWT for authentication in the context.
+ * Uses session-based authentication in the context.
  * 
  * @module graphql/index
  */
@@ -21,6 +21,9 @@ import { GraphQLFormattedError } from 'graphql';
 
 // Context
 import { createContext, GraphQLContext } from './context';
+
+// Session auth
+import { requireSession } from '../middleware/sessionAuthMiddleware';
 
 // Resolvers
 import { dashboardResolver } from './resolvers/dashboardResolver';
@@ -150,6 +153,15 @@ export async function setupGraphQL(
     process.env.FRONTEND_URL
   ].filter(Boolean) as string[];
 
+  const isLocalhostOrigin = (origin: string): boolean => {
+    try {
+      const url = new URL(origin);
+      return url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '::1';
+    } catch {
+      return false;
+    }
+  };
+
   // Mount GraphQL middleware at /graphql
   app.use(
     '/graphql',
@@ -157,6 +169,11 @@ export async function setupGraphQL(
       origin: function (origin, callback) {
         // Allow requests with no origin (server-to-server, health checks)
         if (!origin) {
+          return callback(null, true);
+        }
+
+        // Always allow local development origins regardless of NODE_ENV
+        if (isLocalhostOrigin(origin)) {
           return callback(null, true);
         }
         
@@ -180,6 +197,7 @@ export async function setupGraphQL(
       credentials: true,
     }),
     bodyParser.json(),
+    requireSession,
     // Type cast to resolve Express version mismatch between packages
     expressMiddleware(server, {
       context: async ({ req }) => createContext({ req: req as any }),

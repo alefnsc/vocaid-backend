@@ -10,6 +10,10 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { z } from 'zod';
 
+// Middleware
+import { requireAuth } from '../middleware/sessionAuthMiddleware';
+import { prisma } from '../services/databaseService';
+
 // Services
 import {
   getUserPreferences,
@@ -19,6 +23,7 @@ import {
 } from '../services/userPreferencesService';
 import { getMultilingualRetellService } from '../services/multilingualRetellService';
 import { getPaymentGateway, CREDIT_PACKAGES, getPackagePrice, getCurrencyForRegion } from '../services/paymentStrategyService';
+import { addPurchasedCredits } from '../services/creditsWalletService';
 import { apiLogger, paymentLogger } from '../utils/logger';
 
 // Types
@@ -34,6 +39,7 @@ const updatePreferencesSchema = z.object({
   language: z.string().refine(isValidLanguageCode, 'Invalid language code').optional(),
   country: z.string().length(2).optional(),
   timezone: z.string().optional(),
+  preferredPhoneCountry: z.string().length(2).optional(), // ISO2 for phone country picker
 });
 
 const registerMultilingualCallSchema = z.object({
@@ -57,6 +63,10 @@ const createPaymentSchema = z.object({
   provider: z.enum(['mercadopago', 'paypal']).optional(),
 });
 
+const confirmMercadoPagoSchema = z.object({
+  paymentId: z.string().min(1),
+});
+
 // ========================================
 // MIDDLEWARE
 // ========================================
@@ -73,25 +83,6 @@ function getClientIP(req: Request): string {
   return req.ip || req.socket.remoteAddress || '127.0.0.1';
 }
 
-/**
- * Get Clerk user ID from request
- */
-function getClerkUserId(req: Request): string | null {
-  return (req.headers['x-user-id'] as string) || null;
-}
-
-/**
- * Require authenticated user
- */
-function requireAuth(req: Request, res: Response, next: NextFunction) {
-  const clerkId = getClerkUserId(req);
-  if (!clerkId) {
-    return res.status(401).json({ status: 'error', message: 'Authentication required' });
-  }
-  (req as any).clerkUserId = clerkId;
-  next();
-}
-
 // ========================================
 // USER PREFERENCES ROUTES
 // ========================================
@@ -102,8 +93,8 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
  */
 router.get('/preferences', requireAuth, async (req: Request, res: Response) => {
   try {
-    const clerkId = (req as any).clerkUserId;
-    const preferences = await getUserPreferences(clerkId);
+    const userId = (req as any).userId;
+    const preferences = await getUserPreferences(userId);
     
     if (!preferences) {
       return res.status(404).json({
@@ -131,14 +122,15 @@ router.get('/preferences', requireAuth, async (req: Request, res: Response) => {
  */
 router.put('/preferences', requireAuth, async (req: Request, res: Response) => {
   try {
-    const clerkId = (req as any).clerkUserId;
+    const userId = (req as any).userId;
     const body = updatePreferencesSchema.parse(req.body);
     
-    const preferences = await updateUserPreferences(clerkId, {
+    const preferences = await updateUserPreferences(userId, {
       language: body.language as SupportedLanguageCode,
       country: body.country,
       timezone: body.timezone,
       setByUser: true,
+      preferredPhoneCountry: body.preferredPhoneCountry,
     });
     
     res.json({
@@ -169,11 +161,11 @@ router.put('/preferences', requireAuth, async (req: Request, res: Response) => {
  */
 router.post('/preferences/initialize', requireAuth, async (req: Request, res: Response) => {
   try {
-    const clerkId = (req as any).clerkUserId;
+    const userId = (req as any).userId;
     const ip = getClientIP(req);
     const headers = req.headers as Record<string, string>;
     
-    const preferences = await initializeUserPreferences(clerkId, ip, headers);
+    const preferences = await initializeUserPreferences(userId, ip, headers);
     
     res.json({
       status: 'success',
@@ -199,7 +191,7 @@ router.post('/preferences/initialize', requireAuth, async (req: Request, res: Re
  */
 router.post('/call/register', requireAuth, async (req: Request, res: Response) => {
   try {
-    const clerkId = (req as any).clerkUserId;
+    const userId = (req as any).userId;
     const body = registerMultilingualCallSchema.parse(req.body);
     
     const retellService = getMultilingualRetellService();
@@ -208,7 +200,7 @@ router.post('/call/register', requireAuth, async (req: Request, res: Response) =
     if (body.language) {
       // Use specified language
       result = await retellService.registerMultilingualCall({
-        userId: clerkId,
+        userId,
         language: body.language as SupportedLanguageCode,
         metadata: {
           ...body.metadata,
@@ -217,7 +209,7 @@ router.post('/call/register', requireAuth, async (req: Request, res: Response) =
       });
     } else {
       // Auto-detect from user preferences
-      result = await retellService.registerCallWithAutoLanguage(clerkId, body.metadata);
+      result = await retellService.registerCallWithAutoLanguage(userId, body.metadata);
     }
     
     res.json({
@@ -283,8 +275,8 @@ router.get('/languages', async (_req: Request, res: Response) => {
  */
 router.get('/payment/provider', requireAuth, async (req: Request, res: Response) => {
   try {
-    const clerkId = (req as any).clerkUserId;
-    const { provider, isFallback } = await getPreferredPaymentProvider(clerkId);
+    const userId = (req as any).userId;
+    const { provider, isFallback } = await getPreferredPaymentProvider(userId);
     
     const gateway = getPaymentGateway();
     const providerInfo = gateway.getProvider(provider);
@@ -313,8 +305,8 @@ router.get('/payment/provider', requireAuth, async (req: Request, res: Response)
  */
 router.get('/payment/packages', requireAuth, async (req: Request, res: Response) => {
   try {
-    const clerkId = (req as any).clerkUserId;
-    const preferences = await getUserPreferences(clerkId);
+    const userId = (req as any).userId;
+    const preferences = await getUserPreferences(userId);
     
     const language = (preferences?.language || 'en-US') as SupportedLanguageCode;
     const region = preferences?.region || 'GLOBAL';
@@ -354,12 +346,11 @@ router.get('/payment/packages', requireAuth, async (req: Request, res: Response)
  */
 router.post('/payment/create', requireAuth, async (req: Request, res: Response) => {
   try {
-    const clerkId = (req as any).clerkUserId;
+    const userId = (req as any).userId;
     const body = createPaymentSchema.parse(req.body);
-    const isDevelopment = process.env.NODE_ENV === 'development';
     
     // Get user preferences for language and region
-    const preferences = await getUserPreferences(clerkId);
+    const preferences = await getUserPreferences(userId);
     const language = (body.language || preferences?.language || 'en-US') as SupportedLanguageCode;
     const region = preferences?.region || 'GLOBAL';
     
@@ -382,24 +373,40 @@ router.post('/payment/create', requireAuth, async (req: Request, res: Response) 
       });
     }
     
-    // Get user email from Clerk (with development fallback)
-    let userEmail = '';
-    if (isDevelopment && clerkId.startsWith('test_')) {
-      // Development mode: use mock email for test users
-      userEmail = `${clerkId}@test.vocaid.com`;
-      paymentLogger.info('Using mock email for test user', { clerkId, userEmail });
-    } else {
-      const { clerkClient } = await import('@clerk/express');
-      const clerkUser = await clerkClient.users.getUser(clerkId);
-      userEmail = clerkUser.emailAddresses[0]?.emailAddress || '';
+    // Get user email from database
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { email: true },
+    });
+    
+    if (!user?.email) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'User email not found',
+      });
     }
+    
+    const userEmail = user.email;
     
     // Create payment with geo-based provider (or user-specified provider)
     const gateway = getPaymentGateway();
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
     const webhookUrl = process.env.WEBHOOK_BASE_URL;
+
+    // In development we typically only expose the backend via ngrok.
+    // If WEBHOOK_BASE_URL is configured, use backend redirect-bridge endpoints
+    // so providers can redirect to HTTPS (ngrok) and then bounce to the frontend.
+    const successUrl = webhookUrl
+      ? `${webhookUrl}/payment/redirect/success`
+      : `${frontendUrl}/payment/success`;
+    const failureUrl = webhookUrl
+      ? `${webhookUrl}/payment/redirect/failure`
+      : `${frontendUrl}/payment/failure`;
+    const pendingUrl = webhookUrl
+      ? `${webhookUrl}/payment/redirect/pending`
+      : `${frontendUrl}/payment/pending`;
     
-    const result = await gateway.createPayment(clerkId, {
+    const result = await gateway.createPayment(userId, {
       userEmail,
       packageId: body.packageId,
       packageName: pkg.name,
@@ -408,16 +415,16 @@ router.post('/payment/create', requireAuth, async (req: Request, res: Response) 
       amountLocal: pkg.prices[currency],
       currency,
       language,
-      successUrl: `${frontendUrl}/payment/success`,
-      failureUrl: `${frontendUrl}/payment/failure`,
-      pendingUrl: `${frontendUrl}/payment/pending`,
+      successUrl,
+      failureUrl,
+      pendingUrl,
       webhookUrl: webhookUrl ? `${webhookUrl}/webhook/payment` : undefined,
     }, body.provider); // Pass user-specified provider
     
     paymentLogger.info('Payment created', {
       provider: result.selectedProvider,
       packageId: body.packageId,
-      userId: clerkId,
+      userId,
     });
     
     res.json({
@@ -475,6 +482,73 @@ router.get('/payment/status/:paymentId', requireAuth, async (req: Request, res: 
     res.status(500).json({
       status: 'error',
       message: 'Failed to check payment status',
+    });
+  }
+});
+
+/**
+ * POST /api/multilingual/payment/confirm/mercadopago
+ * Confirm MercadoPago payment and add credits (fallback when webhook/redirect timing is unreliable).
+ * Protected: requires session auth; enforces `user.id`.
+ */
+router.post('/payment/confirm/mercadopago', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).userId as string;
+    const { paymentId } = confirmMercadoPagoSchema.parse(req.body);
+
+    const gateway = getPaymentGateway();
+    const mpProvider = gateway.getProvider('mercadopago');
+
+    // Reuse provider webhook logic to fetch/verify payment details and extract metadata.
+    const result = await mpProvider.handleWebhook({ data: { id: paymentId } }, req.headers as any);
+
+    if (result.userId && result.userId !== userId) {
+      return res.status(403).json({
+        status: 'error',
+        message: 'Payment does not belong to the current user',
+      });
+    }
+
+    if (!result.success || !result.creditsToAdd) {
+      return res.json({
+        status: 'success',
+        data: {
+          confirmed: false,
+          paymentId: result.paymentId || paymentId,
+          paymentStatus: result.status,
+          statusDetail: result.statusDetail,
+        },
+      });
+    }
+
+    const tx = await addPurchasedCredits(
+      userId,
+      result.creditsToAdd,
+      result.paymentId || paymentId,
+      'Mercado Pago Purchase'
+    );
+
+    return res.json({
+      status: 'success',
+      data: {
+        confirmed: true,
+        paymentId: result.paymentId || paymentId,
+        creditsAdded: result.creditsToAdd,
+        newBalance: tx.newBalance,
+      },
+    });
+  } catch (error: any) {
+    paymentLogger.error('Error confirming MercadoPago payment', { error: error.message });
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Validation failed',
+        errors: error.errors,
+      });
+    }
+    return res.status(500).json({
+      status: 'error',
+      message: 'Failed to confirm payment',
     });
   }
 });

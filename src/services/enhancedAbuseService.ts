@@ -1,13 +1,10 @@
 /**
  * Enhanced Abuse Prevention Service
- * Multi-layered defense system for free trial protection
- * 
- * Features:
- * - Disposable email domain blocking
- * - Subnet velocity tracking
- * - Hardware fingerprint validation
- * - Credit throttling
- * - Behavioral analysis
+ *
+ * The original implementation relied on Prisma models that are not present in the
+ * canonical `prisma/schema.prisma` (e.g. `signupRecord`, `subnetTracker`,
+ * `disposableEmailDomain`). This version keeps the same public API surface but
+ * implements lightweight, in-memory tracking.
  */
 
 import { prisma, dbLogger } from './databaseService';
@@ -22,10 +19,10 @@ const CONFIG = {
   MAX_ACCOUNTS_PER_FINGERPRINT: parseInt(process.env.MAX_ACCOUNTS_PER_FINGERPRINT || '1', 10),
   MAX_SIGNUPS_PER_SUBNET_HOUR: parseInt(process.env.MAX_SIGNUPS_PER_SUBNET_HOUR || '3', 10),
   
-  // Credit throttling - new accounts get 15 credits by default
-  INITIAL_CREDITS_UNVERIFIED: parseInt(process.env.FREE_TRIAL_CREDITS || '15', 10),
-  INITIAL_CREDITS_PHONE_VERIFIED: parseInt(process.env.FREE_TRIAL_CREDITS_PHONE_VERIFIED || '15', 10),
-  INITIAL_CREDITS_LINKEDIN_VERIFIED: parseInt(process.env.FREE_TRIAL_CREDITS_LINKEDIN_VERIFIED || '15', 10),
+  // Credits are no longer auto-granted; keep fields for compatibility.
+  INITIAL_CREDITS_UNVERIFIED: 0,
+  INITIAL_CREDITS_PHONE_VERIFIED: 0,
+  INITIAL_CREDITS_LINKEDIN_VERIFIED: 0,
   
   // Behavioral thresholds
   MIN_BEHAVIOR_SCORE_FOR_CREDITS: 30,
@@ -35,6 +32,36 @@ const CONFIG = {
   SUBNET_VELOCITY_WINDOW_HOURS: 1,
   SUBNET_TRACKER_EXPIRY_HOURS: 24,
 };
+
+type SignupRecord = {
+  userId: string;
+  ipAddress?: string;
+  deviceFingerprint?: string;
+  userAgent?: string;
+  emailDomain?: string;
+  creditTier: 'full' | 'throttled' | 'blocked';
+  captchaCompleted: boolean;
+  phoneVerified: boolean;
+  linkedInId?: string;
+  behaviorScore: number;
+  isSuspicious: boolean;
+  suspicionReason?: string | null;
+  createdAt: Date;
+};
+
+const signupRecordsByUserId = new Map<string, SignupRecord>();
+const fingerprintCounts = new Map<string, number>();
+const ipCounts = new Map<string, number>();
+
+type SubnetTrackerEntry = {
+  subnet: string;
+  signupCount: number;
+  windowStart: Date;
+  lastSignupAt: Date;
+  expiresAt: Date;
+};
+
+const subnetTrackers = new Map<string, SubnetTrackerEntry>();
 
 // ========================================
 // TYPES
@@ -94,6 +121,8 @@ const COMMON_DISPOSABLE_DOMAINS = new Set([
   // Add more as needed...
 ]);
 
+const disposableDomains = COMMON_DISPOSABLE_DOMAINS;
+
 /**
  * Extract domain from email address
  */
@@ -112,20 +141,8 @@ export async function checkDisposableEmail(email: string): Promise<DisposableEma
     return { isDisposable: false, domain: '' };
   }
 
-  // First check in-memory list (fast)
-  if (COMMON_DISPOSABLE_DOMAINS.has(domain)) {
+  if (disposableDomains.has(domain)) {
     dbLogger.warn('Disposable email detected (in-memory)', { domain });
-    return { isDisposable: true, domain };
-  }
-
-  // Then check database for extended list
-  const dbRecord = await prisma.disposableEmailDomain.findUnique({
-    where: { domain },
-    select: { isActive: true }
-  });
-
-  if (dbRecord?.isActive) {
-    dbLogger.warn('Disposable email detected (database)', { domain });
     return { isDisposable: true, domain };
   }
 
@@ -136,11 +153,9 @@ export async function checkDisposableEmail(email: string): Promise<DisposableEma
  * Add a new disposable email domain to the database
  */
 export async function addDisposableEmailDomain(domain: string, source?: string) {
-  return prisma.disposableEmailDomain.upsert({
-    where: { domain },
-    create: { domain, source, isActive: true },
-    update: { isActive: true, source }
-  });
+  disposableDomains.add(domain.toLowerCase());
+  dbLogger.info('Disposable email domain added (in-memory)', { domain, source });
+  return { domain, source };
 }
 
 /**
@@ -151,13 +166,7 @@ export async function seedDisposableEmailDomains() {
   
   dbLogger.info('Seeding disposable email domains', { count: domains.length });
   
-  for (const domain of domains) {
-    await prisma.disposableEmailDomain.upsert({
-      where: { domain },
-      create: { domain, source: 'initial_seed', isActive: true },
-      update: {} // Don't update if exists
-    });
-  }
+  domains.forEach((d) => disposableDomains.add(d.toLowerCase()));
   
   dbLogger.info('Disposable email domains seeded');
 }
@@ -194,28 +203,30 @@ export async function checkSubnetVelocity(ipAddress: string): Promise<SubnetVelo
   }
 
   const subnet = extractSubnet(ipAddress);
-  const windowStart = new Date(Date.now() - CONFIG.SUBNET_VELOCITY_WINDOW_HOURS * 60 * 60 * 1000);
-  const expiresAt = new Date(Date.now() + CONFIG.SUBNET_TRACKER_EXPIRY_HOURS * 60 * 60 * 1000);
+  const now = Date.now();
+  const windowMs = CONFIG.SUBNET_VELOCITY_WINDOW_HOURS * 60 * 60 * 1000;
+  const bucketStartMs = Math.floor(now / windowMs) * windowMs;
+  const windowStart = new Date(bucketStartMs);
+  const expiresAt = new Date(now + CONFIG.SUBNET_TRACKER_EXPIRY_HOURS * 60 * 60 * 1000);
 
-  // Upsert subnet tracker
-  const tracker = await prisma.subnetTracker.upsert({
-    where: {
-      subnet_windowStart: {
-        subnet,
-        windowStart
+  const key = `${subnet}:${windowStart.toISOString()}`;
+  const existing = subnetTrackers.get(key);
+  const tracker: SubnetTrackerEntry = existing
+    ? {
+        ...existing,
+        signupCount: existing.signupCount + 1,
+        lastSignupAt: new Date(),
+        expiresAt,
       }
-    },
-    create: {
-      subnet,
-      signupCount: 1,
-      windowStart,
-      expiresAt
-    },
-    update: {
-      signupCount: { increment: 1 },
-      lastSignupAt: new Date()
-    }
-  });
+    : {
+        subnet,
+        signupCount: 1,
+        windowStart,
+        lastSignupAt: new Date(),
+        expiresAt,
+      };
+
+  subnetTrackers.set(key, tracker);
 
   const isHighVelocity = tracker.signupCount > CONFIG.MAX_SIGNUPS_PER_SUBNET_HOUR;
 
@@ -238,17 +249,20 @@ export async function checkSubnetVelocity(ipAddress: string): Promise<SubnetVelo
  * Clean up expired subnet trackers
  */
 export async function cleanupExpiredSubnetTrackers() {
-  const result = await prisma.subnetTracker.deleteMany({
-    where: {
-      expiresAt: { lt: new Date() }
+  const now = Date.now();
+  let count = 0;
+  for (const [key, entry] of subnetTrackers.entries()) {
+    if (entry.expiresAt.getTime() < now) {
+      subnetTrackers.delete(key);
+      count++;
     }
-  });
-  
-  if (result.count > 0) {
-    dbLogger.info('Cleaned up expired subnet trackers', { count: result.count });
   }
-  
-  return result.count;
+
+  if (count > 0) {
+    dbLogger.info('Cleaned up expired subnet trackers', { count });
+  }
+
+  return count;
 }
 
 // ========================================
@@ -266,12 +280,7 @@ export async function checkDeviceFingerprint(fingerprint: string): Promise<{
     return { isReused: false, previousAccounts: 0 };
   }
 
-  const previousAccounts = await prisma.signupRecord.count({
-    where: {
-      deviceFingerprint: fingerprint,
-      freeCreditGranted: true
-    }
-  });
+  const previousAccounts = fingerprintCounts.get(fingerprint) ?? 0;
 
   const isReused = previousAccounts >= CONFIG.MAX_ACCOUNTS_PER_FINGERPRINT;
 
@@ -300,12 +309,7 @@ export async function checkIPAddress(ipAddress: string): Promise<{
     return { isOverLimit: false, previousAccounts: 0 };
   }
 
-  const previousAccounts = await prisma.signupRecord.count({
-    where: {
-      ipAddress,
-      freeCreditGranted: true
-    }
-  });
+  const previousAccounts = ipCounts.get(ipAddress) ?? 0;
 
   const isOverLimit = previousAccounts >= CONFIG.MAX_ACCOUNTS_PER_IP;
 
@@ -521,23 +525,34 @@ export async function recordEnhancedSignup(
 ) {
   try {
     const emailDomain = extractEmailDomain(signupInfo.email);
-    
-    const record = await prisma.signupRecord.create({
-      data: {
-        userId,
-        ipAddress: signupInfo.ipAddress,
-        deviceFingerprint: signupInfo.deviceFingerprint,
-        userAgent: signupInfo.userAgent,
-        emailDomain,
-        freeCreditGranted: abuseCheckResult.creditsToGrant > 0,
-        creditTier: abuseCheckResult.creditTier,
-        captchaCompleted: !!signupInfo.captchaToken,
-        linkedInId: signupInfo.linkedInId,
-        behaviorScore: 50, // Initial score
-        isSuspicious: abuseCheckResult.isSuspicious,
-        suspicionReason: abuseCheckResult.suspicionReasons.join('; ') || null
-      }
-    });
+
+    const record: SignupRecord = {
+      userId,
+      ipAddress: signupInfo.ipAddress,
+      deviceFingerprint: signupInfo.deviceFingerprint,
+      userAgent: signupInfo.userAgent,
+      emailDomain,
+      creditTier: abuseCheckResult.creditTier,
+      captchaCompleted: !!signupInfo.captchaToken,
+      phoneVerified: false,
+      linkedInId: signupInfo.linkedInId,
+      behaviorScore: 50,
+      isSuspicious: abuseCheckResult.isSuspicious,
+      suspicionReason: abuseCheckResult.suspicionReasons.join('; ') || null,
+      createdAt: new Date(),
+    };
+
+    signupRecordsByUserId.set(userId, record);
+
+    if (signupInfo.deviceFingerprint) {
+      fingerprintCounts.set(
+        signupInfo.deviceFingerprint,
+        (fingerprintCounts.get(signupInfo.deviceFingerprint) ?? 0) + 1
+      );
+    }
+    if (signupInfo.ipAddress) {
+      ipCounts.set(signupInfo.ipAddress, (ipCounts.get(signupInfo.ipAddress) ?? 0) + 1);
+    }
 
     dbLogger.info('Enhanced signup record created', {
       userId,
@@ -564,32 +579,27 @@ export async function updateSignupVerification(
   verificationData?: string
 ) {
   try {
-    const updateData: any = {};
-    
+    const existing = signupRecordsByUserId.get(userId);
+    if (!existing) return null;
+
+    const updated: SignupRecord = { ...existing };
     switch (verificationType) {
       case 'phone':
-        updateData.phoneVerified = true;
+        updated.phoneVerified = true;
         break;
       case 'captcha':
-        updateData.captchaCompleted = true;
+        updated.captchaCompleted = true;
         break;
       case 'linkedin':
-        updateData.linkedInId = verificationData;
+        updated.linkedInId = verificationData;
         break;
     }
 
-    const updated = await prisma.signupRecord.update({
-      where: { userId },
-      data: updateData
-    });
-
-    // Potentially upgrade credit tier
     if (updated.phoneVerified && updated.creditTier === 'throttled') {
-      await prisma.signupRecord.update({
-        where: { userId },
-        data: { creditTier: 'full' }
-      });
+      updated.creditTier = 'full';
     }
+
+    signupRecordsByUserId.set(userId, updated);
 
     dbLogger.info('Signup verification updated', {
       userId,
@@ -612,18 +622,12 @@ export async function updateSignupVerification(
  */
 export async function updateUserBehaviorScore(userId: string) {
   const score = await calculateBehaviorScore(userId);
-  
-  try {
-    await prisma.signupRecord.update({
-      where: { userId },
-      data: { behaviorScore: score }
-    });
-    
-    return score;
-  } catch (error) {
-    // Record might not exist for older users
-    return score;
+
+  const existing = signupRecordsByUserId.get(userId);
+  if (existing) {
+    signupRecordsByUserId.set(userId, { ...existing, behaviorScore: score });
   }
+  return score;
 }
 
 // ========================================
@@ -634,34 +638,18 @@ export async function updateUserBehaviorScore(userId: string) {
  * Get comprehensive abuse prevention statistics
  */
 export async function getEnhancedAbuseStats() {
-  const [
-    totalSignups,
-    suspiciousSignups,
-    blockedSignups,
-    throttledSignups,
-    phoneVerifiedSignups,
-    disposableEmailAttempts,
-    recentSubnetVelocity
-  ] = await Promise.all([
-    prisma.signupRecord.count(),
-    prisma.signupRecord.count({ where: { isSuspicious: true } }),
-    prisma.signupRecord.count({ where: { creditTier: 'blocked' } }),
-    prisma.signupRecord.count({ where: { creditTier: 'throttled' } }),
-    prisma.signupRecord.count({ where: { phoneVerified: true } }),
-    prisma.signupRecord.count({
-      where: {
-        isSuspicious: true,
-        suspicionReason: { contains: 'Disposable email' }
-      }
-    }),
-    prisma.subnetTracker.findMany({
-      where: {
-        signupCount: { gt: CONFIG.MAX_SIGNUPS_PER_SUBNET_HOUR }
-      },
-      orderBy: { signupCount: 'desc' },
-      take: 10
-    })
-  ]);
+  const records = Array.from(signupRecordsByUserId.values());
+  const totalSignups = records.length;
+  const suspiciousSignups = records.filter((r) => r.isSuspicious).length;
+  const blockedSignups = records.filter((r) => r.creditTier === 'blocked').length;
+  const throttledSignups = records.filter((r) => r.creditTier === 'throttled').length;
+  const phoneVerifiedSignups = records.filter((r) => r.phoneVerified).length;
+  const disposableEmailAttempts = records.filter((r) => (r.suspicionReason ?? '').includes('Disposable email')).length;
+
+  const recentSubnetVelocity = Array.from(subnetTrackers.values())
+    .filter((s) => s.signupCount > CONFIG.MAX_SIGNUPS_PER_SUBNET_HOUR)
+    .sort((a, b) => b.signupCount - a.signupCount)
+    .slice(0, 10);
 
   return {
     totalSignups,

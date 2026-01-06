@@ -51,34 +51,33 @@ jest.mock('../../services/databaseService', () => ({
   },
 }));
 
-// Mock Clerk authentication
-jest.mock('@clerk/express', () => ({
-  clerkMiddleware: () => (req: any, res: any, next: any) => {
-    req.auth = { userId: 'user_test123' };
-    next();
-  },
-  requireAuth: () => (req: any, res: any, next: any) => {
-    req.auth = { userId: 'user_test123' };
-    (req as any).clerkUserId = 'user_test123';
-    next();
-  },
-  getAuth: () => ({ userId: 'user_test123' }),
-}));
 
 // Mock logger
-jest.mock('../../utils/logger', () => ({
-  default: {
+jest.mock('../../utils/logger', () => {
+  const childLogger = {
     info: jest.fn(),
     error: jest.fn(),
     warn: jest.fn(),
     debug: jest.fn(),
-  },
-  httpLogger: {
+  };
+
+  const logger = {
     info: jest.fn(),
     error: jest.fn(),
     warn: jest.fn(),
-  },
-}));
+    debug: jest.fn(),
+    child: jest.fn(() => childLogger),
+  };
+
+  return {
+    __esModule: true,
+    default: logger,
+    httpLogger: childLogger,
+    wsLogger: childLogger,
+    authLogger: childLogger,
+    dbLogger: childLogger,
+  };
+});
 
 // ============================================
 // TEST UTILITIES
@@ -93,8 +92,7 @@ function createTestApp() {
   
   // Add mock auth middleware
   app.use((req: any, res, next) => {
-    req.auth = { userId: 'user_test123' };
-    req.clerkUserId = 'user_test123';
+    req.userId = 'user_test123';
     req.requestId = 'test-request-id';
     next();
   });
@@ -372,21 +370,15 @@ describe('Resume API Contracts', () => {
       expect(typeof mockResumeListItem.isPrimary).toBe('boolean');
     });
   });
-  
+
   describe('Resume Score Response', () => {
     const mockResumeScore = {
       resumeId: '550e8400-e29b-41d4-a716-446655440000',
       roleTitle: 'Software Engineer',
       score: 78,
-      provider: 'openai',
-      breakdown: {
-        skills: 85,
-        experience: 70,
-        education: 80,
-      },
-      cachedAt: '2024-12-01T10:00:00Z',
+      provider: 'mock',
     };
-    
+
     it('should have correct score response shape', () => {
       expect(mockResumeScore).toHaveProperty('resumeId');
       expect(mockResumeScore).toHaveProperty('roleTitle');
