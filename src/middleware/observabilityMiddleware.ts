@@ -151,6 +151,9 @@ export function observabilityMiddleware(req: Request, res: Response, next: NextF
   const startTime = Date.now();
   const fingerprint = getRequestFingerprint(req);
   const isDuplicate = detectDuplicate(fingerprint);
+
+  const endpointPath = `${req.baseUrl || ''}${req.path || ''}` || req.path;
+  const displayPath = (req.originalUrl || endpointPath).split('?')[0];
   
   // Attach request ID and metrics to request object
   (req as any).requestId = requestId;
@@ -177,9 +180,9 @@ export function observabilityMiddleware(req: Request, res: Response, next: NextF
   
   if (isDuplicate) {
     logData.duplicate = true;
-    httpLogger.warn(`⚡ Duplicate request detected: ${req.method} ${req.path}`, logData);
+    httpLogger.warn(`⚡ Duplicate request detected: ${req.method} ${displayPath}`, logData);
   } else {
-    httpLogger.info(`→ ${req.method} ${req.path}`, logData);
+    httpLogger.info(`→ ${req.method} ${displayPath}`, logData);
   }
   
   // Capture response metrics
@@ -201,7 +204,7 @@ export function observabilityMiddleware(req: Request, res: Response, next: NextF
     metrics.totalResponseBytes += responseSize;
     if (isSlow) metrics.slowRequests++;
     
-    updateEndpointStats(req.path, duration, responseSize, isSlow);
+    updateEndpointStats(endpointPath, duration, responseSize, isSlow);
     
     // Determine log level based on status and duration
     const logLevel = statusCode >= 500 ? 'error' : 
@@ -218,9 +221,9 @@ export function observabilityMiddleware(req: Request, res: Response, next: NextF
     
     if (isSlow) {
       responseLog.slow = true;
-      httpLogger.warn(`⚠ SLOW: ${req.method} ${req.path} took ${duration}ms`, responseLog);
+      httpLogger.warn(`⚠ SLOW: ${req.method} ${displayPath} took ${duration}ms`, responseLog);
     } else {
-      httpLogger[logLevel](`← ${req.method} ${req.path} ${statusCode}`, responseLog);
+      httpLogger[logLevel](`← ${req.method} ${displayPath} ${statusCode}`, responseLog);
     }
     
     return originalSend(body);

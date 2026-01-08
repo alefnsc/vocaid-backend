@@ -17,7 +17,7 @@ jest.setTimeout(30000);
 
 // Mock Prisma client for unit tests
 jest.mock('@prisma/client', () => {
-  const mockPrismaClient = {
+  const mockPrismaClient: any = {
     $connect: jest.fn(),
     $disconnect: jest.fn(),
     transactionalEmail: {
@@ -38,11 +38,66 @@ jest.mock('@prisma/client', () => {
       update: jest.fn(),
       updateMany: jest.fn()
     },
+    session: {
+      create: jest.fn(),
+      findUnique: jest.fn(),
+      update: jest.fn(),
+      deleteMany: jest.fn(),
+    },
+    linkedInProfile: {
+      findFirst: jest.fn(),
+      create: jest.fn(),
+      upsert: jest.fn(),
+    },
+    googleProfile: {
+      findUnique: jest.fn(),
+      findFirst: jest.fn(),
+      create: jest.fn(),
+      upsert: jest.fn(),
+      update: jest.fn(),
+      deleteMany: jest.fn(),
+    },
+    microsoftProfile: {
+      findUnique: jest.fn(),
+      findFirst: jest.fn(),
+      create: jest.fn(),
+      upsert: jest.fn(),
+      update: jest.fn(),
+      deleteMany: jest.fn(),
+    },
+    xProfile: {
+      findUnique: jest.fn(),
+      findFirst: jest.fn(),
+      create: jest.fn(),
+      upsert: jest.fn(),
+      update: jest.fn(),
+      deleteMany: jest.fn(),
+    },
+    userConsent: {
+      findUnique: jest.fn(),
+      create: jest.fn(),
+      upsert: jest.fn(),
+      update: jest.fn(),
+      updateMany: jest.fn(),
+    },
     user: {
       findUnique: jest.fn(),
-      findMany: jest.fn()
+      findMany: jest.fn(),
+      findFirst: jest.fn(),
+      create: jest.fn(),
+      update: jest.fn(),
     }
   };
+
+  mockPrismaClient.$transaction = jest.fn(async (arg: any): Promise<any> => {
+    if (Array.isArray(arg)) {
+      return Promise.all(arg);
+    }
+    if (typeof arg === 'function') {
+      return arg(mockPrismaClient);
+    }
+    return arg;
+  });
   
   return {
     PrismaClient: jest.fn(() => mockPrismaClient),

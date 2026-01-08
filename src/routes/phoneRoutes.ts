@@ -113,18 +113,43 @@ router.post('/verify-otp', requireSession, async (req: Request, res: Response) =
 
 /**
  * POST /api/phone/skip-for-credits
+ * 
+ * Records that user skipped phone verification during onboarding.
+ * Used for dashboard CTA targeting (reminder to verify for credits).
  */
 router.post('/skip-for-credits', requireSession, async (req: Request, res: Response) => {
+  const userId = req.userId!;
+  const startTime = Date.now();
+  
+  console.log('[PhoneRoutes] skip-for-credits: request received', { userId });
+  
   try {
-    const userId = req.userId!;
     const success = await phoneVerificationService.skipPhoneVerificationForCredits(userId);
 
+    const duration = Date.now() - startTime;
+    
     if (!success) {
+      console.warn('[PhoneRoutes] skip-for-credits: failed to record', { 
+        userId, 
+        durationMs: duration 
+      });
       return res.status(400).json({ status: 'error', message: 'Failed to record skip preference' });
     }
 
+    console.log('[PhoneRoutes] skip-for-credits: success', { 
+      userId, 
+      durationMs: duration 
+    });
+    
     return res.json({ status: 'success', message: 'Skip preference recorded' });
   } catch (error: any) {
+    const duration = Date.now() - startTime;
+    console.error('[PhoneRoutes] skip-for-credits: exception', { 
+      userId, 
+      error: error?.message,
+      durationMs: duration 
+    });
+    
     return res.status(500).json({
       status: 'error',
       message: error?.message || 'Failed to record skip preference',

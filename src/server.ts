@@ -284,6 +284,10 @@ app.use('/api/feedback/beta', betaFeedbackRoutes);
 import userRoutes from './routes/userRoutes';
 app.use('/api/users', userRoutes);
 
+// Mount account routes (connected OAuth providers management)
+import accountRoutes from './routes/accountRoutes';
+app.use('/api/account', accountRoutes);
+
 // Mount LinkedIn profile routes (profile storage, scoring, consent)
 import linkedinProfileRoutes from './routes/linkedinProfileRoutes';
 app.use('/api/linkedin-profile', linkedinProfileRoutes);

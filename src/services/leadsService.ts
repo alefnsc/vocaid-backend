@@ -1,13 +1,16 @@
 /**
  * Leads Service
  *
- * Lead capture was previously backed by a Prisma `Lead` model.
- * The canonical `prisma/schema.prisma` in this repo does not include that model,
- * so this service is currently a stub.
+ * Lead capture backed by Prisma Lead model.
+ * Handles early access signups and demo requests with deduplication.
+ * 
+ * @module services/leadsService
  */
 
+import { PrismaClient, LeadType, CompanySizeTier } from '@prisma/client';
 import logger from '../utils/logger';
 
+const prisma = new PrismaClient();
 const leadsLogger = logger.child({ component: 'leads' });
 
 // ========================================
@@ -17,13 +20,12 @@ const leadsLogger = logger.child({ component: 'leads' });
 export interface CreateLeadParams {
   name: string;
   email: string;
-  company?: string;
-  phone?: string;
-  type: string;
-  source?: string;
-  teamSize?: string;
-  useCase?: string;
+  type: LeadType;
+  companyName?: string;
+  companySizeTier?: CompanySizeTier;
+  phoneE164?: string;
   interestedModules?: string[];
+  source?: string;
   ipAddress?: string;
   userAgent?: string;
   referrer?: string;
@@ -37,7 +39,7 @@ export interface LeadResult {
 }
 
 export interface LeadQueryParams {
-  type?: string;
+  type?: LeadType;
   contacted?: boolean;
   limit?: number;
   offset?: number;
@@ -49,26 +51,113 @@ export interface LeadQueryParams {
 
 /**
  * Create a new lead
- * Handles both demo requests and early access signups
+ * Handles both demo requests and early access signups with deduplication.
  */
 export async function createLead(params: CreateLeadParams): Promise<LeadResult> {
-  leadsLogger.warn('createLead called but leads are disabled', {
-    email: params.email,
-    type: params.type,
+  const { 
+    name, 
+    email, 
+    type,
+    companyName,
+    companySizeTier,
+    phoneE164,
+    interestedModules = [],
+    source,
+    ipAddress,
+    userAgent,
+    referrer,
+  } = params;
+
+  leadsLogger.info('Creating lead', {
+    email,
+    type,
+    companyName,
+    companySizeTier,
+    modules: interestedModules,
   });
 
-  return {
-    success: false,
-    error: 'Leads capture is not available on this deployment.',
-  };
+  try {
+    // Upsert to handle duplicates gracefully (update if exists)
+    const lead = await prisma.lead.upsert({
+      where: {
+        type_email: {
+          type,
+          email: email.toLowerCase().trim(),
+        },
+      },
+      update: {
+        name,
+        companyName,
+        companySizeTier,
+        phoneE164,
+        interestedModules,
+        source,
+        ipAddress,
+        userAgent,
+        referrer,
+        updatedAt: new Date(),
+      },
+      create: {
+        type,
+        email: email.toLowerCase().trim(),
+        name,
+        companyName,
+        companySizeTier,
+        phoneE164,
+        interestedModules,
+        source,
+        ipAddress,
+        userAgent,
+        referrer,
+      },
+    });
+
+    leadsLogger.info('Lead created/updated successfully', { 
+      leadId: lead.id,
+      type,
+      email,
+    });
+
+    return {
+      success: true,
+      lead: { id: lead.id },
+    };
+  } catch (error: any) {
+    leadsLogger.error('Failed to create lead', {
+      email,
+      type,
+      error: error.message,
+    });
+
+    return {
+      success: false,
+      error: 'Failed to save lead. Please try again.',
+    };
+  }
 }
 
 /**
  * Get leads with optional filtering
  */
-export async function getLeads(_params: LeadQueryParams = {}): Promise<any[]> {
-  leadsLogger.warn('getLeads called but leads are disabled');
-  return [];
+export async function getLeads(params: LeadQueryParams = {}): Promise<any[]> {
+  const { type, contacted, limit = 100, offset = 0 } = params;
+
+  try {
+    const leads = await prisma.lead.findMany({
+      where: {
+        ...(type && { type }),
+        ...(contacted !== undefined && { contacted }),
+      },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      skip: offset,
+    });
+
+    return leads;
+  } catch (error: any) {
+    leadsLogger.error('Failed to get leads', { error: error.message });
+    return [];
+  }
 }
 
 /**
@@ -77,9 +166,26 @@ export async function getLeads(_params: LeadQueryParams = {}): Promise<any[]> {
 export async function markLeadContacted(
   leadId: string,
   notes?: string
-): Promise<null> {
-  leadsLogger.warn('markLeadContacted called but leads are disabled', { leadId, notes });
-  return null;
+): Promise<any | null> {
+  try {
+    const lead = await prisma.lead.update({
+      where: { id: leadId },
+      data: {
+        contacted: true,
+        contactedAt: new Date(),
+        contactNotes: notes,
+      },
+    });
+
+    leadsLogger.info('Lead marked as contacted', { leadId });
+    return lead;
+  } catch (error: any) {
+    leadsLogger.error('Failed to mark lead as contacted', { 
+      leadId, 
+      error: error.message,
+    });
+    return null;
+  }
 }
 
 /**
@@ -93,15 +199,37 @@ export async function getLeadStats(): Promise<{
   pending: number;
   lastWeek: number;
 }> {
-  leadsLogger.warn('getLeadStats called but leads are disabled');
-  return {
-    total: 0,
-    demoRequests: 0,
-    earlyAccess: 0,
-    contacted: 0,
-    pending: 0,
-    lastWeek: 0,
-  };
+  try {
+    const oneWeekAgo = new Date();
+    oneWeekAgo.setDate(oneWeekAgo.getDate() - 7);
+
+    const [total, demoRequests, earlyAccess, contacted, lastWeek] = await Promise.all([
+      prisma.lead.count(),
+      prisma.lead.count({ where: { type: 'DEMO_REQUEST' } }),
+      prisma.lead.count({ where: { type: 'EARLY_ACCESS' } }),
+      prisma.lead.count({ where: { contacted: true } }),
+      prisma.lead.count({ where: { createdAt: { gte: oneWeekAgo } } }),
+    ]);
+
+    return {
+      total,
+      demoRequests,
+      earlyAccess,
+      contacted,
+      pending: total - contacted,
+      lastWeek,
+    };
+  } catch (error: any) {
+    leadsLogger.error('Failed to get lead stats', { error: error.message });
+    return {
+      total: 0,
+      demoRequests: 0,
+      earlyAccess: 0,
+      contacted: 0,
+      pending: 0,
+      lastWeek: 0,
+    };
+  }
 }
 
 export default {

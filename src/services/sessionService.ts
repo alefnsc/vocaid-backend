@@ -19,6 +19,66 @@ const sessionLogger = logger.child({ service: 'session' });
 // CONFIGURATION
 // ========================================
 
+type SameSiteOption = 'lax' | 'strict' | 'none';
+
+function parseBooleanEnv(value: string | undefined): boolean | undefined {
+  if (value == null) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (['true', '1', 'yes', 'y'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'n'].includes(normalized)) return false;
+  return undefined;
+}
+
+function parseSameSiteEnv(value: string | undefined): SameSiteOption | undefined {
+  if (!value) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'lax' || normalized === 'strict' || normalized === 'none') return normalized;
+  return undefined;
+}
+
+function shouldUseSecureCookiesByDefault(): boolean {
+  const candidates = [
+    process.env.BACKEND_PUBLIC_URL,
+    process.env.WEBHOOK_BASE_URL,
+    process.env.PUBLIC_URL,
+  ].filter(Boolean) as string[];
+
+  for (const candidate of candidates) {
+    try {
+      const url = new URL(candidate);
+      if (url.protocol === 'https:') return true;
+      if (url.hostname.includes('ngrok')) return true;
+    } catch {
+      // ignore
+    }
+  }
+
+  return process.env.NODE_ENV === 'production';
+}
+
+export function getSessionCookieOptions(): {
+  httpOnly: boolean;
+  secure: boolean;
+  sameSite: SameSiteOption;
+  path: string;
+} {
+  const envSameSite = parseSameSiteEnv(process.env.SESSION_COOKIE_SAMESITE);
+  const envSecure = parseBooleanEnv(process.env.SESSION_COOKIE_SECURE);
+
+  const secure = envSecure ?? shouldUseSecureCookiesByDefault();
+  const sameSite: SameSiteOption = envSameSite ?? (secure ? 'none' : 'lax');
+
+  // Browsers reject SameSite=None cookies unless Secure=true.
+  const normalizedSameSite: SameSiteOption = sameSite === 'none' && !secure ? 'lax' : sameSite;
+
+  return {
+    httpOnly: true,
+    secure,
+    sameSite: normalizedSameSite,
+    path: '/',
+  };
+}
+
 const SESSION_CONFIG = {
   // Session token length (32 bytes = 256 bits of entropy)
   tokenLength: 32,
@@ -30,13 +90,11 @@ const SESSION_CONFIG = {
   cookieName: 'vocaid_session',
   
   // Cookie settings
-  cookie: {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax' as const,
-    path: '/',
-  },
+  cookie: getSessionCookieOptions(),
 };
+
+// Log effective session cookie options on module load (helps debug SameSite/Secure issues)
+sessionLogger.info('Session cookie options resolved', SESSION_CONFIG.cookie);
 
 // ========================================
 // TOKEN UTILITIES

@@ -106,6 +106,16 @@ enum EmailProvider {
   RESEND      // Resend email service
 }
 
+enum MediaKind {
+  RECORDING   // User audio/video recording from browser
+}
+
+enum MediaStatus {
+  UPLOADING   // Upload in progress
+  AVAILABLE   // Upload complete, ready for playback
+  FAILED      // Upload failed
+}
+
 // ========================================
 // USER MODEL
 // ========================================
@@ -134,6 +144,7 @@ model User {
   registrationRegion    String?   @map("registration_region") @db.VarChar(10)
   registrationCountry   String?   @map("registration_country") @db.VarChar(2)
   initialIp             String?   @map("initial_ip") @db.VarChar(45)
+  accountTypeConfirmedAt DateTime? @map("account_type_confirmed_at")
   onboardingComplete    Boolean   @default(false) @map("onboarding_complete")
   onboardingCompletedAt DateTime? @map("onboarding_completed_at")
   
@@ -162,17 +173,23 @@ model User {
   resumeDocuments ResumeDocument[]
   chatSessions    ChatSession[]
   linkedInProfiles LinkedInProfile[]
+  xProfile        XProfile?
+  googleProfile   GoogleProfile?
+  microsoftProfile MicrosoftProfile?
   creditsWallet   CreditsWallet?
   creditLedger    CreditLedger[]
   transactionalEmails TransactionalEmail[]
   userConsent     UserConsent?
   performanceGoal PerformanceGoal?
+  betaFeedback    BetaFeedback[]
+  interviewMedia  InterviewMedia[]
 
   @@index([email])
   @@index([isActive])
   @@index([preferredLanguage])
   @@index([registrationRegion])
   @@index([currentRole])
+  @@index([accountTypeConfirmedAt])
   @@index([onboardingCompletedAt])
   @@index([userType])
   @@index([countryCode])
@@ -514,6 +531,7 @@ model Interview {
   emailLogs       EmailLog[]
   session         InterviewSession?
   studyRecommendation StudyRecommendation?
+  media           InterviewMedia?
 
   @@index([userId])
   @@index([retellCallId])
@@ -530,6 +548,34 @@ model Interview {
   @@index([userId, createdAt])
   @@index([userId, endedAt])
   @@map("interviews")
+}
+
+// ========================================
+// INTERVIEW MEDIA MODEL
+// Stores user audio/video recording metadata
+// ========================================
+model InterviewMedia {
+  id           String       @id @default(uuid()) @db.Uuid
+  interviewId  String       @unique @map("interview_id") @db.Uuid
+  userId       String       @map("user_id") @db.Uuid
+  
+  kind         MediaKind    @default(RECORDING)
+  blobKey      String       @map("blob_key") @db.VarChar(500)
+  mimeType     String       @map("mime_type") @db.VarChar(100)
+  sizeBytes    Int          @map("size_bytes")
+  durationSec  Int?         @map("duration_sec")
+  
+  status       MediaStatus  @default(UPLOADING)
+  
+  createdAt    DateTime     @default(now()) @map("created_at")
+  updatedAt    DateTime     @updatedAt @map("updated_at")
+  
+  interview    Interview    @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([userId])
+  @@index([status])
+  @@map("interview_media")
 }
 
 // ========================================
@@ -654,6 +700,72 @@ model LinkedInProfileScore {
   @@index([roleKey])
   @@index([computedAt])
   @@map("linkedin_profile_scores")
+}
+
+// ========================================
+// X (TWITTER) PROFILE MODEL
+// Stores X OAuth user data for linking/login
+// ========================================
+model XProfile {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @unique @map("user_id") @db.Uuid
+
+  xUserId    String   @unique @map("x_user_id") @db.VarChar(100)
+  username   String?  @db.VarChar(100)
+  name       String?  @db.VarChar(255)
+  pictureUrl String?  @map("picture_url") @db.VarChar(500)
+
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([xUserId])
+  @@map("x_profiles")
+}
+
+// ========================================
+// GOOGLE PROFILE MODEL
+// Stores Google OAuth user data for linking/login
+// ========================================
+model GoogleProfile {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @unique @map("user_id") @db.Uuid
+
+  googleId   String   @unique @map("google_id") @db.VarChar(100)
+  email      String?  @db.VarChar(255)
+  name       String?  @db.VarChar(255)
+  pictureUrl String?  @map("picture_url") @db.VarChar(500)
+
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([googleId])
+  @@map("google_profiles")
+}
+
+// ========================================
+// MICROSOFT PROFILE MODEL
+// Stores Microsoft OAuth user data for linking/login
+// ========================================
+model MicrosoftProfile {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @unique @map("user_id") @db.Uuid
+
+  msUserId   String   @unique @map("ms_user_id") @db.VarChar(100)
+  email      String?  @db.VarChar(255)
+  name       String?  @db.VarChar(255)
+  pictureUrl String?  @map("picture_url") @db.VarChar(500)
+
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([msUserId])
+  @@map("microsoft_profiles")
 }
 
 // ========================================
@@ -961,4 +1073,161 @@ model InterviewSession {
   @@index([callStartedAt])
   @@index([endReason])
   @@map("interview_sessions")
+}
+
+// ========================================
+// LEAD CAPTURE MODEL
+// Stores waitlist signups and demo requests
+// ========================================
+
+enum LeadType {
+  EARLY_ACCESS    // Waitlist for B2B features
+  DEMO_REQUEST    // Inbound demo request
+}
+
+enum CompanySizeTier {
+  STARTUP      // 1-20 employees
+  SMALL        // 21-200 employees
+  MEDIUM       // 201-10,000 employees
+  ENTERPRISE   // >10,001 employees
+}
+
+model Lead {
+  id                  String          @id @default(uuid()) @db.Uuid
+  
+  type                LeadType
+  email               String          @db.VarChar(320)
+  name                String          @db.VarChar(200)
+  companyName         String?         @map("company_name") @db.VarChar(200)
+  companySizeTier     CompanySizeTier? @map("company_size_tier")
+  phoneE164           String?         @map("phone_e164") @db.VarChar(20)
+  
+  // Interested modules for early access (hr_recruiting_platform, employee_services_hub)
+  interestedModules   String[]        @map("interested_modules") @db.VarChar(50)
+  
+  // Tracking metadata
+  source              String?         @db.VarChar(50)
+  ipAddress           String?         @map("ip_address") @db.VarChar(45)
+  userAgent           String?         @map("user_agent") @db.VarChar(500)
+  referrer            String?         @db.VarChar(500)
+  
+  // Contact status
+  contacted           Boolean         @default(false)
+  contactedAt         DateTime?       @map("contacted_at")
+  contactNotes        String?         @map("contact_notes") @db.Text
+  
+  createdAt           DateTime        @default(now()) @map("created_at")
+  updatedAt           DateTime        @updatedAt @map("updated_at")
+  
+  @@unique([type, email])
+  @@index([type])
+  @@index([email])
+  @@index([companySizeTier])
+  @@index([contacted])
+  @@index([createdAt])
+  @@map("leads")
+}
+
+// ========================================
+// BETA FEEDBACK MODEL
+// Stores closed beta bug reports and feature suggestions
+// ========================================
+
+enum BetaFeedbackType {
+  BUG
+  FEATURE
+}
+
+enum BetaFeedbackStatus {
+  NEW
+  TRIAGED
+  DONE
+  SPAM
+}
+
+enum BetaFeedbackSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  BLOCKING
+}
+
+enum BetaFeedbackFrequency {
+  ALWAYS
+  SOMETIMES
+  ONCE
+}
+
+enum BetaFeedbackPriority {
+  NICE_TO_HAVE
+  IMPORTANT
+  CRITICAL
+}
+
+enum BetaFeedbackTargetUser {
+  SELF
+  RECRUITERS
+  OTHER
+}
+
+model BetaFeedback {
+  id                  String              @id @default(uuid()) @db.Uuid
+  refId               String              @unique @map("ref_id") @db.Uuid
+  
+  // Type discriminator
+  type                BetaFeedbackType
+  
+  // Core fields (both types)
+  title               String              @db.VarChar(200)
+  description         String              @db.Text
+  
+  // Bug-specific fields (null for features)
+  severity            BetaFeedbackSeverity?
+  frequency           BetaFeedbackFrequency?
+  stepsToReproduce    Json?               @map("steps_to_reproduce")
+  expectedBehavior    String?             @map("expected_behavior") @db.Text
+  actualBehavior      String?             @map("actual_behavior") @db.Text
+  
+  // Feature-specific fields (null for bugs)
+  priority            BetaFeedbackPriority?
+  targetUser          BetaFeedbackTargetUser? @map("target_user")
+  goal                String?             @db.Text
+  alternativesTried   String?             @map("alternatives_tried") @db.Text
+  
+  // Metadata
+  pageUrl             String              @map("page_url") @db.VarChar(500)
+  userEmail           String              @map("user_email") @db.VarChar(255)
+  clerkUserId         String?             @map("clerk_user_id") @db.VarChar(100)
+  vocaidUserId        String?             @map("vocaid_user_id") @db.Uuid
+  language            String              @default("en") @db.VarChar(10)
+  appEnv              String              @map("app_env") @db.VarChar(20)
+  appVersion          String              @map("app_version") @db.VarChar(20)
+  userAgent           String?             @map("user_agent") @db.VarChar(500)
+  allowFollowUp       Boolean             @default(false) @map("allow_follow_up")
+  
+  // Ops fields
+  status              BetaFeedbackStatus  @default(NEW)
+  source              String              @default("web") @db.VarChar(50)
+  ipAddress           String?             @map("ip_address") @db.VarChar(45)
+  
+  // reCAPTCHA verification results
+  recaptchaScore      Float?              @map("recaptcha_score") @db.DoublePrecision
+  recaptchaAction     String?             @map("recaptcha_action") @db.VarChar(50)
+  recaptchaVerifiedAt DateTime?           @map("recaptcha_verified_at")
+  recaptchaRaw        Json?               @map("recaptcha_raw")
+  
+  // Timestamps
+  createdAt           DateTime            @default(now()) @map("created_at")
+  updatedAt           DateTime            @updatedAt @map("updated_at")
+  
+  // Optional FK to User (best-effort mapping from clerkUserId)
+  vocaidUser          User?               @relation(fields: [vocaidUserId], references: [id], onDelete: SetNull)
+  
+  @@index([type])
+  @@index([status])
+  @@index([userEmail])
+  @@index([clerkUserId])
+  @@index([vocaidUserId])
+  @@index([createdAt])
+  @@map("beta_feedback")
 }

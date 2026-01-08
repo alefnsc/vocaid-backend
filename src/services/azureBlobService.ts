@@ -13,7 +13,15 @@
  * @module services/azureBlobService
  */
 
-import { BlobServiceClient, ContainerClient, BlockBlobClient } from '@azure/storage-blob';
+import { 
+  BlobServiceClient, 
+  ContainerClient, 
+  BlockBlobClient,
+  StorageSharedKeyCredential,
+  generateBlobSASQueryParameters,
+  BlobSASPermissions,
+  SASProtocol
+} from '@azure/storage-blob';
 import { apiLogger } from '../utils/logger';
 
 // ============================================
@@ -26,6 +34,7 @@ function getConfig() {
     connectionString: process.env.AZURE_STORAGE_CONNECTION_STRING || '',
     containerResumes: process.env.AZURE_STORAGE_CONTAINER_RESUMES || 'resumes',
     containerExports: process.env.AZURE_STORAGE_CONTAINER_EXPORTS || 'exports',
+    containerMedia: process.env.AZURE_STORAGE_CONTAINER_MEDIA || 'interview-media',
     enabled: process.env.AZURE_BLOB_STORAGE_ENABLED === 'true',
   };
 }
@@ -37,6 +46,8 @@ function getConfig() {
 let blobServiceClient: BlobServiceClient | null = null;
 let resumesContainer: ContainerClient | null = null;
 let exportsContainer: ContainerClient | null = null;
+let mediaContainer: ContainerClient | null = null;
+let sharedKeyCredential: StorageSharedKeyCredential | null = null;
 let isInitialized = false;
 
 /**
@@ -58,18 +69,31 @@ async function initializeBlobStorage(): Promise<boolean> {
   try {
     blobServiceClient = BlobServiceClient.fromConnectionString(config.connectionString);
     
+    // Extract account name and key from connection string for SAS generation
+    const accountNameMatch = config.connectionString.match(/AccountName=([^;]+)/);
+    const accountKeyMatch = config.connectionString.match(/AccountKey=([^;]+)/);
+    if (accountNameMatch && accountKeyMatch) {
+      sharedKeyCredential = new StorageSharedKeyCredential(
+        accountNameMatch[1],
+        accountKeyMatch[1]
+      );
+    }
+    
     // Get or create containers
     resumesContainer = blobServiceClient.getContainerClient(config.containerResumes);
     exportsContainer = blobServiceClient.getContainerClient(config.containerExports);
+    mediaContainer = blobServiceClient.getContainerClient(config.containerMedia);
 
     // Create containers if they don't exist
     await resumesContainer.createIfNotExists({ access: 'blob' });
     await exportsContainer.createIfNotExists({ access: 'blob' });
+    await mediaContainer.createIfNotExists({ access: 'blob' });
 
     isInitialized = true;
     apiLogger.info('[azure-blob] Azure Blob Storage initialized', {
       resumesContainer: config.containerResumes,
       exportsContainer: config.containerExports,
+      mediaContainer: config.containerMedia,
     });
 
     return true;
@@ -395,33 +419,181 @@ export async function downloadFeedbackPdf(blobName: string): Promise<DownloadRes
 }
 
 /**
- * Generate a SAS URL for temporary access to a blob
+ * Generate a SAS URL for temporary read access to a blob
  */
 export async function generateSasUrl(
   blobName: string,
   expiresInMinutes: number = 60
 ): Promise<string | null> {
-  if (!isAzureBlobEnabled()) {
+  if (!isAzureBlobEnabled() || !sharedKeyCredential) {
     return null;
   }
 
   try {
     const blockBlobClient = resumesContainer!.getBlockBlobClient(blobName);
     
-    // Generate SAS token with read permission
     const expiresOn = new Date();
     expiresOn.setMinutes(expiresOn.getMinutes() + expiresInMinutes);
 
-    // Note: For SAS generation, you need to use generateBlobSASQueryParameters
-    // This requires the storage account key, which we'd extract from connection string
-    // For now, return the direct URL (works if container has public access)
-    return blockBlobClient.url;
+    const sasToken = generateBlobSASQueryParameters({
+      containerName: resumesContainer!.containerName,
+      blobName,
+      permissions: BlobSASPermissions.parse('r'),
+      expiresOn,
+      protocol: SASProtocol.Https,
+    }, sharedKeyCredential).toString();
+
+    return `${blockBlobClient.url}?${sasToken}`;
   } catch (error) {
     apiLogger.error('[azure-blob] Failed to generate SAS URL', {
       blobName,
       error: error instanceof Error ? error.message : 'Unknown error',
     });
     return null;
+  }
+}
+
+// ============================================
+// INTERVIEW MEDIA OPERATIONS
+// ============================================
+
+export interface MediaUploadSasResult {
+  success: boolean;
+  uploadUrl?: string;
+  blobKey?: string;
+  expiresAt?: Date;
+  headers?: Record<string, string>;
+  error?: string;
+}
+
+/**
+ * Generate a SAS URL for uploading interview media (write permission)
+ */
+export async function generateMediaUploadSas(
+  userId: string,
+  interviewId: string,
+  mediaId: string,
+  contentType: string,
+  expiresInMinutes: number = 30
+): Promise<MediaUploadSasResult> {
+  await ensureInitialized();
+  
+  if (!isAzureBlobEnabled() || !sharedKeyCredential || !mediaContainer) {
+    return {
+      success: false,
+      error: 'Azure Blob Storage is not enabled or not properly configured',
+    };
+  }
+
+  try {
+    // Generate blob path: users/{userId}/interviews/{interviewId}/{mediaId}.{ext}
+    const ext = contentType.includes('video') ? 'webm' : 
+                contentType.includes('audio') ? 'webm' : 'bin';
+    const blobKey = `users/${userId}/interviews/${interviewId}/${mediaId}.${ext}`;
+    
+    const blockBlobClient = mediaContainer.getBlockBlobClient(blobKey);
+    
+    const expiresOn = new Date();
+    expiresOn.setMinutes(expiresOn.getMinutes() + expiresInMinutes);
+
+    const sasToken = generateBlobSASQueryParameters({
+      containerName: mediaContainer.containerName,
+      blobName: blobKey,
+      permissions: BlobSASPermissions.parse('cw'), // create + write
+      expiresOn,
+      protocol: SASProtocol.Https,
+      contentType,
+    }, sharedKeyCredential).toString();
+
+    const uploadUrl = `${blockBlobClient.url}?${sasToken}`;
+
+    apiLogger.info('[azure-blob] Generated media upload SAS', {
+      userId: userId.slice(0, 12),
+      interviewId: interviewId.slice(0, 12),
+      blobKey,
+      expiresAt: expiresOn.toISOString(),
+    });
+
+    return {
+      success: true,
+      uploadUrl,
+      blobKey,
+      expiresAt: expiresOn,
+      headers: {
+        'x-ms-blob-type': 'BlockBlob',
+        'Content-Type': contentType,
+      },
+    };
+  } catch (error) {
+    apiLogger.error('[azure-blob] Failed to generate media upload SAS', {
+      userId: userId.slice(0, 12),
+      interviewId: interviewId.slice(0, 12),
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to generate upload URL',
+    };
+  }
+}
+
+/**
+ * Generate a SAS URL for downloading/streaming interview media (read permission)
+ */
+export async function generateMediaDownloadSas(
+  blobKey: string,
+  expiresInMinutes: number = 60
+): Promise<string | null> {
+  await ensureInitialized();
+  
+  if (!isAzureBlobEnabled() || !sharedKeyCredential || !mediaContainer) {
+    return null;
+  }
+
+  try {
+    const blockBlobClient = mediaContainer.getBlockBlobClient(blobKey);
+    
+    const expiresOn = new Date();
+    expiresOn.setMinutes(expiresOn.getMinutes() + expiresInMinutes);
+
+    const sasToken = generateBlobSASQueryParameters({
+      containerName: mediaContainer.containerName,
+      blobName: blobKey,
+      permissions: BlobSASPermissions.parse('r'),
+      expiresOn,
+      protocol: SASProtocol.Https,
+    }, sharedKeyCredential).toString();
+
+    return `${blockBlobClient.url}?${sasToken}`;
+  } catch (error) {
+    apiLogger.error('[azure-blob] Failed to generate media download SAS', {
+      blobKey,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+    return null;
+  }
+}
+
+/**
+ * Delete interview media from Azure Blob Storage
+ */
+export async function deleteMedia(blobKey: string): Promise<boolean> {
+  if (!isAzureBlobEnabled() || !mediaContainer) {
+    return false;
+  }
+
+  try {
+    const blockBlobClient = mediaContainer.getBlockBlobClient(blobKey);
+    await blockBlobClient.deleteIfExists();
+    
+    apiLogger.info('[azure-blob] Media deleted', { blobKey });
+    return true;
+  } catch (error) {
+    apiLogger.error('[azure-blob] Failed to delete media', {
+      blobKey,
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+    return false;
   }
 }
 
@@ -448,5 +620,8 @@ export default {
   downloadFeedbackPdf,
   deleteResume,
   generateSasUrl,
+  generateMediaUploadSas,
+  generateMediaDownloadSas,
+  deleteMedia,
   initializeBlobStorage,
 };

@@ -8,6 +8,10 @@
  * 1. Primary: LinkedIn OIDC with openid, profile, email scopes
  * 2. Fallback: Manual PDF upload or form-based entry
  * 
+ * Two flows are supported:
+ * - SSO Login: Uses LINKEDIN_REDIRECT_URI (/api/auth/linkedin/callback)
+ * - Onboarding Import: Uses LINKEDIN_PROFILE_REDIRECT_URI (/api/auth/linkedin-profile/callback)
+ * 
  * Note: LinkedIn's richer profile data (work history, skills) requires
  * special partnership access. This implementation uses the standard
  * OIDC userinfo endpoint which provides basic profile information.
@@ -16,6 +20,7 @@
  */
 
 import logger from '../utils/logger';
+import crypto from 'crypto';
 
 const linkedInLogger = logger.child({ component: 'linkedin' });
 
@@ -25,7 +30,18 @@ const linkedInLogger = logger.child({ component: 'linkedin' });
 
 const LINKEDIN_CLIENT_ID = process.env.LINKEDIN_CLIENT_ID;
 const LINKEDIN_CLIENT_SECRET = process.env.LINKEDIN_CLIENT_SECRET;
-const LINKEDIN_REDIRECT_URI = process.env.LINKEDIN_REDIRECT_URI || 'http://localhost:3001/api/auth/linkedin/callback';
+
+// SSO redirect URI (for login)
+const LINKEDIN_REDIRECT_URI = process.env.LINKEDIN_REDIRECT_URI || 
+  (process.env.NODE_ENV === 'production' 
+    ? 'https://api.vocaid.io/api/auth/linkedin/callback'
+    : 'http://localhost:3001/api/auth/linkedin/callback');
+
+// Profile import redirect URI (for onboarding)
+const LINKEDIN_PROFILE_REDIRECT_URI = process.env.LINKEDIN_PROFILE_REDIRECT_URI || 
+  (process.env.NODE_ENV === 'production' 
+    ? 'https://api.vocaid.io/api/auth/linkedin-profile/callback'
+    : 'http://localhost:3001/api/auth/linkedin-profile/callback');
 
 // LinkedIn OIDC endpoints
 const LINKEDIN_AUTH_URL = 'https://www.linkedin.com/oauth/v2/authorization';
@@ -34,6 +50,12 @@ const LINKEDIN_USERINFO_URL = 'https://api.linkedin.com/v2/userinfo';
 
 // OIDC scopes (standard OpenID Connect)
 const LINKEDIN_SCOPES = ['openid', 'profile', 'email'];
+
+// ========================================
+// FLOW TYPES
+// ========================================
+
+export type LinkedInFlowType = 'sso' | 'import';
 
 // ========================================
 // INTERFACES
@@ -91,17 +113,34 @@ export function isLinkedInConfigured(): boolean {
 }
 
 /**
- * Generate LinkedIn OAuth authorization URL
+ * Get the redirect URI for a given flow type
  */
-export function getLinkedInAuthUrl(state: string): string {
+export function getRedirectUriForFlow(flowType: LinkedInFlowType): string {
+  return flowType === 'import' ? LINKEDIN_PROFILE_REDIRECT_URI : LINKEDIN_REDIRECT_URI;
+}
+
+/**
+ * Generate LinkedIn OAuth authorization URL
+ * @param state - CSRF protection state token
+ * @param flowType - 'sso' for login or 'import' for onboarding profile import
+ */
+export function getLinkedInAuthUrl(state: string, flowType: LinkedInFlowType = 'sso'): string {
   if (!LINKEDIN_CLIENT_ID) {
     throw new Error('LinkedIn client ID not configured');
   }
   
+  const redirectUri = getRedirectUriForFlow(flowType);
+  
+  linkedInLogger.info('Building LinkedIn auth URL', { 
+    flowType, 
+    redirectUri,
+    hasState: !!state 
+  });
+  
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: LINKEDIN_CLIENT_ID,
-    redirect_uri: LINKEDIN_REDIRECT_URI,
+    redirect_uri: redirectUri,
     state,
     scope: LINKEDIN_SCOPES.join(' ')
   });
@@ -111,12 +150,18 @@ export function getLinkedInAuthUrl(state: string): string {
 
 /**
  * Exchange authorization code for access token
+ * @param code - Authorization code from LinkedIn callback
+ * @param flowType - 'sso' for login or 'import' for onboarding profile import
  */
-export async function exchangeCodeForToken(code: string): Promise<LinkedInTokenResponse | null> {
+export async function exchangeCodeForToken(code: string, flowType: LinkedInFlowType = 'sso'): Promise<LinkedInTokenResponse | null> {
   if (!LINKEDIN_CLIENT_ID || !LINKEDIN_CLIENT_SECRET) {
     linkedInLogger.error('LinkedIn credentials not configured');
     return null;
   }
+  
+  const redirectUri = getRedirectUriForFlow(flowType);
+  
+  linkedInLogger.info('Exchanging code for token', { flowType, redirectUri });
   
   try {
     const params = new URLSearchParams({
@@ -124,7 +169,7 @@ export async function exchangeCodeForToken(code: string): Promise<LinkedInTokenR
       code,
       client_id: LINKEDIN_CLIENT_ID,
       client_secret: LINKEDIN_CLIENT_SECRET,
-      redirect_uri: LINKEDIN_REDIRECT_URI
+      redirect_uri: redirectUri
     });
     
     const response = await fetch(LINKEDIN_TOKEN_URL, {
@@ -137,7 +182,7 @@ export async function exchangeCodeForToken(code: string): Promise<LinkedInTokenR
     
     if (!response.ok) {
       const error = await response.text();
-      linkedInLogger.error('Failed to exchange code for token', { error });
+      linkedInLogger.error('Failed to exchange code for token', { error, status: response.status });
       return null;
     }
     
@@ -199,9 +244,11 @@ export function userInfoToProfileData(userInfo: LinkedInUserInfo): LinkedInProfi
 
 /**
  * Complete OAuth flow: exchange code and get profile data
+ * @param code - Authorization code from LinkedIn callback
+ * @param flowType - 'sso' for login or 'import' for onboarding profile import
  */
-export async function completeOAuthFlow(code: string): Promise<LinkedInProfileData | null> {
-  const tokenResponse = await exchangeCodeForToken(code);
+export async function completeOAuthFlow(code: string, flowType: LinkedInFlowType = 'sso'): Promise<LinkedInProfileData | null> {
+  const tokenResponse = await exchangeCodeForToken(code, flowType);
   
   if (!tokenResponse) {
     return null;
@@ -224,7 +271,6 @@ export async function completeOAuthFlow(code: string): Promise<LinkedInProfileDa
  * Generate state token for OAuth flow
  */
 export function generateStateToken(): string {
-  const crypto = require('crypto');
   return crypto.randomBytes(32).toString('hex');
 }
 
@@ -322,6 +368,7 @@ export function isLinkedInExport(base64Data: string, mimeType: string): boolean 
 export default {
   isLinkedInConfigured,
   getLinkedInAuthUrl,
+  getRedirectUriForFlow,
   exchangeCodeForToken,
   getUserInfo,
   userInfoToProfileData,

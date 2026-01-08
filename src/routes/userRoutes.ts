@@ -44,12 +44,14 @@ const updateProfileSchema = z.object({
     .optional(),
   role: z.enum(['Recruiter', 'Candidate', 'Manager']).optional(),
   marketingOptIn: z.boolean().optional(),
+  accountTypeConfirmed: z.boolean().optional(),
 }).refine((data) => {
   // At least one field must be provided
   return data.countryCode !== undefined || 
          data.preferredLanguage !== undefined || 
          data.role !== undefined ||
-         data.marketingOptIn !== undefined;
+         data.marketingOptIn !== undefined ||
+         data.accountTypeConfirmed !== undefined;
 }, {
   message: 'At least one field must be provided',
 });
@@ -145,7 +147,7 @@ router.put('/me', requireSession, async (req: Request, res: Response) => {
       });
     }
 
-    const { countryCode, preferredLanguage, role, marketingOptIn } = result.data;
+    const { countryCode, preferredLanguage, role, marketingOptIn, accountTypeConfirmed } = result.data;
 
     // Validate country code if provided
     if (countryCode) {
@@ -177,6 +179,12 @@ router.put('/me', requireSession, async (req: Request, res: Response) => {
       updateData.currentRole = role;
     }
 
+    if (accountTypeConfirmed !== undefined) {
+      updateData.accountTypeConfirmedAt = accountTypeConfirmed ? new Date() : null;
+      // Business accounts are not enabled yet.
+      updateData.userType = UserType.PERSONAL;
+    }
+
     // Update user
     const user = await prisma.user.update({
       where: { id: userId },
@@ -190,6 +198,7 @@ router.put('/me', requireSession, async (req: Request, res: Response) => {
         countryCode: true,
         preferredLanguage: true,
         currentRole: true,
+        accountTypeConfirmedAt: true,
         updatedAt: true,
       }
     });
@@ -415,6 +424,118 @@ router.get('/me/b2c-status', requireSession, async (req: Request, res: Response)
         message: 'Failed to fetch B2C status',
         requestId
       }
+    });
+  }
+});
+
+// ========================================
+// GET /api/users/onboarding-status
+// Returns whether user has completed profile/resume setup
+// Used by frontend to determine if onboarding is needed
+// ========================================
+router.get('/onboarding-status', requireSession, async (req: Request, res: Response) => {
+  const requestId = (req as any).requestId || 'N/A';
+  const userId = req.userId!;
+
+  try {
+    // Fetch user, resume, and LinkedIn profile status in parallel
+    const [user, resumeCount, linkedInProfile, userConsent] = await Promise.all([
+      prisma.user.findUnique({
+        where: { id: userId },
+        select: {
+          onboardingComplete: true,
+          firstName: true,
+          lastName: true,
+          phoneVerified: true,
+        },
+      }),
+      prisma.resumeDocument.count({
+        where: {
+          userId,
+          isActive: true,
+        },
+      }),
+      prisma.linkedInProfile.findUnique({
+        where: { userId },
+        select: {
+          id: true,
+          linkedinMemberId: true,
+          name: true,
+          email: true,
+          pictureUrl: true,
+          source: true,
+          createdAt: true,
+        },
+      }),
+      prisma.userConsent.findUnique({
+        where: { userId },
+        select: {
+          linkedinConnectedAt: true,
+          linkedinMemberId: true,
+        },
+      }),
+    ]);
+
+    if (!user) {
+      return res.status(404).json({
+        ok: false,
+        status: 'error',
+        error: {
+          code: B2CErrorCodes.USER_NOT_FOUND,
+          message: 'User not found',
+          requestId,
+        },
+      });
+    }
+
+    const hasResume = resumeCount > 0;
+    const hasLinkedInProfile = !!linkedInProfile;
+    const isLinkedInConnected = !!(userConsent?.linkedinConnectedAt || linkedInProfile?.linkedinMemberId);
+    const hasCompleteName = !!(user.firstName && user.lastName);
+    
+    // Onboarding is complete if user has at least one resume OR LinkedIn profile
+    // AND has completed their name (profile info)
+    const onboardingComplete = user.onboardingComplete || (hasCompleteName && (hasResume || hasLinkedInProfile));
+
+    logger.info('Onboarding status checked', {
+      userId: userId.slice(0, 12),
+      hasResume,
+      hasLinkedInProfile,
+      isLinkedInConnected,
+      hasCompleteName,
+      onboardingComplete,
+    });
+
+    res.json({
+      ok: true,
+      status: 'success',
+      data: {
+        onboardingComplete,
+        hasResume,
+        hasLinkedInProfile,
+        isLinkedInConnected,
+        hasCompleteName,
+        phoneVerified: user.phoneVerified,
+        // Include LinkedIn profile summary if available (for UI prefill)
+        linkedInProfile: linkedInProfile ? {
+          name: linkedInProfile.name,
+          email: linkedInProfile.email,
+          pictureUrl: linkedInProfile.pictureUrl,
+          source: linkedInProfile.source,
+          connectedAt: userConsent?.linkedinConnectedAt || linkedInProfile.createdAt,
+        } : null,
+      },
+    });
+  } catch (error: any) {
+    logger.error('Error fetching onboarding status', { requestId, error: error.message });
+    res.status(500).json({
+      ok: false,
+      status: 'error',
+      error: {
+        code: 'SERVER_ERROR',
+        message: 'Failed to fetch onboarding status',
+        requestId,
+      },
     });
   }
 });

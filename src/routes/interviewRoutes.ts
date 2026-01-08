@@ -456,4 +456,231 @@ router.post('/:id/clone', requireSession, async (req: Request, res: Response) =>
   }
 });
 
+// ========================================
+// INTERVIEW MEDIA ROUTES
+// ========================================
+
+import * as interviewMediaService from '../services/interviewMediaService';
+
+const mediaUploadSchema = z.object({
+  mimeType: z.string().min(1).max(100),
+  sizeBytes: z.number().int().positive().max(500 * 1024 * 1024), // Max 500MB
+});
+
+const mediaCompleteSchema = z.object({
+  blobKey: z.string().min(1).max(500),
+  mimeType: z.string().min(1).max(100),
+  sizeBytes: z.number().int().positive(),
+  durationSec: z.number().int().nonnegative().optional(),
+});
+
+/**
+ * POST /api/interviews/:id/media/upload-url
+ * Generate a SAS URL for uploading interview media
+ */
+router.post('/:id/media/upload-url', requireSession, async (req: Request, res: Response) => {
+  try {
+    const userId = req.userId!;
+    const interviewId = uuidSchema.parse(req.params.id);
+    const body = mediaUploadSchema.parse(req.body);
+
+    const result = await interviewMediaService.getUploadUrl({
+      userId,
+      interviewId,
+      mimeType: body.mimeType,
+      sizeBytes: body.sizeBytes,
+    });
+
+    if (!result.success) {
+      return res.status(400).json({
+        status: 'error',
+        message: result.error,
+      });
+    }
+
+    return res.json({
+      status: 'success',
+      data: {
+        uploadUrl: result.uploadUrl,
+        blobKey: result.blobKey,
+        mediaId: result.mediaId,
+        expiresAt: result.expiresAt?.toISOString(),
+        headers: result.headers,
+      },
+    });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Validation failed',
+        errors: error.errors,
+      });
+    }
+
+    interviewLogger.error('Error generating media upload URL', { error: error.message });
+    return res.status(500).json({
+      status: 'error',
+      message: 'Failed to generate upload URL',
+    });
+  }
+});
+
+/**
+ * POST /api/interviews/:id/media/complete
+ * Mark media upload as complete
+ */
+router.post('/:id/media/complete', requireSession, async (req: Request, res: Response) => {
+  try {
+    const userId = req.userId!;
+    const interviewId = uuidSchema.parse(req.params.id);
+    const body = mediaCompleteSchema.parse(req.body);
+
+    const result = await interviewMediaService.completeUpload({
+      userId,
+      interviewId,
+      blobKey: body.blobKey,
+      mimeType: body.mimeType,
+      sizeBytes: body.sizeBytes,
+      durationSec: body.durationSec,
+    });
+
+    if (!result.success) {
+      return res.status(400).json({
+        status: 'error',
+        message: result.error,
+      });
+    }
+
+    return res.json({
+      status: 'success',
+      data: {
+        mediaId: result.mediaId,
+      },
+    });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Validation failed',
+        errors: error.errors,
+      });
+    }
+
+    interviewLogger.error('Error completing media upload', { error: error.message });
+    return res.status(500).json({
+      status: 'error',
+      message: 'Failed to complete upload',
+    });
+  }
+});
+
+/**
+ * GET /api/interviews/:id/media
+ * Get media info for an interview
+ */
+router.get('/:id/media', requireSession, async (req: Request, res: Response) => {
+  try {
+    const userId = req.userId!;
+    const interviewId = uuidSchema.parse(req.params.id);
+
+    const media = await interviewMediaService.getMediaInfo(userId, interviewId);
+
+    if (!media) {
+      return res.json({
+        status: 'success',
+        data: null,
+      });
+    }
+
+    return res.json({
+      status: 'success',
+      data: {
+        id: media.id,
+        status: media.status,
+        mimeType: media.mimeType,
+        sizeBytes: media.sizeBytes,
+        durationSec: media.durationSec,
+        downloadUrl: media.downloadUrl,
+        createdAt: media.createdAt.toISOString(),
+      },
+    });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Invalid interview ID',
+      });
+    }
+
+    interviewLogger.error('Error getting media info', { error: error.message });
+    return res.status(500).json({
+      status: 'error',
+      message: 'Failed to get media info',
+    });
+  }
+});
+
+/**
+ * GET /api/interviews/:id/media/download
+ * Get a signed download URL for interview media
+ */
+router.get('/:id/media/download', requireSession, async (req: Request, res: Response) => {
+  try {
+    const userId = req.userId!;
+    const interviewId = uuidSchema.parse(req.params.id);
+
+    const downloadUrl = await interviewMediaService.getDownloadUrl(userId, interviewId);
+
+    if (!downloadUrl) {
+      return res.status(404).json({
+        status: 'error',
+        message: 'Media not found or not available',
+      });
+    }
+
+    return res.json({
+      status: 'success',
+      data: {
+        downloadUrl,
+      },
+    });
+  } catch (error: any) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({
+        status: 'error',
+        message: 'Invalid interview ID',
+      });
+    }
+
+    interviewLogger.error('Error getting media download URL', { error: error.message });
+    return res.status(500).json({
+      status: 'error',
+      message: 'Failed to get download URL',
+    });
+  }
+});
+
+/**
+ * POST /api/interviews/:id/media/fail
+ * Mark media upload as failed (for retry)
+ */
+router.post('/:id/media/fail', requireSession, async (req: Request, res: Response) => {
+  try {
+    const userId = req.userId!;
+    const interviewId = uuidSchema.parse(req.params.id);
+
+    await interviewMediaService.failUpload(userId, interviewId);
+
+    return res.json({
+      status: 'success',
+    });
+  } catch (error: any) {
+    interviewLogger.error('Error marking media as failed', { error: error.message });
+    return res.status(500).json({
+      status: 'error',
+      message: 'Failed to update media status',
+    });
+  }
+});
+
 export default router;
